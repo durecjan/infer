@@ -351,6 +351,8 @@ val atlas_double_free : t
 
 val atlas_use_after_free : t
 
+val atlas_free_invalid_addr : t
+
 val unreachable_cost_call : kind:CostKind.t -> t
 
 val lineage_flow : t

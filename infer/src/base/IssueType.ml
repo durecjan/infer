@@ -1049,6 +1049,11 @@ let atlas_use_after_free =
   register ~category:MemoryError ~id:"ATLAS_USE_AFTER_FREE" Error Atlas
   ~user_documentation:[%blob "./documentation/issues/ATLAS_USE_AFTER_FREE.md"]
 
+let atlas_free_invalid_addr =
+  register ~category:MemoryError ~id:"ATLAS_FREE_INVALID_ADDR" Error Atlas
+  ~user_documentation:[%blob "./documentation/issues/ATLAS_FREE_INVALID_ADDR.md"]
+
+
 
 let unreachable_cost_call ~kind = register_cost ~enabled:false ~kind "%s_UNREACHABLE_AT_EXIT"
 

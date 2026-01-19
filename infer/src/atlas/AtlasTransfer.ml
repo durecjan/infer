@@ -59,6 +59,21 @@ let use_after_free (analysis_data: IntraproceduralAnalysis.t) loc err_var var va
 
   Domain.store_var var value astate
 
+let free_invalid_addr (analysis_data : IntraproceduralAnalysis.t) loc value astate =
+  let proc_desc = analysis_data.proc_desc in
+  let err_log = analysis_data.err_log in
+  Reporting.log_issue
+    proc_desc
+    err_log
+    ~loc:loc
+    Checker.Atlas
+    IssueType.atlas_free_invalid_addr
+    (Format.asprintf
+          "free called with invalid address (value=%a)"
+          Domain.Value.pp value) ;
+    
+  astate
+
 let var_of_exp = function
   | Exp.Var id -> Some (Var.of_id id)
   | Exp.Lvar pvar -> Some (Var.of_pvar pvar)
@@ -152,10 +167,12 @@ let exec_instr astate node (analysis_data : IntraproceduralAnalysis.t) instr =
                   astate''
             | Domain.Value.Ptr { block; offset } ->
               free_non_base_pointer analysis_data loc block offset astate
+            | Domain.Value.Int 0 ->
+              astate (* free(NULL) *)
+            | Domain.Value.Int i ->
+              free_invalid_addr analysis_data loc (Domain.Value.Int i) astate
             | Domain.Value.Top ->
-              astate
-            | Domain.Value.Int _ ->
-              astate
+              astate (* we do not know anything *)
           end
     | Sil.Call _ ->
       astate

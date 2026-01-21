@@ -51,6 +51,7 @@ let free_invalid_addr (r: reporter) (loc: Location.t) (value: Domain.Value.t) =
           "free called with invalid address (value=%a)"
           Domain.Value.pp value)
 
+
 let rec eval_exp (astate : Domain.t) (exp : Exp.t) : Domain.Value.t =
   match exp with
   | Exp.Const (Const.Cint c) ->
@@ -72,6 +73,71 @@ let rec eval_exp (astate : Domain.t) (exp : Exp.t) : Domain.Value.t =
   | _ ->
     Domain.Value.Top
 
+
+let exec_load_instr lhs rhs astate r loc =
+  let value = eval_exp astate rhs in
+    let var = Var.of_id lhs in
+    begin
+      match rhs, value with
+      | Exp.Lvar pvar, Domain.Value.Ptr { block = block; _ }
+        when Domain.is_freed block astate ->
+          let err_var = Var.of_pvar pvar in
+          use_after_free r loc err_var block ;
+          Domain.store_var var value astate
+      | _ ->
+        Domain.store_var var value astate
+    end
+
+
+let exec_store_instr lhs rhs astate r loc =
+  match lhs with
+  | Exp.Lvar pvar ->
+    let var = Var.of_pvar pvar in
+    let value = eval_exp astate rhs in
+    let lhs' = eval_exp astate lhs in
+    begin
+      match lhs' with
+      | Domain.Value.Ptr { block = block; _ }
+        when Domain.is_freed block astate ->
+          use_after_free r loc var block ;
+          Domain.store_var var value astate
+      | _ ->
+        Domain.store_var var value astate
+    end
+  | _ -> astate
+
+
+let exec_malloc_instr lhs actual astate =
+  let size = eval_exp astate actual in
+  let astate', ptr = Domain.alloc_block size astate in
+  let var = Var.of_id lhs in
+  Domain.store_var var ptr astate'
+
+
+let exec_free_instr actual astate r loc =
+  match eval_exp astate actual with
+  | Domain.Value.Ptr { block; offset }
+    when Domain.Address.equal offset (Domain.Address.NonTop 0)
+    || Domain.Address.equal offset Domain.Address.Top ->
+      if Domain.is_freed block astate then
+        begin
+          double_free r loc block ;
+          astate
+        end
+      else 
+        Domain.free_block block astate
+  | Domain.Value.Ptr { block; offset } ->
+    free_non_base_pointer r loc block offset ;
+    Domain.free_block block astate
+  | Domain.Value.Int 0 ->
+    astate (* free(NULL) *)
+  | Domain.Value.Int i ->
+    free_invalid_addr r loc (Domain.Value.Int i) ;
+    astate
+  | Domain.Value.Top ->
+    astate (* we do not know anything *)
+
+
 module TransferFunctions = struct
   module CFG = ProcCfg.Normal
   module Domain = Domain
@@ -88,79 +154,17 @@ module TransferFunctions = struct
     let astate' =
       match instr with
       | Sil.Load { id = lhs; e = rhs; typ = _lhs_typ; loc = loc} ->
-        let value = eval_exp astate rhs in
-        let var = Var.of_id lhs in
-        begin
-          match rhs, value with
-          | Exp.Lvar pvar, Domain.Value.Ptr { block = block; _ }
-            when Domain.is_freed block astate ->
-              let err_var = Var.of_pvar pvar in
-              use_after_free r loc err_var block ;
-              Domain.store_var var value astate
-          | _ ->
-            Domain.store_var var value astate
-        end
+        exec_load_instr lhs rhs astate r loc
       | Sil.Store {e1= lhs; typ= _lhs_typ; e2= rhs; loc= loc} ->
-        begin
-          match lhs with
-          | Exp.Lvar pvar ->
-            let var = Var.of_pvar pvar in
-            let value = eval_exp astate rhs in
-            let lhs' = eval_exp astate lhs in
-            begin
-              match lhs' with
-              | Domain.Value.Ptr { block = block; _ }
-                when Domain.is_freed block astate ->
-                  use_after_free r loc var block ;
-                  Domain.store_var var value astate
-              | _ ->
-                Domain.store_var var value astate
-            end
-          | _ -> astate
-        end
+        exec_store_instr lhs rhs astate r loc
       | Sil.Call
-        ( (ret_id, _ret_typ)
-        , Exp.Const (Const.Cfun procname)
-        , (act_exp, _) :: _
-        , _loc
-        , _call_flags )
+        ( (id, _), Exp.Const (Const.Cfun procname), (actual, _) :: _, _, _ )
           when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-            let size = eval_exp astate act_exp in
-            let (new_astate, ptr) = Domain.alloc_block size astate in
-            let var = Var.of_id ret_id in
-            Domain.store_var var ptr new_astate
+            exec_malloc_instr id actual astate
       | Sil.Call
-        ( (_ret_id, _ret_typ)
-        , Exp.Const (Const.Cfun procname)
-        , (act_exp, _) :: _
-        , loc
-        , _call_flags)
+        ( _, Exp.Const (Const.Cfun procname), (actual, _) :: _, loc, _ )
           when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
-            begin
-              match eval_exp astate act_exp with
-              | Domain.Value.Ptr { block; offset }
-                when Domain.Address.equal offset (Domain.Address.NonTop 0) ||
-                Domain.Address.equal offset Domain.Address.Top ->
-                  let (astate'', double_free') = Domain.free_block block astate in
-                  if double_free' then
-                    begin
-                    double_free r loc block ;
-                    astate''
-                    end
-                  else
-                    astate''
-              | Domain.Value.Ptr { block; offset } ->
-                free_non_base_pointer r loc block offset ;
-                let astate'', _ = Domain.free_block block astate in
-                astate''
-              | Domain.Value.Int 0 ->
-                astate (* free(NULL) *)
-              | Domain.Value.Int i ->
-                free_invalid_addr r loc (Domain.Value.Int i) ;
-                astate
-              | Domain.Value.Top ->
-                astate (* we do not know anything *)
-            end
+            exec_free_instr actual astate r loc
       | _ ->
         astate
     in

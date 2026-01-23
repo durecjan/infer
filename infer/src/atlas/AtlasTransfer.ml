@@ -51,42 +51,61 @@ let free_invalid_addr (r: reporter) (loc: Location.t) (value: Domain.Value.t) =
           "free called with invalid address (value=%a)"
           Domain.Value.pp value)
 
+let ptr_sub_different_blocks (r: reporter) (loc: Location.t) =
+  report r loc IssueType.atlas_ptr_sub_different_blocks
+    (Format.asprintf
+      "subtraction of pointers which point to different memory blocks")
 
-let rec eval_exp (astate : Domain.t) (exp : Exp.t) : Domain.Value.t =
+
+let rec eval_exp (astate : Domain.t) (exp : Exp.t) : Domain.ExpEvalRes.t =
   match exp with
   | Exp.Const (Const.Cint c) ->
     (match IntLit.to_int c with
-      | Some n -> Domain.Value.of_int n
-      | None -> Domain.Value.Top)
+      | Some n -> Domain.ExpEvalRes.Ok (Domain.Value.Int n)
+      | None -> Domain.ExpEvalRes.Ok (Domain.Value.Top))
   | Exp.Sizeof { typ = _; nbytes = Some n; dynamic_length = _; subtype = _; nullable = _ } ->
-    Domain.Value.of_int n
+    Domain.ExpEvalRes.Ok (Domain.Value.Int n)
   | Exp.Var id ->
-    Domain.lookup_var (Var.of_id id) astate
+    Domain.ExpEvalRes.Ok (Domain.lookup_var (Var.of_id id) astate)
   | Exp.Lvar pvar ->
-    Domain.lookup_var (Var.of_pvar pvar) astate
+    Domain.ExpEvalRes.Ok (Domain.lookup_var (Var.of_pvar pvar) astate)
   | Exp.Cast (_typ, e) ->
     eval_exp astate e
   | Exp.BinOp (op, e1, e2) ->
-    let v1 = eval_exp astate e1 in
-    let v2 = eval_exp astate e2 in
-    Domain.Value.eval_binop op v1 v2
+    let r1 = eval_exp astate e1 in
+    let r2 = eval_exp astate e2 in
+    begin
+      match r1, r2 with
+      | Domain.ExpEvalRes.Ok v1, Domain.ExpEvalRes.Ok v2 ->
+        Domain.ExpEvalRes.eval_binop op v1 v2
+      | Domain.ExpEvalRes.Ok _, err | err, Domain.ExpEvalRes.Ok _ ->
+        err
+      | _ -> Domain.ExpEvalRes.Unknown
+    end
   | _ ->
-    Domain.Value.Top
+    Domain.ExpEvalRes.Unknown
 
 
 let exec_load_instr lhs rhs astate r loc =
   let value = eval_exp astate rhs in
-    let var = Var.of_id lhs in
+  let var = Var.of_id lhs in
+  match value with
+  | Domain.ExpEvalRes.Ok v ->
     begin
-      match rhs, value with
+      match rhs, v with
       | Exp.Lvar pvar, Domain.Value.Ptr { block = block; _ }
         when Domain.is_freed block astate ->
           let err_var = Var.of_pvar pvar in
           use_after_free r loc err_var block ;
-          Domain.store_var var value astate
+          Domain.store_var var v astate
       | _ ->
-        Domain.store_var var value astate
+        Domain.store_var var v astate
     end
+  | Domain.ExpEvalRes.PtrBinopDifferentBlocks ->
+    ptr_sub_different_blocks r loc ;
+    Domain.store_var var Domain.Value.Top astate
+  | Domain.ExpEvalRes.Unknown ->
+    Domain.store_var var Domain.Value.Top astate
 
 
 let exec_store_instr lhs rhs astate r loc =
@@ -96,27 +115,39 @@ let exec_store_instr lhs rhs astate r loc =
     let value = eval_exp astate rhs in
     let lhs' = eval_exp astate lhs in
     begin
-      match lhs' with
-      | Domain.Value.Ptr { block = block; _ }
-        when Domain.is_freed block astate ->
-          use_after_free r loc var block ;
-          Domain.store_var var value astate
-      | _ ->
-        Domain.store_var var value astate
+      match value with
+      | Domain.ExpEvalRes.Ok result ->
+        begin
+          match lhs' with
+          | Domain.ExpEvalRes.Ok Domain.Value.Ptr { block = block; _ }
+            when Domain.is_freed block astate ->
+              use_after_free r loc var block ;
+              Domain.store_var var result astate
+          | _ ->
+            Domain.store_var var result astate
+        end
+      | Domain.ExpEvalRes.PtrBinopDifferentBlocks ->
+        ptr_sub_different_blocks r loc ;
+        Domain.store_var var Domain.Value.Top astate
+      | Domain.ExpEvalRes.Unknown ->
+        Domain.store_var var Domain.Value.Top astate
     end
   | _ -> astate
 
 
 let exec_malloc_instr lhs actual astate =
   let size = eval_exp astate actual in
-  let astate', ptr = Domain.alloc_block size astate in
-  let var = Var.of_id lhs in
-  Domain.store_var var ptr astate'
+  match size with
+  | Ok s ->
+    let astate', ptr = Domain.alloc_block s astate in
+    let var = Var.of_id lhs in
+    Domain.store_var var ptr astate'
+  | _ -> astate
 
 
 let exec_free_instr actual astate r loc =
   match eval_exp astate actual with
-  | Domain.Value.Ptr { block; offset }
+  | Domain.ExpEvalRes.Ok Domain.Value.Ptr { block; offset }
     when Domain.Address.equal offset (Domain.Address.NonTop 0)
     || Domain.Address.equal offset Domain.Address.Top ->
       if Domain.is_freed block astate then
@@ -126,16 +157,17 @@ let exec_free_instr actual astate r loc =
         end
       else 
         Domain.free_block block astate
-  | Domain.Value.Ptr { block; offset } ->
+  | Domain.ExpEvalRes.Ok Domain.Value.Ptr { block; offset } ->
     free_non_base_pointer r loc block offset ;
     Domain.free_block block astate
-  | Domain.Value.Int 0 ->
+  | Domain.ExpEvalRes.Ok Domain.Value.Int 0 ->
     astate (* free(NULL) *)
-  | Domain.Value.Int i ->
+  | Domain.ExpEvalRes.Ok Domain.Value.Int i ->
     free_invalid_addr r loc (Domain.Value.Int i) ;
     astate
-  | Domain.Value.Top ->
+  | Domain.ExpEvalRes.Ok Domain.Value.Top ->
     astate (* we do not know anything *)
+  | _ -> astate
 
 
 module TransferFunctions = struct

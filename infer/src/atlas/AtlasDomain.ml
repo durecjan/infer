@@ -20,6 +20,11 @@ module Address = struct
     | _, Top | Top, _ -> Top
     | NonTop a, NonTop b -> NonTop (a + b)
 
+  let sub x y =
+    match x, y with
+    | _, Top | Top, _ -> Top
+    | NonTop a, NonTop b -> NonTop (a - b)
+
   let join a b =
     match (a, b) with
     | Top, _ | _, Top -> Top
@@ -69,18 +74,6 @@ module Value = struct
     match addr with
     | Address.NonTop n -> Int n
     | Address.Top -> Top
-
-  let eval_binop op v1 v2 = 
-    match op, v1, v2 with
-    | Binop.PlusA _, Int a, Int b -> of_int (a + b)
-    | Binop.PlusPI, Ptr p, Int x ->
-      Ptr { p with offset = Address.add p.offset (Address.NonTop x) }
-    | Binop.PlusPI, Ptr p, Top ->
-      Ptr { p with offset = Address.Top }
-    | Binop.MinusA _, Int a, Int b -> of_int (a - b)
-    | Binop.MinusPI, Ptr p, Int x ->
-      Ptr { p with offset = Address.add p.offset (Address.NonTop (-x)) }
-    | _, _, _ -> Top
 
   let leq ~lhs ~rhs =
     match lhs, rhs with
@@ -247,13 +240,7 @@ let alloc_block (size: Value.t) (astate: t) : t * Value.t =
   { astate with heap = new_blocks; heap_cursor = new_cursor },
   Value.Ptr { block = id; offset = Address.NonTop 0 }
 
-let free_block (id: BlockId.t) (astate: t) : t * bool =
-  let block = Heap.find_opt id astate.heap in
-  let double_free =
-    match block with
-    | Some { base = _; end_ = _; freed = true } -> true
-    | Some _ | None -> false
-  in 
+let free_block (id: BlockId.t) (astate: t) : t =
   let heap' =
     (Heap.update id
       (function 
@@ -262,7 +249,7 @@ let free_block (id: BlockId.t) (astate: t) : t * bool =
         | None -> None)
       astate.heap)
   in
-  { astate with heap = heap' }, double_free
+  { astate with heap = heap' }
 
 let is_freed (id: BlockId.t) (astate: t) : bool =
   let block = Heap.find_opt id astate.heap in
@@ -314,3 +301,29 @@ let lookup_var (var : Var.t) (astate : t) : Value.t =
 let store_var (var : Var.t) (value: Value.t) (astate: t) : t =
   let key = key_of_var var in
   { astate with env= Env.add key value astate.env }
+
+module ExpEvalRes = struct
+  type t =
+    | Ok of Value.t
+    | Unknown
+    | PtrBinopDifferentBlocks
+
+  let eval_binop (op: Binop.t) (v1: Value.t) (v2: Value.t) : t =
+    match op, v1, v2 with
+    | Binop.PlusA _, Int a, Int b ->
+      Ok (Value.Int (a + b))
+    | Binop.PlusPI, Ptr p, Int x ->
+      Ok (Value.Ptr { p with offset = Address.add p.offset (Address.NonTop x) })
+    | Binop.PlusPI, Ptr p, Top ->
+      Ok (Value.Ptr { p with offset = Address.Top })
+    | Binop.MinusA _, Int a, Int b ->
+      Ok (Value.Int (a - b))
+    | Binop.MinusPI, Ptr p, Int x ->
+      Ok (Value.Ptr { p with offset = Address.sub p.offset (Address.NonTop x) })
+    | Binop.MinusPP, Ptr { block = b1; offset = off1}, Ptr { block = b2; offset = off2} ->
+      if BlockId.equal b1 b2 then
+        Ok (Value.of_addr (Address.sub off1 off2))
+      else
+        PtrBinopDifferentBlocks
+    | _, _, _ -> Unknown
+end

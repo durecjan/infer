@@ -29,11 +29,19 @@ module Value : sig
   val of_int : int -> t
   val of_ptr : BlockId.t -> Address.t -> t
   val of_addr : Address.t -> t
-  val eval_binop : Binop.t -> t -> t -> t
   val leq : lhs:t -> rhs:t -> bool
   val join : t -> t -> t
   val widen : prev:t -> next:t -> num_iters:int -> t
   val pp : Format.formatter -> t -> unit
+end
+
+module ExpEvalRes : sig
+  type t =
+    | Ok of Value.t
+    | Unknown
+    | PtrBinopDifferentBlocks
+
+  val eval_binop : Binop.t -> Value.t -> Value.t -> t
 end
 
 type t
@@ -50,7 +58,7 @@ val widen : prev:t -> next:t -> num_iters:int -> t
 
 val alloc_block : Value.t -> t -> t * Value.t
 
-val free_block : BlockId.t -> t -> t * bool
+val free_block : BlockId.t -> t -> t
 
 val is_freed : BlockId.t -> t -> bool
 

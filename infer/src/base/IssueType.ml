@@ -1060,6 +1060,11 @@ let atlas_ptr_sub_different_blocks =
   ~user_documentation:[%blob "./documentation/issues/ATLAS_PTR_SUB_DIFFERENT_BLOCKS.md"]
 
 
+let atlas_ptr_comparison_error =
+  register ~category:MemoryError ~id:"ATLAS_PTR_COMPARISON_ERROR" Error Atlas
+  ~user_documentation:[%blob "./documentation/issues/ATLAS_PTR_COMPARISON_ERROR.md"]
+
+
 let unreachable_cost_call ~kind = register_cost ~enabled:false ~kind "%s_UNREACHABLE_AT_EXIT"
 
 (* register enabled cost issues *)

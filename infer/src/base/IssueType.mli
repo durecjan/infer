@@ -355,6 +355,8 @@ val atlas_free_invalid_addr : t
 
 val atlas_ptr_sub_different_blocks : t
 
+val atlas_ptr_comparison_error : t
+
 val unreachable_cost_call : kind:CostKind.t -> t
 
 val lineage_flow : t

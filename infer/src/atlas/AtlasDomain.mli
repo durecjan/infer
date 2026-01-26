@@ -38,8 +38,11 @@ end
 module ExpEvalRes : sig
   type t =
     | Ok of Value.t
+    | PtrSubDifferentBlocks
+    | PtrComparisonError
     | Unknown
-    | PtrBinopDifferentBlocks
+
+  val eval_unop : Unop.t -> Value.t -> t
 
   val eval_binop : Binop.t -> Value.t -> Value.t -> t
 end
@@ -69,3 +72,5 @@ val end_ : Address.t -> t -> Address.t option
 val lookup_var : Var.t -> t -> Value.t
 
 val store_var : Var.t -> Value.t -> t -> t
+
+val eval_exp : t -> Exp.t -> ExpEvalRes.t

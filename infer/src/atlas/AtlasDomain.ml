@@ -7,13 +7,47 @@ module Address = struct
     | Top
   let of_int (n: int) = NonTop n
 
-  let leq ~lhs ~rhs =
-    match (lhs, rhs) with
-    | _, Top -> true
-    | Top, NonTop _ -> false
-    | NonTop a, NonTop b -> a <= b
+  let lt x y =
+    match x, y with
+    | _, Top | Top, _ ->
+      Top
+    | NonTop a, NonTop b ->
+      if a < b then NonTop 1 else NonTop 0
 
-  let equal x y = leq ~lhs:x ~rhs:y && leq ~lhs:y ~rhs:x
+  let gt x y =
+    match x, y with
+    | _, Top | Top, _->
+      Top
+    | NonTop a, NonTop b ->
+      if a > b then NonTop 1 else NonTop 0
+  
+  let le x y =
+    match x, y with
+    | _, Top | Top, _->
+      Top
+    | NonTop a, NonTop b ->
+      if a <= b then NonTop 1 else NonTop 0
+
+  let ge x y =
+    match x, y with
+    | _, Top | Top, _->
+      Top
+    | NonTop a, NonTop b ->
+      if a >= b then NonTop 1 else NonTop 0
+
+  let eq x y =
+    match x, y with
+    | _, Top | Top, _->
+      Top
+    | NonTop a, NonTop b ->
+      if Int.equal a b then NonTop 1 else NonTop 0
+
+  let ne x y =
+    match x, y with
+    | _, Top | Top, _->
+      Top
+    | NonTop a, NonTop b ->
+      if Int.equal a b then NonTop 0 else NonTop 1
 
   let add x y =
     match x, y with
@@ -24,6 +58,19 @@ module Address = struct
     match x, y with
     | _, Top | Top, _ -> Top
     | NonTop a, NonTop b -> NonTop (a - b)
+
+  let equal x y =
+    match x, y with
+    | _, Top | Top, _ ->
+      false
+    | NonTop a, NonTop b ->
+      Int.equal a b
+
+  let leq ~lhs ~rhs =
+    match (lhs, rhs) with
+    | _, Top -> true
+    | Top, NonTop _ -> false
+    | NonTop a, NonTop b -> a <= b
 
   let join a b =
     match (a, b) with
@@ -305,25 +352,166 @@ let store_var (var : Var.t) (value: Value.t) (astate: t) : t =
 module ExpEvalRes = struct
   type t =
     | Ok of Value.t
+    | PtrSubDifferentBlocks
+    | PtrComparisonError
     | Unknown
-    | PtrBinopDifferentBlocks
+
+  let eval_unop (op: Unop.t) (v: Value.t) : t =
+    match op, v with
+    | Neg, Int i ->
+      Ok (Int (-i))
+    | BNot, Int i ->
+      Ok (Int (lnot i))
+    | LNot, Int i ->
+      Ok (Int (if Int.equal i 0 then 1 else 0))
+    | (Neg | BNot | LNot), Ptr _ ->
+      Unknown
+    | (Neg | BNot | LNot), Top ->
+      Ok Top
 
   let eval_binop (op: Binop.t) (v1: Value.t) (v2: Value.t) : t =
     match op, v1, v2 with
-    | Binop.PlusA _, Int a, Int b ->
-      Ok (Value.Int (a + b))
-    | Binop.PlusPI, Ptr p, Int x ->
-      Ok (Value.Ptr { p with offset = Address.add p.offset (Address.NonTop x) })
-    | Binop.PlusPI, Ptr p, Top ->
-      Ok (Value.Ptr { p with offset = Address.Top })
-    | Binop.MinusA _, Int a, Int b ->
-      Ok (Value.Int (a - b))
-    | Binop.MinusPI, Ptr p, Int x ->
-      Ok (Value.Ptr { p with offset = Address.sub p.offset (Address.NonTop x) })
-    | Binop.MinusPP, Ptr { block = b1; offset = off1}, Ptr { block = b2; offset = off2} ->
+    | PlusA _, Int a, Int b ->
+      Ok (Int (a + b))
+    | MinusA _, Int a, Int b ->
+      Ok (Int (a - b))
+    | Mult _, Int a, Int b ->
+      Ok (Int (a * b))
+    | DivI, Int a, Int b ->
+      Ok (Int (a / b))
+    (* | DivF  (** / for floats *) *)
+    | Mod, Int a, Int b ->
+      Ok (Int (a mod b))
+    | Shiftlt, Int a, Int b ->
+      Ok (Int (a lsl b))
+    | Shiftrt, Int a, Int b ->
+      Ok (Int (a lsr b))
+    | (PlusA _ | MinusA _ | Mult _ | DivI | Mod | Shiftlt | Shiftrt), Top, Int _
+    | (PlusA _ | MinusA _ | Mult _ | DivI | Mod | Shiftlt | Shiftrt), Int _, Top
+    | (PlusA _ | MinusA _ | Mult _ | DivI | Mod | Shiftlt | Shiftrt), Top, Top ->
+      Ok Top
+    | PlusPI, Ptr p, Int x ->
+      Ok (Ptr { p with offset = Address.add p.offset (NonTop x) })
+    | MinusPI, Ptr p, Int x ->
+      Ok (Ptr { p with offset = Address.sub p.offset (NonTop x) })
+    | PlusPI, Ptr p, Top
+    | MinusPI, Ptr p, Top ->
+      Ok (Ptr { p with offset = Top })
+    | MinusPP, Ptr { block = b1; offset = off1}, Ptr { block = b2; offset = off2} ->
       if BlockId.equal b1 b2 then
         Ok (Value.of_addr (Address.sub off1 off2))
       else
-        PtrBinopDifferentBlocks
-    | _, _, _ -> Unknown
+        PtrSubDifferentBlocks
+    | Lt, Int a, Int b ->
+      Ok (Int (if a < b then 1 else 0))
+    | Gt, Int a, Int b ->
+      Ok (Int (if a > b then 1 else 0))
+    | Le, Int a, Int b ->
+      Ok (Int (if a <= b then 1 else 0))
+    | Ge, Int a, Int b ->
+      Ok (Int (if a >= b then 1 else 0))
+    | Eq, Int a, Int b ->
+      Ok (Int (if Int.equal a b then 1 else 0))
+    | Ne, Int a, Int b ->
+      Ok (Int (if Int.equal a b then 0 else 1))
+    | (Lt | Gt | Le | Ge | Eq | Ne), Top, Int _
+    | (Lt | Gt | Le | Ge | Eq | Ne), Int _, Top
+    | (Lt | Gt | Le | Ge | Eq | Ne), Top, Top ->
+      Ok Top
+    | Lt, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.lt off1 off2))
+    | Gt, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.gt off1 off2))
+    | Le, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.le off1 off2))
+    | Ge, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.ge off1 off2))
+    | Eq, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.eq off1 off2))
+    | Eq, Ptr _, Int 0 | Eq, Int 0, _ -> (* ptr == NULL *)
+      Ok (Int 0)
+    | Ne, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
+      when BlockId.equal id1 id2 ->
+        Ok (Value.of_addr (Address.ne off1 off2))
+    | Ne, Ptr _, Int 0 | Ne, Int 0, _ -> (* ptr != NULL *)
+      Ok (Int 1)
+    | (Lt | Gt | Le | Ge | Eq | Ne), Ptr _, Ptr _
+    | (Lt | Gt | Le | Ge | Eq | Ne), Ptr _, Int _
+    | (Lt | Gt | Le | Ge | Eq | Ne), Int _, Ptr _ ->
+      PtrComparisonError
+    | BAnd, Int a, Int b ->
+      Ok (Int (a land b))
+    | BXor, Int a, Int b ->
+      Ok (Int (a lxor b))
+    | BOr, Int a, Int b ->
+      Ok (Int (a lor b))
+    | (BAnd | BXor | BOr), Top, Int _
+    | (BAnd | BXor | BOr), Int _, Top
+    | (BAnd | BXor | BOr), Top, Top ->
+      Ok Top
+    | LAnd, Int a, Int b ->
+      Ok (Int (if a <> 0 && b <> 0 then 1 else 0))
+    | LOr, Int a, Int b ->
+      Ok (Int (if a <> 0 || b <> 0 then 1 else 0))
+    | (LAnd | LOr), Top, Int _
+    | (LAnd | LOr), Int _, Top
+    | (LAnd | LOr), Top, Top ->
+        Ok Top
+    | LAnd, Ptr _, Int a
+    | LAnd, Int a, Ptr _->
+      Ok (Int (if a <> 0 then 1 else 0))
+    | LAnd, Ptr _, Ptr _ ->
+      Ok (Int 1)
+    | LOr, Ptr _, Int _
+    | LOr, Int _, Ptr _ ->
+      Ok (Int 1)
+    | _ -> Unknown
 end
+
+let rec eval_exp (astate : Domain.t) (exp : Exp.t) : ExpEvalRes.t =
+  match exp with
+  | Var id ->
+    Ok (lookup_var (Var.of_id id) astate)
+  | UnOp (op, e, _typ) ->
+    begin
+      match eval_exp astate e with
+      | Ok v -> ExpEvalRes.eval_unop op v
+      | err -> err (* UnOp involving pointer *)
+    end
+  | BinOp (op, e1, e2) ->
+    Format.print_newline () ;
+    let res1 = eval_exp astate e1 in
+    let res2 = eval_exp astate e2 in
+    begin
+      match res1, res2 with
+      | Ok v1, Ok v2 ->
+        ExpEvalRes.eval_binop op v1 v2
+      | Unknown, Ok _ | Ok _, Unknown | Unknown, Unknown ->
+        Unknown
+      | Ok _, err | err, Ok _ | Unknown, err  | err, Unknown ->
+        err
+      | err1, _ -> (* for now report only the lhs issue *)
+        err1
+    end
+  | Const (Const.Cint c) ->
+    begin
+      match IntLit.to_int c with
+      | Some n -> Ok (Int n)
+      | None -> Ok Top
+    end
+  | Cast (_typ, e) ->
+    eval_exp astate e
+  | Lvar pvar ->
+    Ok (lookup_var (Var.of_pvar pvar) astate)
+  (* Lfield *)
+  (* Lindex *)
+  | Sizeof { nbytes = Some n } ->
+    Ok (Int n)
+  (* Sizeof for [dynamic_length] *)
+  | _ ->
+    Unknown

@@ -1,0 +1,268 @@
+
+module Id = struct
+  type t = int [@@deriving compare, equal, hash]
+
+  let initial_next_fresh = 1
+
+  let next_fresh = AnalysisGlobalState.make_dls ~init:(fun () -> initial_next_fresh)
+
+  let fresh () =
+  let l = DLS.get next_fresh in
+  DLS.set next_fresh (l + 1) ;
+  l
+
+  let pp = Format.pp_print_int
+
+end
+
+let rec lookup_variable id vars =
+  match vars with
+    [] -> None
+  | (a,b)::l -> if Id.equal b id then Some a else lookup_variable id l
+
+let rec lookup_variable_id v vars =
+  match vars with
+    [] -> None
+  | (a,b)::l -> if Var.equal a v then Some b else lookup_variable_id v l
+
+module Expr = struct
+  type t =
+      Var of int
+    | CVar of int
+    | Const of const_val
+    | UnOp of (unop * t)
+    | BinOp of (binop * t * t)
+    | Undef
+
+  and unop =
+      Base
+    | End
+    | BVnot  (** bitwise complement *)  
+    | Lnot  (** logical not *)
+    | Puminus  (** unary minus *)
+
+  and binop =
+      Pplus
+    | Pminus
+    | Pmult
+    | Pdiv
+    | Pmod
+    | BVlshift  (** shift left *)
+    | BVrshift  (** shift right *)
+    | Pless
+    | Plesseq
+    | Peq
+    | Pneq
+    | BVand  (** bitwise AND *)
+    | BVor  (** bitwise OR *)
+    | BVxor  (** bitwise XOR *)
+    | Land  (** logical AND *)
+    | Lor  (** logical OR *)
+  
+  and const_val =
+      Ptr of int
+    | Int of Int64.t
+    | String of string
+    | Float of float
+
+  let one = Const (Int 1L)
+  let zero = Const (Int 0L)
+  let null = Const (Ptr 0)
+  let ret = Var 0
+
+  let rec from_SIL (exp: IR.Exp.t) vars =
+    match exp with
+    | Var ident ->
+      begin
+        match lookup_variable_id (Var.of_id ident) vars with
+        | Some id -> Var id
+        | None -> Undef
+      end
+    | Lvar pvar ->
+      begin
+        match lookup_variable_id (Var.of_pvar pvar) vars with
+        | Some id -> CVar id
+        | None -> Undef
+      end
+    | Lfield _ -> (* TODO *)
+      Undef
+    | Lindex _ -> (* TODO *)
+      Undef
+    | Sizeof { nbytes = Some i } -> Const (Int (Int64.of_int i))
+    | Const (Const.Cint i) -> Const (Int (Z.to_int64 (IntLit.to_big_int i)))
+    | Const (Const.Cstr s) -> Const (String s)
+    | Const (Const.Cfloat f) -> Const (Float f)
+    | Cast (_, exp) -> from_SIL exp vars
+    | UnOp (Neg, exp, _) -> UnOp (Puminus, from_SIL exp vars)
+    | UnOp (BNot, exp, _) -> UnOp (BVnot, from_SIL exp vars)
+    | UnOp (LNot, exp, _) -> UnOp (Lnot, from_SIL exp vars)
+    | BinOp ((PlusA _ | PlusPI), exp1, exp2) -> BinOp (Pplus, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp ((MinusA _ | MinusPI | MinusPP), exp1, exp2) -> BinOp (Pminus, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Mult _, exp1, exp2) -> BinOp (Pmult, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp ((DivI | DivF), exp1, exp2) -> BinOp (Pdiv, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Mod, exp1, exp2) -> BinOp (Pmod, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Shiftlt, exp1, exp2) -> BinOp (BVlshift, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Shiftrt, exp1, exp2) -> BinOp (BVrshift, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Lt, exp1, exp2) -> BinOp (Pless, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Gt, exp1, exp2) -> BinOp (Pless, from_SIL exp2 vars, from_SIL exp1 vars)
+    | BinOp (Le, exp1, exp2) -> BinOp (Plesseq, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Ge, exp1, exp2) -> BinOp (Plesseq, from_SIL exp2 vars, from_SIL exp1 vars)
+    | BinOp (Eq, exp1, exp2) -> BinOp (Peq, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (Ne, exp1, exp2) -> BinOp (Pneq, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (BAnd, exp1, exp2) -> BinOp (BVand, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (BOr, exp1, exp2) -> BinOp (BVor, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (BXor, exp1, exp2) -> BinOp (BVxor, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (LAnd, exp1, exp2) -> BinOp (Land, from_SIL exp1 vars, from_SIL exp2 vars)
+    | BinOp (LOr, exp1, exp2) -> BinOp (Lor, from_SIL exp1 vars, from_SIL exp2 vars)
+    | (Const _ | Sizeof _ | Exn _ | Closure _) ->
+      Undef
+
+  let rec var_to_string vars v =
+    match lookup_variable v vars with
+    | Some var -> "<" ^ var_string var ^ "," ^ Int.to_string v ^ ">"
+    | None -> Int.to_string v
+
+  and var_string = function
+    | Var.ProgramVar pvar when Pvar.is_return pvar -> "%ret"
+    | Var.ProgramVar pvar -> Pvar.get_simplified_name pvar
+    | Var.LogicalVar id -> Ident.to_string id
+
+  let const_to_string c =
+    match c with
+    | Ptr p -> if Int.equal p 0 then "NULL" else Printf.sprintf "0x%x" p
+    | Int i -> Int64.to_string i
+    | String s -> "\"" ^ String.escaped s ^ "\""
+    | Float f -> Float.to_string f
+
+  let unop_to_string o =
+    match o with
+    | Base -> "base"
+    | End -> "end"
+    | Puminus -> "-"
+    | BVnot -> "~"
+    | Lnot -> "!"
+
+  let binop_to_string o =
+    match o with
+    | Pplus -> "+"
+    | Pminus -> "-"
+    | Pmult -> "*"
+    | Pdiv -> "/"
+    | Pmod -> "%"
+    | BVlshift -> "<<"
+    | BVrshift -> ">>"
+    | Pless -> "<"
+    | Plesseq -> "<="
+    | Peq -> "=="
+    | Pneq -> "!="
+    | BVand -> "&"
+    | BVxor -> "^"
+    | BVor -> "|"
+    | Land -> "&&"
+    | Lor -> "||"
+
+  let rec to_string vars exp =
+  match exp with
+  | Var a -> var_to_string vars a
+  | CVar a -> var_to_string vars a
+  | Const a -> const_to_string a
+  | UnOp (op,a) -> unop_to_string op ^ "(" ^ to_string vars a ^ ")"
+  | BinOp (op,a,b) -> "(" ^ to_string vars a ^ binop_to_string op ^ to_string vars b ^ ")"
+  | Undef -> "Undef"
+
+end
+
+type t = {
+  spatial: spatial;
+  pure: pure;
+}
+
+and block = {
+  id : int;
+  base : int;
+  end_ : int;
+  freed : bool
+}
+
+and heap_pred =
+  | PointsToExp of Expr.t * Expr.t * Expr.t (* source, size_of_field, destination *)
+  | PointsToBlock of Expr.t * Expr.t * block (* source, size_of_field, memory_block *)
+  | PointsToUniformBlock of Expr.t * Expr.t * block * Expr.const_val (* source, size_of_field, memory_block, uniform_value *)
+
+and spatial = heap_pred list
+
+and pure = Expr.t list
+
+let empty = {spatial = []; pure = []}
+
+let rec pure_to_string vars p =
+  match p with
+  | [] -> ""
+  | first::[] -> Expr.to_string vars first
+  | first::rest -> Expr.to_string vars first ^ " & " ^ pure_to_string vars rest
+
+let rec spatial_to_string vars s =
+  match s with
+  | [] -> ""
+  | first::[] -> points_to_to_string vars first
+  | first::rest -> points_to_to_string vars first ^ " * " ^ spatial_to_string vars rest
+
+  and points_to_to_string vars points_to =
+  match points_to with
+  | PointsToExp (source, size, dest) ->
+    Expr.to_string vars source ^ " -(" ^ Expr.to_string vars size ^ ")-> " ^ Expr.to_string vars dest
+  | PointsToBlock (source, size, block) ->
+    Expr.to_string vars source ^ " -(" ^ Expr.to_string vars size ^ ")-> " ^ block_to_string block
+  | PointsToUniformBlock (source, size, block, value) ->
+    Expr.to_string vars source ^ " -(" ^ Expr.to_string vars size ^ ")-> " ^ uniform_block_to_string block value
+
+and block_to_string b =
+  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int.to_string b.base ^ ";end=" ^ Int.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ "]"
+
+and uniform_block_to_string b v =
+  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int.to_string b.base ^ ";end=" ^ Int.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ ";uniform_value=" ^ Expr.const_to_string v ^ "]"
+
+let to_string vars f =
+  spatial_to_string vars f.spatial ^ "\n" ^ pure_to_string vars f.pure
+
+module IdSet = Stdlib.Set.Make (Int)
+
+let lookup_pure_const_exp_of_id id pure =
+  let rec resolve visited id =
+    if IdSet.mem id visited then
+      None
+    else
+      let visited = IdSet.add id visited in
+      match
+        Stdlib.List.find_opt
+        (function
+        | Expr.BinOp (Expr.Peq, Expr.Var lhs, _) when Id.equal lhs id ->
+          true
+        | Expr.BinOp (Expr.Peq, _, Expr.Var rhs) when Id.equal rhs id ->
+          true
+        | _ -> false)
+        pure
+      with
+      | None -> None
+      | Some (Expr.BinOp (Expr.Peq, Expr.Var lhs, rhs)) when Id.equal lhs id ->
+        resolve_rhs visited rhs
+      | Some (Expr.BinOp (_, lhs, Expr.Var rhs)) when Id.equal rhs id ->
+        resolve_rhs visited lhs
+      | _ -> None
+    and resolve_rhs visited = function
+      | Expr.Const _ as c -> Some c
+      | Expr.Var id' -> resolve visited id'
+      | _ -> None
+    in
+    resolve IdSet.empty id
+
+let take_heap_pred id spatial =
+  let rec traverse acc = function
+  | [] -> None
+  | (PointsToBlock (Expr.Var v, _, _) as hp) :: l
+    when Id.equal v id ->
+      Some (hp, List.rev_append acc l)
+  | hp :: l ->
+    traverse (hp :: acc) l
+  in
+  traverse [] spatial

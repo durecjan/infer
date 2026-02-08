@@ -1,5 +1,48 @@
 open! IStd
 
+module Id = struct
+  type t = int [@@deriving compare, equal, hash]
+
+  let initial_next_fresh = 1
+
+  let next_fresh = AnalysisGlobalState.make_dls ~init:(fun () -> initial_next_fresh)
+
+  let fresh () =
+  let l = DLS.get next_fresh in
+  DLS.set next_fresh (l + 1) ;
+  l
+
+  let pp = Format.pp_print_int
+
+end
+
+let get_fresh_id = Id.fresh
+
+
+module HeapCursor = struct
+  type t = int [@@deriving compare, equal, hash]
+
+  let cursor = Atomic.make 1
+
+  let get = Atomic.get cursor
+
+  let update (n : int) =
+    let rec loop () =
+      let current = Atomic.get cursor in
+      let next = current + n in
+      if Atomic.compare_and_set cursor current next
+      then current
+      else loop ()
+    in
+    loop ()
+
+end
+
+let get_heap_cursor = HeapCursor.get
+
+let update_heap_cursor = HeapCursor.update
+
+
 module Address = struct
 
   type t =
@@ -92,25 +135,12 @@ module Address = struct
     | NonTop n -> Format.pp_print_int fmt n
 end
 
-module BlockId = struct
-
-    type t = int
-
-    let counter = ref 0
-
-    let fresh () = incr counter; !counter
-
-    let compare : t -> t -> int = Int.compare
-
-    let equal (x : t) (y : t) : bool = Int.equal x y
-
-    let pp = Format.pp_print_int
-  end
-
 module Value = struct
   type t =
+      Ptr of { block : Id.t; offset : Address.t }
     | Int of int
-    | Ptr of { block : BlockId.t; offset : Address.t }
+    | String of string
+    | Float of float
     | Top
 
   let of_int n = Int n
@@ -128,7 +158,7 @@ module Value = struct
     | Top, _ -> false
     | Int a, Int b -> a <= b
     | Ptr id1, Ptr id2
-      when BlockId.equal id1.block id2.block ->
+      when Id.equal id1.block id2.block ->
         Address.leq ~lhs:id1.offset ~rhs:id2.offset
     | _, _ -> false
 
@@ -137,7 +167,7 @@ module Value = struct
     | Top, _ | _, Top -> Top
     | Int a, Int b -> Int (max a b)
     | Ptr id1, Ptr id2
-      when BlockId.equal id1.block id2.block ->
+      when Id.equal id1.block id2.block ->
         Ptr 
           { block = id1.block
           ; offset = Address.join id1.offset id2.offset }
@@ -154,7 +184,7 @@ module Value = struct
         Int (max a b)
     | Int _, Int _ -> Top
     | Ptr id1, Ptr id2
-      when BlockId.equal id1.block id2.block ->
+      when Id.equal id1.block id2.block ->
         Ptr
           { block = id1.block
           ; offset = 
@@ -167,9 +197,11 @@ module Value = struct
   let pp fmt = function
     | Top -> Format.pp_print_string fmt "Top"
     | Int n -> Format.fprintf fmt "Int(%d)" n
+    | Float f -> Format.fprintf fmt "Float(%f)" f
+    | String s -> Format.fprintf fmt "String(%s)" s
     | Ptr { block; offset } ->
       Format.fprintf fmt "Ptr(block=%a, off=%a)"
-      BlockId.pp block
+      Id.pp block
       Address.pp offset
 
 end
@@ -201,48 +233,79 @@ module Block = struct
     ; freed = prev.freed || next.freed }
 end
 
-module Heap = AbstractDomain.Map (BlockId) (Block)
+module Heap = AbstractDomain.Map (Id) (Block)
 
-(* Define VarKey since Var does not satisfy IStdlib.PrettyPrintable.PrintableOrderedType *)
-module VarKey : PrettyPrintable.PrintableOrderedType = struct
-  type t = Var.t
+module Stack = struct
+  module VarMap = Stdlib.Map.Make(Var)
 
-  let compare = Var.compare
-  let pp = Var.pp
+  type t = Id.t VarMap.t
 end
 
-module Env : AbstractDomain.MapS
-  with type key = VarKey.t
-  and type value = Value.t =
-  AbstractDomain.Map (VarKey) (Value)
+module Env = struct
+  module IdMap = Stdlib.Map.Make(Id)
+
+  type t = Value.t IdMap.t
+end
+
+module Formula = AtlasFormula
 
 module Domain = struct
   type t =
     { env: Env.t
-    ; heap: Heap.t 
-    ; heap_cursor : Address.t}
-  
+    ; stack: Stack.t
+    ; heap: Heap.t
+    ; formula: Formula.t }
   let init =
-    { env = Env.empty
+    { env = Env.IdMap.empty
+    ; stack = Stack.VarMap.empty
     ; heap = Heap.empty
-    ; heap_cursor = Address.of_int 0 }
+    ; formula = Formula.empty }
 
   let leq ~lhs ~rhs = 
-    Env.leq ~lhs:lhs.env ~rhs:rhs.env &&
-    Heap.leq ~lhs:lhs.heap ~rhs:rhs.heap
+    Heap.leq ~lhs:lhs.heap ~rhs:rhs.heap (* && Formula.leq TODO *)
 
-  let join lhs rhs =
-    { env = Env.join lhs.env rhs.env
-    ; heap = Heap.join lhs.heap rhs.heap
-    ; heap_cursor = Address.join lhs.heap_cursor rhs.heap_cursor}
+  let join _lhs _rhs =
+    Logging.die Die.InternalError "join not supported yet: domain is path-sensitive"
 
-  let widen ~prev ~next ~num_iters =
-    { env = Env.widen ~prev:prev.env ~next:next.env ~num_iters
-    ; heap= Heap.widen ~prev:prev.heap ~next:next.heap ~num_iters 
-    ; heap_cursor = Address.widen ~prev:prev.heap_cursor ~next:next.heap_cursor ~num_iters }
+  let widen ~_prev ~_next ~_num_iters =
+    Logging.die Die.InternalError "join not supported yet: domain is path-sensitive"
 
-  let pp fmt {env; heap; heap_cursor} =
-    Format.fprintf fmt "@[<v2>Env=%a@;Blocks=%a@;Cursor=%a@]" Env.pp env Heap.pp heap Address.pp heap_cursor
+  let pp_stack_env fmt (stack : Stack.t) (env : Env.t) =
+    Format.fprintf fmt "@[<v>Stack/Env:@," ;
+    Stack.VarMap.iter
+      (fun var av ->
+        let value =
+          match Env.IdMap.find_opt av env with
+          | Some v -> v
+          | None -> Value.Top
+        in
+        Format.fprintf fmt "  %a ↦ %a ↦ %a@,"
+          Var.pp var
+          Id.pp av
+          Value.pp value
+      )
+      stack ;
+    Format.fprintf fmt "@]"
+
+  let pp_heap fmt (heap : Heap.t) =
+    Format.fprintf fmt "@[<v>Heap:@," ;
+    Heap.iter
+      (fun bid block ->
+        Format.fprintf fmt
+          "  %a: base=%a end=%a freed=%b@,"
+          Id.pp bid
+          Address.pp block.base
+          Address.pp block.end_
+          block.freed
+      )
+      heap ;
+    Format.fprintf fmt "@]"
+
+  let pp fmt (astate : t) =
+    Format.fprintf fmt "@[<v 0>" ;
+    pp_stack_env fmt astate.stack astate.env ;
+    pp_heap fmt astate.heap ;
+    Format.fprintf fmt "@]"
 end
 
 type t = Domain.t
@@ -253,41 +316,31 @@ let leq ~lhs ~rhs = Domain.leq ~lhs ~rhs
 
 let join = Domain.join
 
-let widen ~prev ~next ~num_iters = Domain.widen ~prev ~next ~num_iters
+let widen ~prev ~next ~num_iters = Domain.widen ~_prev:prev ~_next:next ~_num_iters:num_iters
 
 let pp fmt astate = Domain.pp fmt astate
 
 let alloc_block (size: Value.t) (astate: t) : t * Value.t =
-  let id = BlockId.fresh () in
-  let size' =
+  let id = Id.fresh () in
+  let base', end' =
     match size with
-    | Value.Int s -> Address.NonTop s
-    | Value.Ptr _ | Value.Top -> Address.Top
-  in
-  let base = astate.heap_cursor in
-  let new_cursor =
-    match base, size' with
-    | Address.NonTop b, Address.NonTop s ->
-      Address.of_int (b + s + 1)
-    | Address.Top, _ | _, Address.Top ->
-      Address.Top
+    | Value.Int s ->
+      let base = HeapCursor.update (s + 1) in
+      Address.NonTop base, Address.NonTop (base + s)
+    | Value.Ptr _ | Value.Top | Value.Float _ | Value.String _ ->
+      Address.Top, Address.Top
   in
   let block =
     let open Block in
-    { base = base
-    ; end_ =
-      (match base, size' with
-      | Address.NonTop b, Address.NonTop s ->
-        Address.of_int (b + s)
-      | Address.Top, _ | _, Address.Top ->
-        Address.Top )
+    { base = base'
+    ; end_ = end'
     ; freed = false }
   in
   let new_blocks = Heap.add id block astate.heap in
-  { astate with heap = new_blocks; heap_cursor = new_cursor },
+  { astate with heap = new_blocks },
   Value.Ptr { block = id; offset = Address.NonTop 0 }
 
-let free_block (id: BlockId.t) (astate: t) : t =
+let free_block (id: Id.t) (astate: t) : t =
   let heap' =
     (Heap.update id
       (function 
@@ -298,7 +351,7 @@ let free_block (id: BlockId.t) (astate: t) : t =
   in
   { astate with heap = heap' }
 
-let is_freed (id: BlockId.t) (astate: t) : bool =
+let is_freed (id: Id.t) (astate: t) : bool =
   let block = Heap.find_opt id astate.heap in
   match block with
   | Some { base = _; end_ = _; freed = true } ->
@@ -336,18 +389,20 @@ let end_ (loc:Address.t) (astate: t) : Address.t option =
     astate.heap
     None
 
-let key_of_var (var : Var.t) : Env.key =
-  Obj.magic var
-
 let lookup_var (var : Var.t) (astate : t) : Value.t =
-  let key = key_of_var var in
-  match Env.find_opt key astate.env with
-    | Some v -> v
+  match Stack.VarMap.find_opt var astate.stack with
+    | Some av ->
+      begin
+        match Env.IdMap.find_opt av astate.env with
+        | Some v -> v
+        | None -> Value.Top (* this should not happen - every AV in stack must be bound in env *)
+      end
     | None -> Value.Top
 
 let store_var (var : Var.t) (value: Value.t) (astate: t) : t =
-  let key = key_of_var var in
-  { astate with env= Env.add key value astate.env }
+  let av = Id.fresh () in
+  { astate with env = Env.IdMap.add av value astate.env
+  ; stack = Stack.VarMap.add var av astate.stack }
 
 module ExpEvalRes = struct
   type t =
@@ -368,6 +423,7 @@ module ExpEvalRes = struct
       Unknown
     | (Neg | BNot | LNot), Top ->
       Ok Top
+    | _ -> Unknown
 
   let eval_binop (op: Binop.t) (v1: Value.t) (v2: Value.t) : t =
     match op, v1, v2 with
@@ -379,7 +435,8 @@ module ExpEvalRes = struct
       Ok (Int (a * b))
     | DivI, Int a, Int b ->
       Ok (Int (a / b))
-    (* | DivF  (** / for floats *) *)
+    | DivF, Float a, Float b ->
+      Ok (Float (a /. b))
     | Mod, Int a, Int b ->
       Ok (Int (a mod b))
     | Shiftlt, Int a, Int b ->
@@ -398,7 +455,7 @@ module ExpEvalRes = struct
     | MinusPI, Ptr p, Top ->
       Ok (Ptr { p with offset = Top })
     | MinusPP, Ptr { block = b1; offset = off1}, Ptr { block = b2; offset = off2} ->
-      if BlockId.equal b1 b2 then
+      if Id.equal b1 b2 then
         Ok (Value.of_addr (Address.sub off1 off2))
       else
         PtrSubDifferentBlocks
@@ -419,24 +476,24 @@ module ExpEvalRes = struct
     | (Lt | Gt | Le | Ge | Eq | Ne), Top, Top ->
       Ok Top
     | Lt, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.lt off1 off2))
     | Gt, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.gt off1 off2))
     | Le, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.le off1 off2))
     | Ge, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.ge off1 off2))
     | Eq, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.eq off1 off2))
     | Eq, Ptr _, Int 0 | Eq, Int 0, _ -> (* ptr == NULL *)
       Ok (Int 0)
     | Ne, Ptr { block = id1; offset = off1 }, Ptr { block = id2; offset = off2 }
-      when BlockId.equal id1 id2 ->
+      when Id.equal id1 id2 ->
         Ok (Value.of_addr (Address.ne off1 off2))
     | Ne, Ptr _, Int 0 | Ne, Int 0, _ -> (* ptr != NULL *)
       Ok (Int 1)
@@ -498,12 +555,13 @@ let rec eval_exp (astate : Domain.t) (exp : Exp.t) : ExpEvalRes.t =
       | err1, _ -> (* for now report only the lhs issue *)
         err1
     end
-  | Const (Const.Cint c) ->
-    begin
-      match IntLit.to_int c with
-      | Some n -> Ok (Int n)
-      | None -> Ok Top
-    end
+  | Const (Const.Cint i) ->
+    let z = IntLit.to_big_int i in
+    Ok (Int (Z.to_int z))
+  | Const (Const.Cstr s) ->
+    Ok (String s)
+  | Const (Const.Cfloat f) ->
+    Ok (Float f)
   | Cast (_typ, e) ->
     eval_exp astate e
   | Lvar pvar ->

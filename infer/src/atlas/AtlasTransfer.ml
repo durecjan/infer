@@ -2,7 +2,7 @@ open! IStd
 
 module Domain = AtlasDomain
 module Address = Domain.Address
-module BlockId = Domain.BlockId
+module Id = Domain.Id
 module Value = Domain.Value
 module ExpEvalRes = Domain.ExpEvalRes
 
@@ -30,25 +30,25 @@ let report
       msg
 
 
-let double_free (r : reporter) (loc : Location.t) (block : BlockId.t) =
+let double_free (r : reporter) (loc : Location.t) (block : Id.t) =
   report r loc IssueType.atlas_double_free
     (Format.asprintf
       "free called on already freed block (blockId=%a)"
-      BlockId.pp block)
+      Id.pp block)
 
-let free_non_base_pointer (r : reporter) (loc : Location.t) (block : BlockId.t) (offset : Address.t) =
+let free_non_base_pointer (r : reporter) (loc : Location.t) (block : Id.t) (offset : Address.t) =
   report r loc IssueType.atlas_free_non_base_pointer
     (Format.asprintf
       "free called with non-base pointer (blockId=%a, offset=%a)"
-      BlockId.pp block
+      Id.pp block
       Address.pp offset)
 
-let use_after_free (r: reporter) (loc: Location.t) (var: Var.t) (block: BlockId.t) =
+let use_after_free (r: reporter) (loc: Location.t) (var: Var.t) (block: Id.t) =
   report r loc IssueType.atlas_use_after_free
     (Format.asprintf
       "usage of variable (%a) storing a value pointing to freed block (blockId=%a)"
       Var.pp var
-      BlockId.pp block)
+      Id.pp block)
 
 let free_invalid_addr (r: reporter) (loc: Location.t) (value: Value.t) =
   report r loc IssueType.atlas_free_invalid_addr
@@ -154,13 +154,14 @@ let exec_free_instr actual astate r loc =
   | Some Value.Ptr { block; offset } ->
     free_non_base_pointer r loc block offset ;
     Domain.free_block block astate
-  | Some Value.Int 0 ->
-    astate (* free(NULL) *)
+  | Some Value.Int 0 -> (* free(NULL) *)
+    astate
   | Some Value.Int i ->
     free_invalid_addr r loc (Value.Int i) ;
     astate
-  | Some Value.Top ->
-    astate (* we do not know anything *)
+  | Some Value.Top
+  | Some Value.Float _
+  | Some Value.String _
   | None -> astate
 
 

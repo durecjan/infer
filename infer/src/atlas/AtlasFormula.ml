@@ -70,53 +70,6 @@ module Expr = struct
   let null = Const (Ptr 0)
   let ret = Var 0
 
-  let rec from_SIL (exp: IR.Exp.t) vars =
-    match exp with
-    | Var ident ->
-      begin
-        match lookup_variable_id (Var.of_id ident) vars with
-        | Some id -> Var id
-        | None -> Undef
-      end
-    | Lvar pvar ->
-      begin
-        match lookup_variable_id (Var.of_pvar pvar) vars with
-        | Some id -> CVar id
-        | None -> Undef
-      end
-    | Lfield _ -> (* TODO *)
-      Undef
-    | Lindex _ -> (* TODO *)
-      Undef
-    | Sizeof { nbytes = Some i } -> Const (Int (Int64.of_int i))
-    | Const (Const.Cint i) -> Const (Int (Z.to_int64 (IntLit.to_big_int i)))
-    | Const (Const.Cstr s) -> Const (String s)
-    | Const (Const.Cfloat f) -> Const (Float f)
-    | Cast (_, exp) -> from_SIL exp vars
-    | UnOp (Neg, exp, _) -> UnOp (Puminus, from_SIL exp vars)
-    | UnOp (BNot, exp, _) -> UnOp (BVnot, from_SIL exp vars)
-    | UnOp (LNot, exp, _) -> UnOp (Lnot, from_SIL exp vars)
-    | BinOp ((PlusA _ | PlusPI), exp1, exp2) -> BinOp (Pplus, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp ((MinusA _ | MinusPI | MinusPP), exp1, exp2) -> BinOp (Pminus, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Mult _, exp1, exp2) -> BinOp (Pmult, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp ((DivI | DivF), exp1, exp2) -> BinOp (Pdiv, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Mod, exp1, exp2) -> BinOp (Pmod, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Shiftlt, exp1, exp2) -> BinOp (BVlshift, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Shiftrt, exp1, exp2) -> BinOp (BVrshift, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Lt, exp1, exp2) -> BinOp (Pless, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Gt, exp1, exp2) -> BinOp (Pless, from_SIL exp2 vars, from_SIL exp1 vars)
-    | BinOp (Le, exp1, exp2) -> BinOp (Plesseq, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Ge, exp1, exp2) -> BinOp (Plesseq, from_SIL exp2 vars, from_SIL exp1 vars)
-    | BinOp (Eq, exp1, exp2) -> BinOp (Peq, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (Ne, exp1, exp2) -> BinOp (Pneq, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (BAnd, exp1, exp2) -> BinOp (BVand, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (BOr, exp1, exp2) -> BinOp (BVor, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (BXor, exp1, exp2) -> BinOp (BVxor, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (LAnd, exp1, exp2) -> BinOp (Land, from_SIL exp1 vars, from_SIL exp2 vars)
-    | BinOp (LOr, exp1, exp2) -> BinOp (Lor, from_SIL exp1 vars, from_SIL exp2 vars)
-    | (Const _ | Sizeof _ | Exn _ | Closure _) ->
-      Undef
-
   let rec var_to_string vars v =
     match lookup_variable v vars with
     | Some var -> "<" ^ var_string var ^ "," ^ Int.to_string v ^ ">"

@@ -140,3 +140,77 @@ and subst_to_string vars subst =
     "{"
   in
   traversal ^ "}"
+
+
+(* debugging prints *)
+
+let rec sil_exp_to_string e =
+  let open Exp in
+  match e with
+    Var id -> "Var(" ^ Ident.to_string id ^ ")"
+  | Lvar pvar -> "Lvar(" ^ Pvar.to_string pvar ^ ")"
+  | Const c -> "Const(" ^ sil_const_to_string c ^ ")"
+  | Cast (typ, e1) -> "Cast(" ^ Typ.to_string typ ^ ", " ^ sil_exp_to_string e1 ^ ")"
+  | UnOp (op, e1, typ) -> "UnOp(" ^ sil_unop_to_string op ^ ", " ^ sil_exp_to_string e1 ^ ", " ^ typ_opt_to_string typ ^ ")"
+  | BinOp (op, e1, e2) -> "BinOp(" ^ sil_binop_to_string op ^ ", " ^ sil_exp_to_string e1 ^ ", " ^ sil_exp_to_string e2 ^ ")"
+  | Lfield ({ exp }, field, typ) -> "Lfield(" ^ sil_exp_to_string exp ^ ", " ^ Fieldname.to_string field ^ ", " ^ Typ.to_string typ ^ ")"
+  | Lindex (e1, e2) -> "Lindex(" ^ sil_exp_to_string e1 ^ ", " ^ sil_exp_to_string e2 ^ ")"
+  | Sizeof { typ; nbytes; dynamic_length } ->
+      let nbytes_str =
+        match nbytes with
+        | None -> "None"
+        | Some n -> "Some(" ^ Int.to_string n ^ ")"
+      in
+      let dyn_str =
+        match dynamic_length with
+        | None -> "None"
+        | Some e -> "Some(" ^ sil_exp_to_string e ^ ")"
+      in
+      "Sizeof(" ^ Typ.to_string typ ^ ", " ^ nbytes_str ^ ", " ^ dyn_str ^ ")"
+  | Closure _ -> "Closure()"
+  | _ -> "Undef"
+
+  and sil_const_to_string = function
+    Const.Cint i ->
+      "Cint(" ^ IntLit.to_string i ^ ")"
+  | Const.Cfloat f ->
+      "Cfloat(" ^ string_of_float f ^ ")"
+  | Const.Cstr s ->
+      "Cstr(\"" ^ s ^ "\")"
+  | Const.Cfun pn ->
+      "Cfun(" ^ Procname.to_string pn ^ ")"
+  | Const.Cclass _ ->
+      "Cclass()"
+
+  and sil_unop_to_string = function
+  | Unop.Neg -> "Neg"
+  | Unop.BNot -> "BNot"
+  | Unop.LNot -> "LNot"
+
+  and sil_binop_to_string = function
+    Binop.PlusA _ -> "PlusA"
+  | Binop.PlusPI -> "PlusPI"
+  | Binop.MinusA _ -> "MinusA"
+  | Binop.MinusPI -> "MinusPI"
+  | Binop.MinusPP -> "MinusPP"
+  | Binop.Mult _ -> "Mult"
+  | Binop.DivI -> "DivI"
+  | Binop.DivF -> "DivF"
+  | Binop.Mod -> "Mod"
+  | Binop.Shiftlt -> "Shiftlt"
+  | Binop.Shiftrt -> "Shiftrt"
+  | Binop.Lt -> "Lt"
+  | Binop.Gt -> "Gt"
+  | Binop.Le -> "Le"
+  | Binop.Ge -> "Ge"
+  | Binop.Eq -> "Eq"
+  | Binop.Ne -> "Ne"
+  | Binop.BAnd -> "BAnd"
+  | Binop.BXor -> "BXor"
+  | Binop.BOr -> "BOr"
+  | Binop.LAnd -> "LAnd"
+  | Binop.LOr -> "LOr"
+
+  and typ_opt_to_string = function
+      Some t -> "Some(" ^ Typ.to_string t ^ ")"
+    | None -> "None"

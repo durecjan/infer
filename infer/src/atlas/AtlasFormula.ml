@@ -219,3 +219,55 @@ let take_heap_pred id spatial =
     traverse (hp :: acc) l
   in
   traverse [] spatial
+
+let is_heap_pred_source id f =
+  let rec traverse l =
+    match l with
+      [] -> false
+    | (PointsToExp (Var v, _, _)) :: _
+    | (PointsToBlock (Var v, _, _)) :: _
+    | (PointsToUniformBlock (Var v, _, _, _)) :: _
+      when Id.equal v id -> true
+    | _ :: l ->
+      traverse l
+  in
+  traverse f.spatial
+
+let is_heap_pred_dest id f =
+  let rec traverse l =
+    match l with
+      [] -> false
+    | (PointsToExp (_, _, Var v)) :: _
+      when Id.equal v id -> true
+    | _ :: l ->
+      traverse l
+  in
+  traverse f.spatial
+
+let add_heap_pred p f =
+  let { spatial } = f in
+  { f with spatial = p :: spatial }
+
+let heap_pred_find_src_of_dest id f =
+  let rec traverse l =
+    match l with
+      [] -> None
+    | (PointsToExp (source, _, Var v)) :: _
+      when Id.equal v id -> Some source
+    | _ :: l ->
+      traverse l
+  in
+  traverse f.spatial
+
+(** traverse looking via source, if not then via dest, until you find some block *)
+let rec heap_pred_find_block id spatial =
+  match spatial with
+    [] -> None
+  | PointsToBlock (Var v, _, b) :: _
+  | PointsToUniformBlock (Var v, _, b, _) :: _
+    when Id.equal v id -> Some b
+  | PointsToExp (Var src, _, Var dest) :: _
+    when Id.equal dest id ->
+      heap_pred_find_block src spatial
+  | _ :: rest ->
+    heap_pred_find_block id rest

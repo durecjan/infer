@@ -33,12 +33,10 @@ let free_non_base_pointer (r : reporter) (loc : Location.t) =
     (Format.asprintf
       "free called with non-base pointer")
 
-(*
 let use_after_free (r: reporter) (loc: Location.t) =
   report r loc IssueType.atlas_use_after_free
     (Format.asprintf
       "usage of variable storing a value pointing to freed block")
-*)
 
 (*
 let free_invalid_addr (r: reporter) (loc: Location.t) =
@@ -66,12 +64,15 @@ module TransferFunctions2 = struct
     let r = reporter_of_analysis analysis_data in
     let state' = match instr with
     | Sil.Load { id = ident; e = rhs; typ = _; loc = _} ->
+      (* Format.print_string ("\nSIL.Load rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
       let (rhs', state') = sil_exp_to_expr rhs state in
       exec_load_instr ident rhs' state'
-    | Sil.Store {e1 = lhs; typ = _; e2 = rhs; loc = _} ->
+    | Sil.Store {e1 = lhs; typ = _; e2 = rhs; loc} ->
+      (* Format.print_string ("\nSIL store lhs:" ^ sil_exp_to_string lhs ^ "\n"); *)
+      (* Format.print_string ("\nSIL store rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
       let (lhs', state') = sil_exp_to_expr lhs state in
       let (rhs', state') = sil_exp_to_expr rhs state' in
-      exec_store_instr lhs' rhs' state'
+      exec_store_instr r loc lhs' rhs' state'
     | Sil.Call
       ( (ident, _), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
@@ -94,11 +95,24 @@ module TransferFunctions2 = struct
 
   and exec_load_instr ident rhs state =
     let open State in
+    let open Formula in
     let open Expr in
     let lhs_var = Var.of_id ident in
     let (lhs_id, state) =
       get_existing_canonical_or_mk_fresh_id_of_var lhs_var state
     in
+    match get_base_and_offset_from_expr rhs with
+      Some (id, _off) when is_heap_pred_source id state.formula ->
+        let pred =
+          PointsToExp (rhs, Const (Int 0L)(* cell size TODO *), Var lhs_id)
+        in
+        let formula = add_heap_pred pred state.formula in
+        { state with formula }
+    | _ -> assign_to_variable lhs_id rhs state
+
+  and assign_to_variable lhs_id rhs state =
+    let open Expr in
+    let open State in
     match rhs with
     | Var rhs_id ->
       (* Both Ids already canonical *)
@@ -112,29 +126,40 @@ module TransferFunctions2 = struct
         { state.formula with pure = exp :: state.formula.pure }
       in
       { state with formula }
-    
-  and exec_store_instr lhs rhs state =
+
+  and exec_store_instr r loc lhs rhs state =
     let open State in
+    let open Formula in
     let open Expr in
+    check_valid_deref r loc lhs state;
     match lhs with
     | Var lhs_id ->
-      begin
-        match rhs with
-        | Var rhs_id ->
-          if Id.equal lhs_id rhs_id then
-            state
-          else
-            { state with subst = SubstMap.add lhs_id rhs_id state.subst }
-        | _ ->
-          let exp = BinOp (Peq, Var lhs_id, rhs) in
-          let formula =
-            { state.formula with pure = exp :: state.formula.pure }
-          in
-          { state with formula }
-      end
-    (* | Lfield TODO *)
-    (* | Lindex : BinOp (Peq, Var id, Expr) TODO *)
-    | _ -> state
+      assign_to_variable lhs_id rhs state
+    | _ ->
+      let exp = BinOp (Peq, lhs, rhs) in
+      let formula =
+        { state.formula with pure = exp :: state.formula.pure }
+      in
+      { state with formula }
+
+  and check_valid_deref r loc lhs state =
+    let open State in
+    let open Formula in
+    let _ =
+      match get_base_and_offset_from_expr lhs with
+        None -> Logging.die InternalError "this should be unreachable"
+      | Some (lhs_id, _off)
+        when not (is_heap_pred_dest lhs_id state.formula) -> 
+        ()
+      | Some (lhs_id, _) ->
+        begin
+          match heap_pred_find_block lhs_id state.formula.spatial with
+          | Some { freed = true } -> 
+            use_after_free r loc
+          | _ -> ()
+        end
+    in
+    ()
 
   and exec_malloc_instr ident actual state =
     let open State in
@@ -158,14 +183,14 @@ module TransferFunctions2 = struct
         spatial = PointsToBlock (source, size, block) :: formula.spatial;
         pure =
           BinOp (Peq, UnOp (Base, source), source) ::
-          BinOp (Peq, UnOp (End, BinOp (Pplus, source, size)), source) ::
+          BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
           formula.pure
       };
     }
 
   and exec_free_instr r loc actual state =
     match get_base_and_offset_from_expr actual with (* TODO does not handle variables with value of NULL - these should behave as Skip *)
-    | None -> state (* unknown free target *)
+      None -> state (* unknown free target *)
     | Some (base_id, offset) ->
       free_block r loc base_id offset state
 
@@ -177,7 +202,9 @@ module TransferFunctions2 = struct
     | Nullify (_pvar, _loc) ->
       state (* TODO *)
     | ExitScope (_var_list, _loc) ->
-      state (* TODO *)
+      state (* TODO - maybe when var id is present in the substitution map,
+                we can remove it and re-shuffle the change through formula,
+                making a new canonical id or removing the constraints *)
     | Skip | _ ->
       state
 
@@ -211,8 +238,14 @@ module TransferFunctions2 = struct
     and free_block r loc id off state =
       let open State in
       let open Formula in
+      let open Expr in
       match take_heap_pred id state.formula.spatial with
-      | None -> state (* unknown target memory block *)
+      | None ->
+        begin (* might be an alias *)
+          match heap_pred_find_src_of_dest id state.formula with
+            Some (Var id') -> free_block r loc id' off state
+          | None | Some _ -> state (* unknown target memory block *)
+        end
       | Some (PointsToBlock (source, size, block), rest) ->
         if block.freed then begin
           double_free r loc;

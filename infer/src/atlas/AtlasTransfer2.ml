@@ -132,6 +132,7 @@ module TransferFunctions2 = struct
     let open Formula in
     let open Expr in
     check_valid_deref r loc lhs state;
+    check_valid_deref r loc rhs state;
     match lhs with
     | Var lhs_id ->
       assign_to_variable lhs_id rhs state
@@ -142,21 +143,23 @@ module TransferFunctions2 = struct
       in
       { state with formula }
 
-  and check_valid_deref r loc lhs state =
+  and check_valid_deref r loc e state =
     let open State in
     let open Formula in
+    Format.print_string ("CHECK_VALID_DEREF_EXP:\n" ^ (Expr.to_string state.vars e) );
     let _ =
-      match get_base_and_offset_from_expr lhs with
-        None -> Logging.die InternalError "this should be unreachable"
-      | Some (lhs_id, _off)
-        when not (is_heap_pred_dest lhs_id state.formula) -> 
-        ()
-      | Some (lhs_id, _) ->
+      match get_base_and_offset_from_expr e with
+        None -> Format.print_string "\nCONST EXPRESSION\n";() (* const expression *)
+      | Some (id, _off)
+        when not (is_heap_pred id state.formula) -> 
+        Format.print_string "\nASSIGNMENT\n";() (* assignment *)
+      | Some (id, _) ->
         begin
-          match heap_pred_find_block lhs_id state.formula.spatial with
-          | Some { freed = true } -> 
+          Format.print_string "\nDEREF\n" ;
+          match heap_pred_find_block id state.formula.spatial with
+          | Some { freed = true } ->
             use_after_free r loc
-          | _ -> ()
+          | _ -> Format.print_string "\nDID_NOT_FIND_MEM_BLOCK\n";()
         end
     in
     ()

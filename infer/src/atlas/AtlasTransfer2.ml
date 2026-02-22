@@ -56,13 +56,13 @@ module TransferFunctions2 = struct
 
   type instr = Sil.instr
 
-  let rec exec_instr state _node analysis_data instr =
+  let rec exec_instr _node analysis_data state instr =
     Format.fprintf Format.err_formatter "@[<h>%a;@]@;" (Sil.pp_instr ~print_types:false Pp.text) instr;
     Format.print_newline ();
 
     let open State in
     let r = reporter_of_analysis analysis_data in
-    let state' = match instr with
+    let states = match instr with
     | Sil.Load { id = ident; e = rhs; typ = _; loc = _} ->
       (* Format.print_string ("\nSIL.Load rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
       let (rhs', state') = sil_exp_to_expr rhs state in
@@ -83,15 +83,20 @@ module TransferFunctions2 = struct
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
           let (actual', state') = sil_exp_to_expr actual state in
           exec_free_instr r loc actual' state'
+    | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
+      [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
     | Sil.Metadata metadata ->
       exec_metadata_instr metadata state
     | _ ->
-      state
+      [state]
     in
 
-    Format.print_string (State.to_string state');
+    Format.print_string (String.concat (
+      List.map
+        ~f:(fun state -> State.to_string state)
+        states));
 
-    state'
+    states
 
   and exec_load_instr ident rhs state =
     let open State in
@@ -107,7 +112,7 @@ module TransferFunctions2 = struct
           PointsToExp (rhs, Const (Int 0L)(* cell size TODO *), Var lhs_id)
         in
         let formula = add_heap_pred pred state.formula in
-        { state with formula }
+        [{ state with formula }]
     | _ -> assign_to_variable lhs_id rhs state
 
   and assign_to_variable lhs_id rhs state =
@@ -117,15 +122,15 @@ module TransferFunctions2 = struct
     | Var rhs_id ->
       (* Both Ids already canonical *)
       if Id.equal lhs_id rhs_id then
-        state
+        [state]
       else
-        { state with subst = SubstMap.add lhs_id rhs_id state.subst }
+        [{ state with subst = SubstMap.add lhs_id rhs_id state.subst }]
     | _ ->
       let exp = BinOp (Peq, Var lhs_id, rhs) in
       let formula =
         { state.formula with pure = exp :: state.formula.pure }
       in
-      { state with formula }
+      [{ state with formula }]
 
   and exec_store_instr r loc lhs rhs state =
     let open State in
@@ -141,7 +146,7 @@ module TransferFunctions2 = struct
       let formula =
         { state.formula with pure = exp :: state.formula.pure }
       in
-      { state with formula }
+      [{ state with formula }]
 
   and check_valid_deref r loc e state =
     let open State in
@@ -180,7 +185,7 @@ module TransferFunctions2 = struct
     }
     in
     let open Expr in
-    let { formula } = state in {
+    let { formula } = state in [{
       state with
       formula = {
         spatial = PointsToBlock (source, size, block) :: formula.spatial;
@@ -189,11 +194,11 @@ module TransferFunctions2 = struct
           BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
           formula.pure
       };
-    }
+    }]
 
   and exec_free_instr r loc actual state =
     match get_base_and_offset_from_expr actual with (* TODO does not handle variables with value of NULL - these should behave as Skip *)
-      None -> state (* unknown free target *)
+      None -> [state] (* unknown free target *)
     | Some (base_id, offset) ->
       free_block r loc base_id offset state
 
@@ -201,15 +206,15 @@ module TransferFunctions2 = struct
     let open Sil in
     match metadata with
     | VariableLifetimeBegins { pvar = _ ; typ = _; loc = _; is_cpp_structured_binding = _} ->
-      state
+      [state]
     | Nullify (_pvar, _loc) ->
-      state (* TODO *)
+      [state] (* TODO *)
     | ExitScope (_var_list, _loc) ->
-      state (* TODO - maybe when var id is present in the substitution map,
+      [state] (* TODO - maybe when var id is present in the substitution map,
                 we can remove it and re-shuffle the change through formula,
                 making a new canonical id or removing the constraints *)
     | Skip | _ ->
-      state
+      [state]
 
     (** Tries to extract size from Expr.t [e] using [state] *)
     and get_malloc_size_of_sil_exp e state =
@@ -247,38 +252,61 @@ module TransferFunctions2 = struct
         begin (* might be an alias *)
           match heap_pred_find_src_of_dest id state.formula with
             Some (Var id') -> free_block r loc id' off state
-          | None | Some _ -> state (* unknown target memory block *)
+          | None | Some _ -> [state] (* unknown target memory block *)
         end
       | Some (PointsToBlock (source, size, block), rest) ->
         if block.freed then begin
           double_free r loc;
-          state
+          [state]
         end else
           if not (Int64.equal off 0L) then begin
             free_non_base_pointer r loc;
-            state (* note: probably also mark as freed ? *)
+            [state] (* note: probably also mark as freed ? *)
           end else
             let block' = { block with freed = true } in
             let spatial = 
               PointsToBlock (source, size, block') :: rest
             in
-            { state with
-              formula = { state.formula with spatial } }
-      | Some _ -> state (* TODO *)
+            [{ state with
+              formula = { state.formula with spatial } }]
+      | Some _ -> [state] (* TODO *)
 
 
 end
 
-let run (analysis_data : IntraproceduralAnalysis.t) (state : State.t) =
-  let proc_desc = analysis_data.proc_desc in
-  let nodes = Procdesc.get_nodes proc_desc in
-  List.fold_left
-    ~f:(fun state node ->
-        let instrs = Procdesc.Node.get_instrs node in
-        Instrs.fold
-          ~f:(fun state instr ->
-            TransferFunctions2.exec_instr state node analysis_data instr)
-          ~init:state
-          instrs)
-    ~init:state
-    nodes
+  let run (analysis_data : IntraproceduralAnalysis.t) (init_state : State.t) =
+    let open Procdesc in
+    let open TransferFunctions2 in
+    let proc_desc = analysis_data.proc_desc in
+    let start_node = get_start_node proc_desc in
+    let states_at = ref IdMap.empty in
+    let add_states node new_states = 
+      let old = IdMap.find_opt (Node.get_id node) !states_at
+        |> Option.value ~default:[] in
+      let combined = old @ new_states in
+      states_at :=
+        IdMap.add (Node.get_id node) combined !states_at
+    in
+    let worklist = Stdlib.Queue.create () in
+    add_states start_node [init_state];
+    Stdlib.Queue.add start_node worklist;
+    while not (Stdlib.Queue.is_empty worklist) do
+      let node = Stdlib.Queue.take worklist in
+      let incoming =
+        IdMap.find (Node.get_id node) !states_at
+      in
+      let instrs = Node.get_instrs node in
+      let outgoing = 
+        Instrs.fold ~init:incoming
+          ~f:(fun states instr ->
+            List.concat_map ~f:(fun state ->
+              exec_instr node analysis_data state instr
+              ) states
+            ) instrs
+      in
+      Node.get_succs node
+      |> List.iter ~f:(fun succ ->
+        add_states succ outgoing;
+        Stdlib.Queue.add succ worklist)
+    done;
+    !states_at

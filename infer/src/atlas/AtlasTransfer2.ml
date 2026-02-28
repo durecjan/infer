@@ -100,51 +100,16 @@ module TransferFunctions2 = struct
 
   and exec_load_instr loc ident rhs rhs_expr state =
     let open State in
-    let open Formula in
-    let open Expr in
     let lhs_var = Var.of_id ident in
     let (lhs_id, state) =
-      (* TODO: always makes fresh i believe *)
       get_existing_canonical_or_mk_fresh_id_of_var lhs_var state
     in
     if is_dereference_sil_exp rhs then begin
       match get_base_and_offset_from_expr rhs_expr with
-        Some (id, off) when is_heap_pred id state.current ->
-          (* Ok : we found base, offset, heap_pread *)
-          begin
-            match heap_pred_find_block id state.current.spatial with
-              Some { freed = false; end_ = size } ->
-              (* Ok : we found base, offset, heap_pred, block with freed = false *)
-              if (Int64.compare off size) > 0 || (Int64.compare off 0L) < 0 then
-                (* Error: offset out of bounds *)
-                [{ state with
-                    status = Error;
-                    err_loc = Some loc;
-                    (* err_issue = TODO register new issue type *) }]
-              else
-                let dest = BinOp (Pplus, Var lhs_id, Const (Int off)) in
-                let pred = PointsToExp (rhs_expr, (* TODO could be cell size? *) Const (Int 0L), dest) in
-                let current = add_heap_pred pred state.current in
-                [{ state with current }]
-            | Some { freed = true } ->
-              (* Error: block is freed *)
-              [{ state with
-                  status = Error;
-                  err_loc = Some loc;
-                  (* err_issue = TODO register new issue type *) }]
-            | None ->
-              (* Missing resource: memory block *)
-              (* if is PointsTo dest then something? *)
-              (* if is PointsTo src then something else? *)
-              [state]
-          end
-      | Some (_base, _off) ->
-        (* Missing resource: heap predicate *)
-        (* add heap predicate PointsToBlock src = BinOp(Pplus, base, off) size = Expr.Undef dest = <new block> to state.missing *)
-        (* add heap predicate like in the Ok case to state.current *)
-        [state]
+        Some (id, off) ->
+          exec_load_deref loc lhs_id id off state
       | None ->
-        (* Error: we found nothing in the provided sil *)
+        (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
             status = Error;
             err_loc = Some loc;
@@ -153,11 +118,10 @@ module TransferFunctions2 = struct
       assign_to_variable lhs_id rhs_expr state
 
   and is_dereference_sil_exp exp =
-    match exp with
+    match Exp.ignore_cast exp with
       Exp.Var _ -> true
     | Exp.Lfield ({ exp = e }, _, _) -> is_dereference_sil_exp e
     | Exp.Lindex (e, _) -> is_dereference_sil_exp e
-    | Exp.Cast (_, e) -> is_dereference_sil_exp e
     | _ -> false
 
   and assign_to_variable lhs_id rhs state =
@@ -176,6 +140,65 @@ module TransferFunctions2 = struct
         { state.current with pure = exp :: state.current.pure }
       in
       [{ state with current }]
+  
+  (** Ids [lhs_id] and [rhs_id] must be canonical!
+    At this point does not support loading multiple cells,
+    heap_pred_find_opt uses only id, not Var id + Const Int offset
+    to match heap predicate, so the block might still be missing
+    and we just found some other block at different offset TODO *)
+  and exec_load_deref loc lhs_id rhs_id off state =
+    let open Formula in
+    let open State in
+    let open Expr in
+    match heap_pred_find_opt rhs_id state.current with
+      Some PointsToBlock (src, size, block)
+    | Some PointsToUniformBlock (src, size, block, _) ->
+      let size' =
+        match eval_expr_to_int64 size with
+          Some i -> i
+        | None -> Int64.max_value (* TODO fix me: should throw after we make sure this cannot happen *)
+      in
+      if (Int64.compare off size') > 0 || (Int64.compare off 0L) < 0 then
+        (* Error: offset out of bounds *)
+        [{ state with
+            status = Error;
+            err_loc = Some loc;
+            (* err_issue = TODO register new issue type *) }]
+      else
+        if block.freed then
+          (* Error: block is freed *)
+          [{ state with
+              status = Error;
+              err_loc = Some loc;
+              (* err_issue = TODO register new issue type *) }]
+        else
+          let new_src = expr_normalize (BinOp (Pplus, src, Const (Int off))) state in
+          (* TODO: consider removing size from ExpPointsTo *)
+          let pred = PointsToExp (new_src, Const (Int 0L), Var lhs_id) in
+          let current = add_heap_pred pred state.current in
+          [{ state with current }]
+    | Some PointsToExp _
+      (* Error: missing memory block *)
+    | None ->
+      (* Error: missing heap predicate *)
+      let err_state = { state with
+        status = Error;
+        err_loc = Some loc;
+        (* err_issue = TODO register new issue type *) }
+      in
+      let missing_block = {
+      id = Id.fresh ();
+      base = 0L;
+      end_ = 0L; (* do we really need base, end_ ? *)
+      freed = false; }
+      in
+      let missing_part = PointsToBlock (Var rhs_id, Const (Int Int64.max_value), missing_block) in
+      let missing = add_heap_pred missing_part state.missing in
+      let src = BinOp (Pplus, Var rhs_id, Const (Int off)) in
+      let current_part = PointsToExp (src, Const (Int 0L), Var lhs_id) in
+      (* TODO: consider removing size from ExpPointsTo *)
+      let current = add_heap_pred current_part state.current in
+      err_state :: [{ state with current = current; missing = missing }]
 
   and exec_store_instr r loc lhs rhs state =
     (*

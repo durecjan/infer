@@ -325,8 +325,10 @@ and eval_expr_to_int64 e =
   | _ ->
       None
 
+(* Searches for PointsToBlock | PointsToUniformBlock predicates,
+    if none found, searches for PointsToExp predicates *)
 let rec heap_pred_find_opt id f =
-  let rec traverse l =
+  let rec traverse l found_exp =
     match l with
       [] -> None
     | (PointsToBlock (src, _, _)) as p :: _
@@ -335,16 +337,16 @@ let rec heap_pred_find_opt id f =
     | (PointsToUniformBlock (src, _, _, _)) as p :: _
       when expr_contains_var_with_id id src ->
         Some p
-    | (PointsToExp (src, _, _)) as p :: _
+    | (PointsToExp (src, _, _)) as p :: rest
       when expr_contains_var_with_id id src ->
-        Some p
-    | (PointsToExp (_, _, dest)) as p :: _
+        traverse rest (Some p)
+    | (PointsToExp (_, _, dest)) as p :: rest
       when expr_contains_var_with_id id dest ->
-        Some p
+        traverse rest (Some p)
     | _ :: rest ->
-      traverse rest
+      traverse rest found_exp
   in
-  traverse f.spatial
+  traverse f.spatial None
 
 and expr_base_var_find_opt e =
   let open Expr in

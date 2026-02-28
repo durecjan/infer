@@ -232,3 +232,64 @@ let rec sil_exp_to_string e =
   and typ_opt_to_string = function
       Some t -> "Some(" ^ Typ.to_string t ^ ")"
     | None -> "None"
+
+(** TODO: for now aggregating arithmetic operations should be enough *)
+let rec expr_normalize expr state =
+  let open Expr in 
+  let norm = expr_normalize in
+  match expr with
+    Var _ | Const _ | Undef ->
+      expr
+  | UnOp (op, e) ->
+    let e' = norm e state in
+    begin match op, e' with
+      Puminus, Const (Int i) ->
+      Const (Int (Int64.neg i))
+    | Lnot, Const (Int i) ->
+      Const (Int (if (Int64.compare i 0L) <> 0 then 0L else 1L))
+    | BVnot, Const (Int i) ->
+      Const (Int (Stdlib.Int64.lognot i))
+    | Puminus, UnOp (Puminus, e_inner) ->
+      e_inner
+    | _ ->
+      UnOp (op, e')
+    end
+  | BinOp (op, e1, e2) ->
+    let e1' = norm e1 state in
+    let e2' = norm e2 state in
+    begin match op, e1, e2 with
+      Pplus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.add i1 i2))
+    | Pminus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.sub i1 i2))
+    | Pmult, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.mul i1 i2))
+    | Pdiv, Const (Int i1), Const (Int i2)
+      when (Int64.compare i2 0L) <> 0 ->
+      Const (Int (Stdlib.Int64.div i1 i2))
+    | Pmod,   Const (Int i1), Const (Int i2)
+      when (Int64.compare i2 0L) <> 0 ->
+      Const (Int (Int64.rem i1 i2))
+
+    | Pplus, e, Const (Int 0L)
+    | Pplus, Const (Int 0L), e ->
+      e
+    | Pminus, e, Const (Int 0L) ->
+      e
+    | Pmult, e, Const (Int 1L)
+    | Pmult, Const (Int 1L), e ->
+      e
+    | Pmult, _, Const (Int 0L)
+    | Pmult, Const (Int 0L), _ ->
+      Const (Int 0L)
+
+    | Land, Const (Int 0L), _
+    | Land, _, Const (Int 0L) ->
+      Const (Int 0L)
+    | Lor, Const (Int 1L), _
+    | Lor, _, Const (Int 1L) ->
+      Const (Int 1L)
+
+    | _ ->
+      BinOp (op, e1', e2')
+    end

@@ -5,19 +5,31 @@ module Expr = AtlasFormula.Expr
 
 module SubstMap = Stdlib.Map.Make (Id)
 
+type status = Ok | Error
+
 type t = {
-  formula: Formula.t;
-  vars: (Var.t * Id.t) list;
-  subst: Id.t SubstMap.t
+  current: Formula.t;             (* current formula *)
+  missing: Formula.t;             (* missing part of formula *)
+  vars: (Var.t * Id.t) list;      (* variable association list *)
+  subst: Id.t SubstMap.t;         (* variable id substitution map *)
+  status: status;                 (* status = Ok | Error *)
+  err_loc: Location.t option;     (* location of error *)
+  err_issue: IssueType.t option;  (* issue type of error *)
 }
 
 let empty = {
-  formula = Formula.empty;
+  current = Formula.empty;
+  missing = Formula.empty;
   vars = [];
   subst = SubstMap.empty;
+  status = Ok;
+  err_loc = None;
+  err_issue = None;
 }
 
 
+(** Searches for canonical Id of variable [v], using state [s],
+    if not found, makes fresh Id *)
 let rec get_existing_canonical_or_mk_fresh_id_of_var v s =
   match Formula.lookup_variable_id v s.vars with
   | Some id ->
@@ -32,13 +44,13 @@ and canonical_id subst id =
   | None -> id
   | Some id' -> canonical_id subst id'
 
-
+(** Searches for canonical Id of variable [v], using state [s] *)
 let get_variable_id v s =
   match Formula.lookup_variable_id v s.vars with
   | None -> None
   | Some id -> Some (canonical_id s.subst id)
 
-
+(** Adds substitution between Ids [~from], [~to] to state [s] *)
 let subst_add ~from_ ~to_ s =
   let from_canonical = canonical_id s.subst from_ in
   let to_canonical = canonical_id s.subst to_ in
@@ -128,8 +140,14 @@ and sil_binop_exp_to_expr op =
   | Binop.LOr -> Expr.Lor
 
 
-let rec to_string state = 
-  Formula.to_string state.vars state.formula ^ "\n---------------\n" ^ subst_to_string state.vars state.subst ^ "\n---------------"
+let rec to_string state =
+  "Current:\n" ^
+  Formula.to_string state.vars state.current 
+  ^ "\n---------------\nMissing:"
+  ^ Formula.to_string state.vars state.missing
+  ^ "\n---------------\nSubstitutions:"
+  ^ subst_to_string state.vars state.subst
+  ^ "\n---------------"
 
 and subst_to_string vars subst =
   let traversal =

@@ -28,7 +28,6 @@ let rec lookup_variable_id v vars =
 module Expr = struct
   type t =
       Var of int
-    | CVar of int
     | Const of const_val
     | UnOp of (unop * t)
     | BinOp of (binop * t * t)
@@ -117,7 +116,6 @@ module Expr = struct
   let rec to_string vars exp =
   match exp with
   | Var a -> var_to_string vars a
-  | CVar a -> var_to_string vars a
   | Const a -> const_to_string a
   | UnOp (op,a) -> unop_to_string op ^ "(" ^ to_string vars a ^ ")"
   | BinOp (op,a,b) -> "(" ^ to_string vars a ^ binop_to_string op ^ to_string vars b ^ ")"
@@ -132,8 +130,8 @@ type t = {
 
 and block = {
   id : int;
-  base : int;
-  end_ : int;
+  base : Int64.t;
+  end_ : Int64.t;
   freed : bool
 }
 
@@ -170,10 +168,10 @@ let rec spatial_to_string vars s =
     Expr.to_string vars source ^ " -(" ^ Expr.to_string vars size ^ ")-> " ^ uniform_block_to_string block value
 
 and block_to_string b =
-  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int.to_string b.base ^ ";end=" ^ Int.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ "]"
+  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int64.to_string b.base ^ ";end=" ^ Int64.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ "]"
 
 and uniform_block_to_string b v =
-  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int.to_string b.base ^ ";end=" ^ Int.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ ";uniform_value=" ^ Expr.const_to_string v ^ "]"
+  "[id=" ^ Int.to_string b.id ^ ";base=" ^ Int64.to_string b.base ^ ";end=" ^ Int64.to_string b.end_ ^ ";freed=" ^ Bool.to_string b.freed ^ ";uniform_value=" ^ Expr.const_to_string v ^ "]"
 
 let to_string vars f =
   spatial_to_string vars f.spatial ^ "\n" ^ pure_to_string vars f.pure
@@ -292,3 +290,78 @@ let rec heap_pred_find_block id spatial =
        | Some b -> Some b
        | None -> heap_pred_find_block id rest)
   | _ :: rest -> heap_pred_find_block id rest
+
+(** Finds size of block with [id] inside [spatial] *)
+let rec heap_pred_block_size_find_opt id spatial =
+  match spatial with
+    [] -> None
+  | PointsToBlock (_, size, block) :: rest ->
+    if Id.equal block.id id
+    then eval_expr_to_int64 size
+    else heap_pred_block_size_find_opt id rest
+  | PointsToUniformBlock (_, size, block, _) :: rest ->
+    if Id.equal block.id id
+    then eval_expr_to_int64 size
+    else heap_pred_block_size_find_opt id rest
+  | _ :: rest -> heap_pred_block_size_find_opt id rest
+
+and eval_expr_to_int64 e =
+  let open Expr in
+  match e with
+    Const (Int i) ->
+      Some i
+  | BinOp (Pplus, e1, e2) ->
+    Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
+    Option.map (eval_expr_to_int64 e2) ~f:(fun v2 ->
+      Stdlib.Int64.add v1 v2))
+  | BinOp (Pminus, e1, e2) ->
+    Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
+    Option.map (eval_expr_to_int64 e2) ~f:(fun v2 ->
+      Stdlib.Int64.sub v1 v2))
+  | BinOp (Pmult, e1, e2) ->
+    Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
+    Option.map (eval_expr_to_int64 e2) ~f:(fun v2 ->
+      Stdlib.Int64.mul v1 v2))
+  | _ ->
+      None
+
+let rec heap_pred_find_opt id f =
+  let rec traverse l =
+    match l with
+      [] -> None
+    | (PointsToBlock (src, _, _)) as p :: _
+      when expr_contains_var_with_id id src ->
+        Some p
+    | (PointsToUniformBlock (src, _, _, _)) as p :: _
+      when expr_contains_var_with_id id src ->
+        Some p
+    | (PointsToExp (src, _, _)) as p :: _
+      when expr_contains_var_with_id id src ->
+        Some p
+    | (PointsToExp (_, _, dest)) as p :: _
+      when expr_contains_var_with_id id dest ->
+        Some p
+    | _ :: rest ->
+      traverse rest
+  in
+  traverse f.spatial
+
+and expr_base_var_find_opt e =
+  let open Expr in
+  match e with
+    (Var _) as v -> Some v
+  | UnOp (_, e) -> expr_base_var_find_opt e
+  | BinOp (_, e1, e2) ->
+    begin
+      match expr_base_var_find_opt e1 with
+        Some v -> Some v
+      | None -> expr_base_var_find_opt e2
+    end
+  | Const _ -> None
+  | Undef -> None
+
+and expr_contains_var_with_id id e =
+  let open Expr in
+  match expr_base_var_find_opt e with
+    Some (Var id') -> Id.equal id' id
+  | _ -> false

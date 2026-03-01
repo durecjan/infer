@@ -63,26 +63,23 @@ module TransferFunctions2 = struct
     let open State in
     let r = reporter_of_analysis analysis_data in
     let states = match instr with
-    | Sil.Load { id = ident; e = rhs; typ = _; loc } ->
+    | Sil.Load { id; e = rhs; typ; loc } ->
       (* Format.print_string ("\nSIL.Load rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
-      let (rhs_expr, state') = sil_exp_to_expr rhs state in
-      exec_load_instr loc ident rhs rhs_expr state'
+      exec_load_instr loc id typ rhs (sil_exp_to_expr rhs state) state
     | Sil.Store {e1 = lhs; typ = _; e2 = rhs; loc} ->
       (* Format.print_string ("\nSIL store lhs:" ^ sil_exp_to_string lhs ^ "\n"); *)
       (* Format.print_string ("\nSIL store rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
-      let (lhs', state') = sil_exp_to_expr lhs state in
-      let (rhs', state') = sil_exp_to_expr rhs state' in
-      exec_store_instr r loc lhs' rhs' state'
+      let lhs_expr = sil_exp_to_expr lhs state in
+      let rhs_expr = sil_exp_to_expr rhs state in
+      exec_store_instr r loc lhs_expr rhs_expr state
     | Sil.Call
-      ( (ident, _), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
+      ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-          let (actual', state') = sil_exp_to_expr actual state in
-          exec_malloc_instr ident actual' state'
+          exec_malloc_instr ident typ (sil_exp_to_expr actual state) state
     | Sil.Call
       ( _, Exp.Const (Const.Cfun procname), (actual, _) :: _, loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
-          let (actual', state') = sil_exp_to_expr actual state in
-          exec_free_instr r loc actual' state'
+          exec_free_instr r loc (sil_exp_to_expr actual state) state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
       [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
     | Sil.Metadata metadata ->
@@ -98,16 +95,17 @@ module TransferFunctions2 = struct
 
     states
 
-  and exec_load_instr loc ident rhs rhs_expr state =
+  and exec_load_instr loc lhs typ rhs rhs_expr state =
     let open State in
-    let lhs_var = Var.of_id ident in
-    let (lhs_id, state) =
-      get_existing_canonical_or_mk_fresh_id_of_var lhs_var state
+    let lhs_id = Id.fresh () in
+    let state = { state with
+      vars = (Var.of_id lhs, lhs_id) :: state.vars;
+      types = VarIdMap.add lhs_id typ state.types }
     in
-    if is_dereference_sil_exp rhs then begin
-      match get_base_and_offset_from_expr rhs_expr with
-        Some (id, off) ->
-          exec_load_deref loc lhs_id id off state
+    if is_dereference_sil_exp rhs then begin match
+      get_base_and_offset_from_expr (expr_normalize rhs_expr state) with
+        Some (rhs_id, off) ->
+          exec_load_deref loc lhs_id rhs_id off state
       | None ->
         (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
@@ -133,7 +131,7 @@ module TransferFunctions2 = struct
       if Id.equal lhs_id rhs_id then
         [state]
       else
-        [{ state with subst = SubstMap.add lhs_id rhs_id state.subst }]
+        [{ state with subst = VarIdMap.add lhs_id rhs_id state.subst }]
     | _ ->
       let exp = BinOp (Peq, Var lhs_id, rhs) in
       let current =
@@ -244,14 +242,17 @@ module TransferFunctions2 = struct
     in *)
     ()
 
-  and exec_malloc_instr ident actual state =
+  and exec_malloc_instr lhs typ actual state =
     let open State in
-    let (id, state) = (* maybe this lookup is unnecessary? *)
-      get_existing_canonical_or_mk_fresh_id_of_var (Var.of_id ident) state
-    in
-    let source = Expr.Var id in
-    let size = get_malloc_size_of_sil_exp actual state in
     let open Formula in
+    let open Expr in
+    let lhs_id = Id.fresh () in
+    let state = { state with
+      vars = (Var.of_id lhs, lhs_id) :: state.vars;
+      types = VarIdMap.add lhs_id typ state.types }
+    in
+    let source = Expr.Var lhs_id in
+    let size = get_malloc_size_of_sil_exp actual state in
     let block = {
       id = Id.fresh ();
       base = 0L;
@@ -259,7 +260,6 @@ module TransferFunctions2 = struct
       freed = false;
     }
     in
-    let open Expr in
     let { current } = state in [{
       state with
       current = {
@@ -279,9 +279,13 @@ module TransferFunctions2 = struct
 
   and exec_metadata_instr metadata state =
     let open Sil in
+    let open State in
     match metadata with
-    | VariableLifetimeBegins { pvar = _ ; typ = _; loc = _; is_cpp_structured_binding = _} ->
-      [state]
+    | VariableLifetimeBegins { pvar; typ; loc = _; is_cpp_structured_binding = _} ->
+      let id = Id.fresh () in
+      [{ state with
+        vars = (Var.of_pvar pvar, id) :: state.vars;
+        types = VarIdMap.add id typ state.types }]
     | Nullify (_pvar, _loc) ->
       [state] (* TODO *)
     | ExitScope (_var_list, _loc) ->

@@ -115,6 +115,70 @@ module TransferFunctions2 = struct
     end else
       assign_to_variable lhs_id rhs_expr state
 
+  (** Tries to extract base (pointer variable) and offset
+      from given [expr] using the Sil [exp] and [state]. 
+      Always pass a normalized [expr]! *)
+  and get_base_and_offset_from_expr_ exp expr state =
+    let open State in
+    (* get temporaries and map them to our variable ids *)
+    let vars = Exp.free_vars exp |> Sequence.to_list in
+    let var_ids = List.map ~f:(fun ident ->
+      get_canonical_var_id (Var.of_id ident) state)
+      vars
+    in
+    (* filter variable ids, looking for variable that has pointer type *)
+    let pointers = 
+      List.filter ~f:(fun id ->
+        match id with
+          None -> false (* should not really happen, unless global variable *)
+        | Some id ->
+          begin match VarIdMap.find_opt id state.types with
+            Some typ -> Typ.is_pointer typ
+          | None -> false
+        end)
+        var_ids
+    in
+    (* evaluate offset *)
+    match pointers with
+    | [Some base] -> 
+      begin match eval_offset base expr state with
+        Some offset -> Some (base, offset)
+      | None -> Some (base, 0L) (* TODO revisit *)
+      end
+    | _ ->
+      (* there should not be multiple pointers *)
+      None
+
+  and eval_offset base expr state =
+    let open Formula in
+    let open Expr in
+    let open State in
+    (* TODO a lot of None cases, revisit *)
+    let rec eval_offset acc = function
+        Var id when Id.equal id base ->
+        Some acc
+      | Var id -> begin match
+          lookup_pure_const_exp_of_id id state.current.pure with
+            Some e -> eval_offset acc e
+          | None -> None 
+        end
+      | BinOp (Pplus, e1, e2) ->
+        begin match eval_offset acc e1 with
+          Some acc1 -> eval_offset acc1 e2
+        | None ->
+            match eval_offset acc e2 with
+              Some acc2 -> eval_offset acc2 e1
+            | None -> None
+        end
+      | BinOp (Pminus, e, Const (Int i)) ->
+          eval_offset (Stdlib.Int64.sub acc i) e
+      | Const (Int i) ->
+          Some (Stdlib.Int64.add acc i)
+      | _ ->
+        None
+    in
+    eval_offset 0L expr
+
   and is_dereference_sil_exp exp =
     match Exp.ignore_cast exp with
       Exp.Var _ -> true
@@ -308,8 +372,10 @@ module TransferFunctions2 = struct
         end
       | _ -> e
 
-    (** Tries to extract variable and integer offset from Expr.t [exp] *)
+    (** Tries to extract variable and integer offset from Expr.t [exp].
+        Always pass already normalized expr! *)
     and get_base_and_offset_from_expr exp =
+      let open State in
       let open Expr in
       let rec traverse acc = function
       | Var id -> Some (id, acc)

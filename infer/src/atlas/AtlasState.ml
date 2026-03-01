@@ -31,7 +31,7 @@ let empty = {
 
 
 (** Searches for canonical Id of variable [v], using state [s] *)
-let rec get_variable_id v s =
+let rec get_canonical_var_id v s =
   match Formula.lookup_variable_id v s.vars with
   | None -> None
   | Some id -> Some (canonical_id s.subst id)
@@ -60,15 +60,18 @@ let rec sil_exp_to_expr e s =
   | Exp.Const c -> sil_const_exp_to_expr c
   | Exp.Sizeof sz -> sil_sizeof_exp_to_expr sz
   | Exp.Lvar pvar -> begin match
-    get_variable_id (Var.of_pvar pvar) s with
+    get_canonical_var_id (Var.of_pvar pvar) s with
       Some id ->
       Expr.Var id
     | None ->
-      (* TODO could be a global variable *)
-      Expr.Undef
+      if Pvar.is_return pvar then
+        Expr.ret
+      else
+        (* TODO could be a global variable *)
+        Expr.Undef
     end
   | Exp.Var ident -> begin match
-    get_variable_id (Var.of_id ident) s with
+    get_canonical_var_id (Var.of_id ident) s with
       Some id ->
       Expr.Var id
     | None ->
@@ -190,7 +193,7 @@ and subst_to_string vars subst =
   let traversal =
     VarIdMap.fold
     (fun from_ to_ traversal ->
-      traversal ^ Formula.Expr.var_to_string vars from_ ^ "=" ^ Formula.Expr.var_to_string vars to_ ^ ";")
+      traversal ^ Formula.Expr.var_to_string vars from_ ^ "==" ^ Formula.Expr.var_to_string vars to_ ^ ";")
     subst
     "{"
   in

@@ -70,13 +70,15 @@ module Expr = struct
   let ret = Var 0
 
   let rec var_to_string vars v =
-    match lookup_variable v vars with
-    | Some var -> "<" ^ var_string var ^ "," ^ Int.to_string v ^ ">"
-    | None -> Int.to_string v
+    if Id.equal v 0 then
+      "%ret"
+    else
+      match lookup_variable v vars with
+        Some var -> var_string var
+      | None -> Int.to_string v
 
   and var_string = function
-    | Var.ProgramVar pvar when Pvar.is_return pvar -> "%ret"
-    | Var.ProgramVar pvar -> Pvar.get_simplified_name pvar
+      Var.ProgramVar pvar -> Pvar.get_simplified_name pvar
     | Var.LogicalVar id -> Ident.to_string id
 
   let const_to_string c =

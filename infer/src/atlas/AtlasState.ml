@@ -3,7 +3,7 @@ module Formula = AtlasFormula
 module Id = AtlasFormula.Id
 module Expr = AtlasFormula.Expr
 
-module SubstMap = Stdlib.Map.Make (Id)
+module VarIdMap = Stdlib.Map.Make (Id)
 
 type status = Ok | Error
 
@@ -11,7 +11,8 @@ type t = {
   current: Formula.t;             (* current formula *)
   missing: Formula.t;             (* missing part of formula *)
   vars: (Var.t * Id.t) list;      (* variable association list *)
-  subst: Id.t SubstMap.t;         (* variable id substitution map *)
+  types: Typ.t VarIdMap.t;           (* type map *)
+  subst: Id.t VarIdMap.t;            (* variable id substitution map *)
   status: status;                 (* status = Ok | Error *)
   err_loc: Location.t option;     (* location of error *)
   err_issue: IssueType.t option;  (* issue type of error *)
@@ -21,34 +22,24 @@ let empty = {
   current = Formula.empty;
   missing = Formula.empty;
   vars = [];
-  subst = SubstMap.empty;
+  types = VarIdMap.empty;
+  subst = VarIdMap.empty;
   status = Ok;
   err_loc = None;
   err_issue = None;
 }
 
 
-(** Searches for canonical Id of variable [v], using state [s],
-    if not found, makes fresh Id *)
-let rec get_existing_canonical_or_mk_fresh_id_of_var v s =
-  match Formula.lookup_variable_id v s.vars with
-  | Some id ->
-    let canonical = canonical_id s.subst id in
-    (canonical, s)
-  | None ->
-    let id = Id.fresh () in
-    (id, { s with vars = (v, id) :: s.vars })
-
-and canonical_id subst id =
-  match SubstMap.find_opt id subst with
-  | None -> id
-  | Some id' -> canonical_id subst id'
-
 (** Searches for canonical Id of variable [v], using state [s] *)
-let get_variable_id v s =
+let rec get_variable_id v s =
   match Formula.lookup_variable_id v s.vars with
   | None -> None
   | Some id -> Some (canonical_id s.subst id)
+
+and canonical_id subst id =
+  match VarIdMap.find_opt id subst with
+  | None -> id
+  | Some id' -> canonical_id subst id'
 
 (** Adds substitution between Ids [~from], [~to] to state [s] *)
 let subst_add ~from_ ~to_ s =
@@ -57,62 +48,107 @@ let subst_add ~from_ ~to_ s =
   if Id.equal from_canonical to_canonical then
     s
   else
-    { s with subst = SubstMap.add from_canonical to_canonical s.subst }
+    { s with subst = VarIdMap.add from_canonical to_canonical s.subst }
 
 (** Converts SIL Exp.t [e] to custom Expr.t interpretation.
     If a known variable is encountered, it's canonical Id
     is used in the conversion. If the variable is unknown,
-    a new Id is created and the state [s] is modified. *)
+    it is converted as Expr.Undef *)
 let rec sil_exp_to_expr e s =
-  match e with
+  match Exp.ignore_cast e with
     Exp.Cast (_, inner) -> sil_exp_to_expr inner s
-  | Exp.Const c -> sil_const_exp_to_expr c s
-  | Exp.Sizeof sz -> sil_sizeof_exp_to_expr sz s
-  | Exp.Lvar pvar ->
-    let (id, state) =
-      get_existing_canonical_or_mk_fresh_id_of_var (Var.of_pvar pvar) s
-    in (Expr.Var id, state)
-  | Exp.Var ident ->
-    let (id, state) =
-      get_existing_canonical_or_mk_fresh_id_of_var (Var.of_id ident) s
-    in (Expr.Var id, state)
+  | Exp.Const c -> sil_const_exp_to_expr c
+  | Exp.Sizeof sz -> sil_sizeof_exp_to_expr sz
+  | Exp.Lvar pvar -> begin match
+    get_variable_id (Var.of_pvar pvar) s with
+      Some id ->
+      Expr.Var id
+    | None ->
+      (* TODO could be a global variable *)
+      Expr.Undef
+    end
+  | Exp.Var ident -> begin match
+    get_variable_id (Var.of_id ident) s with
+      Some id ->
+      Expr.Var id
+    | None ->
+      Expr.Undef
+    end
   | Exp.UnOp (op, exp, _) ->
-    let (exp', state) = sil_exp_to_expr exp s in
+    let exp' = sil_exp_to_expr exp s in
     let op' = sil_unop_exp_to_expr op in
-    (Expr.UnOp (op', exp'), state)
+    Expr.UnOp (op', exp')
   | Exp.BinOp ((Binop.Gt | Binop.Ge) as op, e1, e2) ->
-    let (lhs, state) = sil_exp_to_expr e1 s in
-    let (rhs, state) = sil_exp_to_expr e2 state in
+    let lhs = sil_exp_to_expr e1 s in
+    let rhs = sil_exp_to_expr e2 s in
     let op' = sil_binop_exp_to_expr op in
-    (Expr.BinOp (op', rhs, lhs), state)
+    Expr.BinOp (op', rhs, lhs)
   | Exp.BinOp (op, e1, e2) ->
-    let (lhs, state) = sil_exp_to_expr e1 s in
-    let (rhs, state) = sil_exp_to_expr e2 state in
+    let lhs = sil_exp_to_expr e1 s in
+    let rhs = sil_exp_to_expr e2 s in
     let op' = sil_binop_exp_to_expr op in
-    (Expr.BinOp (op', lhs, rhs), state)
-  | Exp.Lfield ({ exp; is_implicit = _ }, _, _) ->
-      sil_exp_to_expr exp s
+    Expr.BinOp (op', lhs, rhs)
+  | Exp.Lfield ({ exp; is_implicit = _ }, _fieldname, typ) ->
+      let base = sil_exp_to_expr exp s in
+      begin match sil_lfield_offset_bytes (*fieldname*) typ with
+        Some off ->
+        Expr.BinOp (Expr.Pplus, base, Const (Int off))
+      | None ->
+        (* TODO rethink this fallback idea vs. Expr.Undef offset *)
+        base
+      end
   | Exp.Lindex (base, index) ->
-      let (base', state) = sil_exp_to_expr base s in
-      let (index', state) = sil_exp_to_expr index state in
-      (Expr.BinOp (Pplus, base', index'), state)
-  | _ -> (Expr.Undef, s)
+      let base' = sil_exp_to_expr base s in
+      let index' = sil_exp_to_expr index s in
+      Expr.BinOp (Pplus, base', index')
+  | _ -> Expr.Undef
 
-and sil_const_exp_to_expr c s =
-  let e = match c with
+and sil_const_exp_to_expr c =
+  match c with
     Const.Cint i -> Expr.Const (Int (Z.to_int64 (IntLit.to_big_int i)))
   | Const.Cstr str -> Expr.Const (String str)
   | Const.Cfloat f -> Expr.Const (Float f)
   | Const.Cfun _ | Const.Cclass _ -> Expr.Undef
-  in (e, s)
 
-and sil_sizeof_exp_to_expr sz s =
+and sil_sizeof_exp_to_expr sz =
   let open Exp in
-  let e = match sz with
+  match sz with
   | { nbytes = Some i } -> Expr.Const (Int (Int.to_int64 i))
   (* | { nbytes = Some i; dynamic_length = exp } *)
   | _ -> Expr.Undef
-  in (e, s)
+
+and sil_lfield_offset_bytes (*tenv*) (*fieldname*) typ =
+  sil_lindex_element_size typ
+
+and sil_lindex_element_size typ =
+  let open Typ in
+  match typ.desc with
+  (* for now assume 64bit architecture *)
+  (* TODO wire up to infer's runtime info *)
+    Tint ikind ->
+      begin match ikind with
+        IChar -> Some 1L
+      | ISChar -> Some 1L
+      | IUChar -> Some 1L
+      | IBool -> Some 1L
+      | IInt -> Some 4L
+      | IUInt -> Some 4L
+      | IShort -> Some 2L
+      | IUShort -> Some 2L
+      | ILong -> Some 8L
+      | IULong -> Some 8L
+      | ILongLong -> Some 16L
+      | IULongLong -> Some 16L
+      | I128 -> Some 32L
+      | IU128 -> Some 32L
+      end
+  | Tfloat _ -> None
+  | Tvoid -> None
+  | Tfun _ -> None
+  | Tptr (_, _) -> None
+  | Tstruct _ -> None
+  | TVar _ -> None
+  | Tarray _ -> None
 
 and sil_unop_exp_to_expr op =
   match op with
@@ -141,23 +177,28 @@ and sil_binop_exp_to_expr op =
 
 
 let rec to_string state =
+  status_to_string state.status ^
   "Current:\n" ^
   Formula.to_string state.vars state.current 
-  ^ "\n---------------\nMissing:"
+  ^ "\n----------------\nMissing:\n"
   ^ Formula.to_string state.vars state.missing
-  ^ "\n---------------\nSubstitutions:"
+  ^ "\n----------------\nSubstitutions:\n"
   ^ subst_to_string state.vars state.subst
-  ^ "\n---------------"
+  ^ "\n================"
 
 and subst_to_string vars subst =
   let traversal =
-    SubstMap.fold
+    VarIdMap.fold
     (fun from_ to_ traversal ->
       traversal ^ Formula.Expr.var_to_string vars from_ ^ "=" ^ Formula.Expr.var_to_string vars to_ ^ ";")
     subst
     "{"
   in
   traversal ^ "}"
+
+and status_to_string s =
+  match s with
+    Ok -> "" | Error -> "ERROR_STATE\n"
 
 
 (* debugging prints *)

@@ -209,17 +209,6 @@ let lookup_pure_const_exp_of_id id pure =
     in
     resolve IdSet.empty id
 
-let take_heap_pred id spatial =
-  let rec traverse acc = function
-  | [] -> None
-  | (PointsToBlock (Expr.Var v, _, _) as hp) :: l
-    when Id.equal v id ->
-      Some (hp, List.rev_append acc l)
-  | hp :: l ->
-    traverse (hp :: acc) l
-  in
-  traverse [] spatial
-
 let is_heap_pred_source id f =
   let rec traverse l =
     match l with
@@ -327,8 +316,9 @@ and eval_expr_to_int64 e =
   | _ ->
       None
 
-(* Searches for PointsToBlock | PointsToUniformBlock predicates,
-    if none found, searches for PointsToExp predicates *)
+(** Searches for PointsToBlock | PointsToUniformBlock predicates,
+    if none found, searches for PointsToExp predicates.
+    [id] must be a canonical identifier of a pointer typed variable *)
 let rec heap_pred_find_opt id f =
   let rec traverse l found_exp =
     match l with
@@ -369,3 +359,18 @@ and expr_contains_var_with_id id e =
   match expr_base_var_find_opt e with
     Some (Var id') -> Id.equal id' id
   | _ -> false
+
+(** Only takes PointsToBlock predicates. [id] must be a canonical identifier of a pointer typed variable. *)
+let heap_pred_take_opt id spatial =
+  let rec traverse acc = function
+    [] -> None
+  | (PointsToBlock (src, _, _) as hp) :: l
+    when expr_contains_var_with_id id src ->
+      Some (hp, List.rev_append acc l)
+  | (PointsToUniformBlock (src, _, _, _) as hp) :: l
+    when expr_contains_var_with_id id src ->
+      Some (hp, List.rev_append acc l)
+  | hp :: l ->
+    traverse (hp :: acc) l
+  in
+  traverse [] spatial

@@ -79,7 +79,7 @@ module TransferFunctions2 = struct
     | Sil.Call
       ( _, Exp.Const (Const.Cfun procname), (actual, _) :: _, loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
-          exec_free_instr r loc (sil_exp_to_expr actual state) state
+          exec_free_instr loc actual (sil_exp_to_expr actual state) state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
       [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
     | Sil.Metadata metadata ->
@@ -103,7 +103,7 @@ module TransferFunctions2 = struct
       types = VarIdMap.add lhs_id typ state.types }
     in
     if is_dereference_sil_exp rhs then begin match
-      get_base_and_offset_from_expr (expr_normalize rhs_expr state) with
+      get_base_and_offset_from_expr rhs (expr_normalize rhs_expr state) state with
         Some (rhs_id, off) ->
           exec_load_deref loc lhs_id rhs_id off state
       | None ->
@@ -118,7 +118,7 @@ module TransferFunctions2 = struct
   (** Tries to extract base (pointer variable) and offset
       from given [expr] using the Sil [exp] and [state]. 
       Always pass a normalized [expr]! *)
-  and get_base_and_offset_from_expr_ exp expr state =
+  and get_base_and_offset_from_expr exp expr state =
     let open State in
     (* get temporaries and map them to our variable ids *)
     let vars = Exp.free_vars exp |> Sequence.to_list in
@@ -149,6 +149,11 @@ module TransferFunctions2 = struct
       (* there should not be multiple pointers *)
       None
 
+  (** Evaluates [expr], skipping [base] since it is
+    a known pointer, handling BinOp | Const | Var ,
+    where Var must have a chain of pure constraints,
+    eventually leading to Const. If any part fails
+    to evaluate, method returns None *)
   and eval_offset base expr state =
     let open Formula in
     let open Expr in
@@ -197,7 +202,7 @@ module TransferFunctions2 = struct
       else
         [{ state with subst = VarIdMap.add lhs_id rhs_id state.subst }]
     | _ ->
-      let exp = BinOp (Peq, Var lhs_id, rhs) in
+      let exp = BinOp (Peq, Var lhs_id, expr_normalize rhs state) in
       let current =
         { state.current with pure = exp :: state.current.pure }
       in
@@ -316,7 +321,13 @@ module TransferFunctions2 = struct
       types = VarIdMap.add lhs_id typ state.types }
     in
     let source = Expr.Var lhs_id in
-    let size = get_malloc_size_of_sil_exp actual state in
+    (* we assume expression denotes to some size_t since it passed compilation *)
+    let size = expr_normalize actual state in
+    (* try to evaluate the size *)
+    let size = match eval_state_expr_to_int64_opt size state with
+      Some i -> Const (Int i)
+    | None -> size
+    in
     let block = {
       id = Id.fresh ();
       base = 0L;
@@ -335,11 +346,22 @@ module TransferFunctions2 = struct
       };
     }]
 
-  and exec_free_instr r loc actual state =
-    match get_base_and_offset_from_expr actual with (* TODO does not handle variables with value of NULL - these should behave as Skip *)
-      None -> [state] (* unknown free target *)
-    | Some (base_id, offset) ->
-      free_block r loc base_id offset state
+  and exec_free_instr loc actual actual_expr state =
+    let open State in
+    let open Expr in
+    match actual_expr with
+      Const (Ptr 0) -> 
+        [state] (* free(NULL); *)
+    | _ -> begin match
+      get_base_and_offset_from_expr actual actual_expr state with
+        Some (base_id, offset) ->
+        free_block loc base_id offset state
+      | None ->
+        [{ state with
+          status = Error;
+          err_loc = Some loc;
+          (* err_issue = register new issue *)}]
+      end
 
   and exec_metadata_instr metadata state =
     let open Sil in
@@ -372,50 +394,93 @@ module TransferFunctions2 = struct
         end
       | _ -> e
 
-    (** Tries to extract variable and integer offset from Expr.t [exp].
-        Always pass already normalized expr! *)
-    and get_base_and_offset_from_expr exp =
-      let open State in
-      let open Expr in
-      let rec traverse acc = function
-      | Var id -> Some (id, acc)
-      | BinOp (Pplus, e, Const (Int i)) | BinOp (Pplus, Const (Int i), e) ->
-        traverse (Stdlib.Int64.add acc i) e
-      | BinOp (Pminus, e, Const (Int i)) ->
-        traverse (Stdlib.Int64.sub acc i) e
-      | _ -> None
-      in
-      traverse 0L exp
-
-    (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [r] and [loc] *)
-    and free_block r loc id off state =
+    (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [loc] *)
+    and free_block loc id off state =
       let open State in
       let open Formula in
       let open Expr in
-      match take_heap_pred id state.current.spatial with
-      | None ->
-        begin (* might be an alias *)
-          match heap_pred_find_src_of_dest id state.current with
-            Some (Var id') -> free_block r loc id' off state
-          | None | Some _ -> [state] (* unknown target memory block *)
-        end
+      match heap_pred_take_opt id state.current.spatial with
       | Some (PointsToBlock (source, size, block), rest) ->
-        if block.freed then begin
-          double_free r loc;
-          [state]
-        end else
-          if not (Int64.equal off 0L) then begin
-            free_non_base_pointer r loc;
-            [state] (* note: probably also mark as freed ? *)
-          end else
-            let block' = { block with freed = true } in
-            let spatial = 
-              PointsToBlock (source, size, block') :: rest
-            in
-            [{ state with
-              current = { state.current with spatial } }]
-      | Some _ -> [state] (* TODO *)
+        begin match has_error_exec_free loc off block.freed state with
+          Some error -> error
+        | None ->
+          let block' = { block with freed = true } in
+          let spatial =
+            PointsToBlock (source, size, block') :: rest
+          in
+          [{ state with
+            current = { state.current with spatial } }]
+        end
+      (* duplicate code caused by heap_pred not being a record *)
+      | Some (PointsToUniformBlock (source, size, block, const_val), rest) ->
+        begin match has_error_exec_free loc off block.freed state with
+          Some error -> error
+        | None ->
+          let block' = { block with freed = true } in
+          let spatial =
+            PointsToUniformBlock (source, size, block', const_val) :: rest
+          in
+          [{ state with
+            current = { state.current with spatial } }]
+        end
+      | Some _
+        (* Error: missing memory block *)
+      | None ->
+        (* Error: missing heap predicate *)
+        let pure =
+          BinOp (Peq, UnOp (Base, Var id), null) :: state.current.pure
+        in
+        let err_state = { state with
+          current = { state.current with pure };
+          status = Error;
+          err_loc = Some loc;
+          (* err_issue = register new issue *) }
+        in
+        let missing_block = {
+          id = Id.fresh ();
+          base = 0L;
+          end_ = 0L; (* do we really need base, end_ ? *)
+          freed = false; }
+        in
+        (* add id -> { block with freed = false } to missing *)
+        let missing_spatial_part =
+          PointsToBlock (Var id, Const (Int Int64.max_value), missing_block)
+        in
+        (* add Base(id) == id & End(id) == id + size to missing *)
+        let missing_pure_base_part, missing_pure_end_part = (
+          BinOp (Peq, UnOp (Base, Var id), Var id),
+          BinOp (Peq, UnOp (End, Var id), BinOp (Pplus, Var id, Const (Int Int64.max_value)))
+        ) in
+        (* add id -> { block with freed = true } to current *)
+        let current_part =
+          PointsToBlock(Var id, Const (Int Int64.max_value), { missing_block with freed = true })
+        in
+        let missing_part = add_heap_pred missing_spatial_part state.missing in
+        let missing =
+          { missing_part with
+            pure = missing_pure_base_part :: missing_pure_end_part :: missing_part.pure }
+        in
+        let current = add_heap_pred current_part state.current in
+        err_state :: [{ state with current; missing }]
 
+    and has_error_exec_free loc var_off is_freed_block state = 
+      let open State in
+      if not (Int64.equal var_off 0L) then
+        (* Error: freeing memory address not returned by malloc *)
+        Some [{ state with
+          status = Error;
+          err_loc = Some loc;
+          err_issue = Some IssueType.atlas_free_non_base_pointer }]
+      else
+        if is_freed_block then
+          (* Error: double free *)
+          Some [{ state with
+            status = Error;
+            err_loc = Some loc;
+            err_issue = Some IssueType.atlas_double_free }]
+        else
+          (* Ok *)
+          None
 
 end
 

@@ -337,3 +337,34 @@ let rec expr_normalize expr state =
     | _ ->
       BinOp (op, e1', e2')
     end
+
+(** Evaluates [expr], handling BinOp | Const | Var ,
+    where Var must have a chain of pure constraints,
+    eventually leading to Const. If any part fails
+    to evaluate, method returns None *)
+let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int64, need to refactor again *)
+  let open Formula in
+  let open Expr in
+  (* TODO a lot of None cases, revisit *)
+  let rec eval acc = function
+      Var id -> begin match
+        lookup_pure_const_exp_of_id id state.current.pure with
+          Some e -> eval acc e
+        | None -> None 
+      end
+    | BinOp (Pplus, e1, e2) ->
+      begin match eval acc e1 with
+        Some acc1 -> eval acc1 e2
+      | None ->
+          match eval acc e2 with
+            Some acc2 -> eval acc2 e1
+          | None -> None
+      end
+    | BinOp (Pminus, e, Const (Int i)) ->
+        eval (Stdlib.Int64.sub acc i) e
+    | Const (Int i) ->
+        Some (Stdlib.Int64.add acc i)
+    | _ ->
+      None
+  in
+  eval 0L expr

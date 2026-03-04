@@ -368,3 +368,44 @@ let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int
       None
   in
   eval 0L expr
+
+(** Searches through [state] heap predicates (both current and missing) and looks for PointsToExp with [dest],
+    then proceeeds to look for PointsToBlock | PointsToUniformBlock using the obtained src. Returns everything
+    that was found, meaning (PointsToExp option * (PointsToBlock | PointsToUniformBlock) option). [dest] expression
+    must be normalized! *)
+let rec heap_pred_find_opt_block_points_to_by_dest dest state =
+  match find_points_to_exp dest state.missing.spatial,
+    find_points_to_exp dest state.current.spatial
+  with
+  | Some (src, points_to_exp), None
+  | None, Some (src, points_to_exp) ->
+    begin match find_points_to_block src state.missing.spatial,
+      find_points_to_block src state.current.spatial
+    with
+    | Some points_to_block, None
+    | None, Some points_to_block ->
+      (Some points_to_exp, Some points_to_block)
+    | _ ->
+      (Some points_to_exp, None)
+    end
+  | _ ->
+    (None, None)
+
+  and find_points_to_exp dest = function
+  | [] -> None
+  | Formula.PointsToExp (src, _, dest') as hp :: _
+    when Expr.equal dest' dest ->
+      Some (src, hp)
+  | _ :: rest ->
+    find_points_to_exp dest rest
+
+  and find_points_to_block src = function
+  | [] -> None
+  | Formula.PointsToBlock (src', _, _) as hp :: _
+    when Expr.equal src' src ->
+      Some hp
+  | Formula.PointsToUniformBlock (src', _, _, _) as hp :: _
+    when Expr.equal src' src ->
+      Some hp
+  | _ :: rest ->
+    find_points_to_block src rest

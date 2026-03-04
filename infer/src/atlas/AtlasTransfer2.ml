@@ -61,17 +61,17 @@ module TransferFunctions2 = struct
     Format.print_newline ();
 
     let open State in
-    let r = reporter_of_analysis analysis_data in
+    let _r = reporter_of_analysis analysis_data in
     let states = match instr with
     | Sil.Load { id; e = rhs; typ; loc } ->
       (* Format.print_string ("\nSIL.Load rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
       exec_load_instr loc id typ rhs (sil_exp_to_expr rhs state) state
-    | Sil.Store {e1 = lhs; typ = _; e2 = rhs; loc} ->
+    | Sil.Store {e1 = lhs; typ = lhs_typ; e2 = rhs; loc} ->
       (* Format.print_string ("\nSIL store lhs:" ^ sil_exp_to_string lhs ^ "\n"); *)
       (* Format.print_string ("\nSIL store rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
       let lhs_expr = sil_exp_to_expr lhs state in
       let rhs_expr = sil_exp_to_expr rhs state in
-      exec_store_instr r loc lhs_expr rhs_expr state
+      exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
@@ -267,49 +267,181 @@ module TransferFunctions2 = struct
       let current = add_heap_pred current_part state.current in
       err_state :: [{ state with current = current; missing = missing }]
 
-  and exec_store_instr r loc lhs rhs state =
-    (*
-    match lhs with 
-      Var id 
-    | Lfield ({ base = Var id }, _fieldname, _typ) 
-    | Lindex (Var id, _offset_exp)
-    -> DEREFERENCE!
-    *)
+  and exec_store_instr loc _lhs_typ lhs lhs_expr rhs_expr state =
+    let open State in
+    let open Expr in
+    if is_dereference_sil_exp lhs then
+      let lhs_norm = expr_normalize lhs_expr state in
+      begin match get_base_and_offset_from_expr lhs lhs_norm state with
+        Some (lhs_id, off) ->
+          exec_store_deref loc lhs_id off lhs_norm rhs_expr state
+      | None ->
+        (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
+        [{ state with
+            status = Error;
+            err_loc = Some loc;
+            (* err_issue = TODO register new issue type *) }]
+    end else
+      let rhs_norm = expr_normalize rhs_expr state in
+      begin match lhs_expr with
+        Var id ->
+        assign_to_variable id rhs_norm state
+      | _ ->
+        let lhs_norm = expr_normalize lhs_expr state in
+        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
+        let current =
+          { state.current with pure = exp :: state.current.pure }
+        in [{ state with current }]
+      end
+
+  and exec_store_deref loc _lhs_id off lhs_norm rhs_expr state =
     let open State in
     let open Formula in
     let open Expr in
-    check_valid_deref r loc lhs state;
-    check_valid_deref r loc rhs state;
-    match lhs with
-    | Var lhs_id ->
-      assign_to_variable lhs_id rhs state
-    | _ ->
-      let exp = BinOp (Peq, lhs, rhs) in
-      let current =
-        { state.current with pure = exp :: state.current.pure }
-      in
-      [{ state with current }]
-
-  and check_valid_deref _r _loc _e _state = (*
-    let open State in
-    let open Formula in
-    (* Format.print_string ("CHECK_VALID_DEREF_EXP:\n" ^ (Expr.to_string state.vars e) ); *)
-    let _ =
-      match get_base_and_offset_from_expr e with
-        None -> (* Format.print_string "\nCONST EXPRESSION\n"; *) () (* const expression *)
-      | Some (id, _off)
-        when not (is_heap_pred id state.current) -> 
-        (* Format.print_string "\nASSIGNMENT\n"; *)() (* assignment *)
-      | Some (id, _) ->
-        begin
-          (* Format.print_string "\nDEREF\n"; *)
-          match heap_pred_find_block id state.current.spatial with
-          | Some { freed = true } ->
-            use_after_free r loc
-          | _ -> (* Format.print_string "\nDID_NOT_FIND_MEM_BLOCK\n"; *)()
+    match heap_pred_find_opt_block_points_to_by_dest lhs_norm state with
+    | _, Some PointsToBlock (src, size, block)
+    | _, Some PointsToUniformBlock (src, size, block, _) ->
+      begin match has_error_exec_store loc src size off block.freed state with
+        Some error -> error
+      | None ->
+        let rhs_norm = expr_normalize rhs_expr state in
+        begin match lhs_norm with
+        | Var id ->
+          assign_to_variable id rhs_norm state
+        | _ ->
+          let exp = BinOp (Peq, lhs_norm, rhs_norm) in
+          let current =
+            { state.current with pure = exp :: state.current.pure }
+          in
+          [{ state with current }]
         end
-    in *)
-    ()
+      end
+    | Some PointsToExp (src, _, _), None ->
+      (* Error: missing memory block *)
+      let missing_block = {
+        id = Id.fresh ();
+        base = 0L;
+        end_ = 0L; (* do we really need base, end_ ? *)
+        freed = false; }
+      in
+      let missing_block_src =
+        match find_opt_ptr_base src state with
+        | Some id -> Var id
+        | None -> Var (Id.fresh ())
+          (* 
+          let id = Id.fresh () in
+          let var = Var.of_id (Ident.create Ident.knormal id) in
+          let vars = (var, id) :: state.vars in
+          let types = VarIdMap.add id Typ.Pk_pointer state.types in
+          *)
+      in
+      let missing_part =
+        PointsToBlock (missing_block_src, Undef, missing_block)
+      in
+      let missing = add_heap_pred missing_part state.missing in
+      let rhs_norm = expr_normalize rhs_expr state in
+      begin match lhs_norm with
+      | Var id ->
+        assign_to_variable id rhs_norm { state with missing }
+      | _ ->
+        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
+        let current =
+          { state.current with pure = exp :: state.current.pure }
+        in
+        [{ state with current; missing }]
+      end
+    | _ ->
+      (* Error: missing heap predicate *)
+      let missing_block = {
+        id = Id.fresh ();
+        base = 0L;
+        end_ = 0L;
+        freed = false;
+      } in
+      let missing_part = 
+        PointsToBlock (Var (Id.fresh ()), Undef, missing_block)
+      in
+      let missing = add_heap_pred missing_part state.missing in
+      let rhs_norm = expr_normalize rhs_expr state in
+      begin match lhs_norm with
+      | Var id ->
+        assign_to_variable id rhs_norm { state with missing }
+      | _ ->
+        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
+        let current =
+          { state.current with pure = exp :: state.current.pure }
+        in
+        [{ state with current; missing }]
+      end
+  
+  and has_error_exec_store loc block_src_expr block_size_expr offset is_freed_block state =
+    let open State in
+    let src_offset =
+      match find_opt_ptr_base block_src_expr state with
+      | Some id ->
+        eval_offset id block_src_expr state
+      | None ->
+        None
+    in
+    let size =
+      eval_state_expr_to_int64_opt block_size_expr state
+    in
+    let abs_offset = Option.bind src_offset
+      ~f:(fun x -> Some (Stdlib.Int64.add x offset))
+    in
+    let is_out_of_bounds = 
+      match abs_offset, size with
+      | Some off, None
+        when (Int64.compare off 0L) < 0 ->
+          true
+      | Some off, Some s
+        when (Int64.compare off 0L) < 0 ||
+        (Int64.compare off s) > 0 ->
+          true
+      | _ ->
+        false
+    in
+    if is_out_of_bounds then
+      (* Error : offset out of bounds *)
+      Some [{ state with
+        status = Error;
+        err_loc = Some loc;
+        (* err_issue = TODO register new issue type *) }]
+    else
+      if is_freed_block then
+        (* Error: block is freed *)
+        Some [{ state with
+          status = Error;
+          err_loc = Some loc;
+          (* err_issue = TODO register new issue type *) }]
+      else
+        None
+
+  (** Finds a id of a variable inside [expr] using type information from [state]*)
+  and find_opt_ptr_base expr state =
+    let open State in
+    match expr with
+    | Expr.Var id ->
+      begin match VarIdMap.find_opt id state.types with
+      | Some typ ->
+        if Typ.is_pointer typ then
+          Some id
+        else
+          None
+      | None ->
+        None
+      end
+    | Expr.UnOp (_, e) ->
+      find_opt_ptr_base e state
+    | Expr.BinOp (_, e1, e2) ->
+      begin match find_opt_ptr_base e1 state with
+      | (Some _) as res -> res
+      | None ->
+        find_opt_ptr_base e2 state
+      end
+    | _ ->
+      None
+
 
   and exec_malloc_instr lhs typ actual state =
     let open State in

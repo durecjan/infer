@@ -69,6 +69,54 @@ module Expr = struct
   let null = Const (Ptr 0)
   let ret = Var 0
 
+  let unop_equal op1 op2 =
+    match op1, op2 with
+    | Base, Base
+    | End, End
+    | BVnot, BVnot
+    | Lnot, Lnot
+    | Puminus, Puminus -> true
+    | _ -> false
+
+  let binop_equal op1 op2 =
+    match op1, op2 with
+    | Pplus, Pplus
+    | Pminus, Pminus
+    | Pmult, Pmult
+    | Pdiv, Pdiv
+    | Pmod, Pmod
+    | BVlshift, BVlshift
+    | BVrshift, BVrshift
+    | Pless, Pless
+    | Plesseq, Plesseq
+    | Peq, Peq
+    | Pneq, Pneq
+    | BVand, BVand
+    | BVor, BVor
+    | BVxor, BVxor
+    | Land, Land
+    | Lor, Lor -> true
+    | _ -> false
+
+  let rec equal e1 e2 =
+    match e1, e2 with
+    | Var id1, Var id2 ->
+      Id.equal id1 id2
+    | Const (Ptr p1), Const (Ptr p2) ->
+      Int.equal p1 p2
+    | Const (Int i1), Const (Int i2) ->
+      Int64.equal i1 i2
+    | Const (String s1), Const (String s2) ->
+      String.equal s1 s2
+    | Const (Float f1), Const (Float f2) ->
+      Float.equal f1 f2
+    | UnOp (op1, e1'), UnOp (op2, e2') ->
+      unop_equal op1 op2 && equal e1' e2'
+    | BinOp (op1, e1', e2'), BinOp (op2, e1'', e2'') ->
+      binop_equal op1 op2 && equal e1' e1'' && equal e2' e2''
+    | Undef, Undef -> true
+    | _ -> false
+
   let rec var_to_string vars v =
     if Id.equal v 0 then
       "%ret"

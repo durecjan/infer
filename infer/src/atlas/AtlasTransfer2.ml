@@ -274,7 +274,7 @@ module TransferFunctions2 = struct
       let lhs_norm = expr_normalize lhs_expr state in
       begin match get_base_and_offset_from_expr lhs lhs_norm state with
         Some (lhs_id, off) ->
-          exec_store_deref loc lhs_id off lhs_norm rhs_expr state
+          exec_store_deref loc lhs_id off rhs_expr state
       | None ->
         (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
@@ -283,164 +283,134 @@ module TransferFunctions2 = struct
             (* err_issue = TODO register new issue type *) }]
     end else
       let rhs_norm = expr_normalize rhs_expr state in
-      begin match lhs_expr with
+      let lhs_norm = expr_normalize lhs_expr state in
+      begin match lhs_norm with
         Var id ->
         assign_to_variable id rhs_norm state
       | _ ->
-        let lhs_norm = expr_normalize lhs_expr state in
         let exp = BinOp (Peq, lhs_norm, rhs_norm) in
         let current =
           { state.current with pure = exp :: state.current.pure }
         in [{ state with current }]
       end
 
-  and exec_store_deref loc _lhs_id off lhs_norm rhs_expr state =
+  and exec_store_deref loc lhs_var_id lhs_offset rhs_expr state =
+    [state]
+    |> concat_map_ok_states
+      (exec_store_deref_check_base loc lhs_var_id)
+    |> concat_map_ok_states
+      (exec_store_deref_check_heap_pred loc lhs_var_id lhs_offset rhs_expr)
+  
+  and concat_map_ok_states f states = 
+    let open State in
+    List.concat_map ~f:(fun s ->
+      match s.status with
+      | Ok -> f s
+      | Error -> [s])
+    states
+
+  and exec_store_deref_check_base loc lhs_var_id state =
     let open State in
     let open Formula in
-    let open Expr in
-    match heap_pred_find_opt_block_points_to_by_dest lhs_norm state with
-    | _, Some PointsToBlock (src, size, block)
-    | _, Some PointsToUniformBlock (src, size, block, _) ->
-      begin match has_error_exec_store loc src size off block.freed state with
-        Some error -> error
-      | None ->
-        let rhs_norm = expr_normalize rhs_expr state in
-        begin match lhs_norm with
-        | Var id ->
-          assign_to_variable id rhs_norm state
-        | _ ->
-          let exp = BinOp (Peq, lhs_norm, rhs_norm) in
-          let current =
-            { state.current with pure = exp :: state.current.pure }
-          in
-          [{ state with current }]
-        end
-      end
-    | Some PointsToExp (src, _, _), None ->
-      (* Error: missing memory block *)
-      let missing_block = {
-        id = Id.fresh ();
-        base = 0L;
-        end_ = 0L; (* do we really need base, end_ ? *)
-        freed = false; }
-      in
-      let missing_block_src =
-        match find_opt_ptr_base src state with
-        | Some id -> Var id
-        | None -> Var (Id.fresh ())
-          (* 
-          let id = Id.fresh () in
-          let var = Var.of_id (Ident.create Ident.knormal id) in
-          let vars = (var, id) :: state.vars in
-          let types = VarIdMap.add id Typ.Pk_pointer state.types in
-          *)
+    match state_find_pure_base_expr lhs_var_id state with
+    | Some e when Formula.is_zero e ->
+      (* Base() == 0*)
+      [{ state with
+        status = Error;
+        err_loc = Some loc; }]
+    | Some e when Expr.equal e (Expr.Var lhs_var_id) ->
+      (* correct *)
+      [state]
+    | _ ->
+      (* missing resource *)
+      let err_state = { state with
+        status = Error;
+        err_loc = Some loc; }
       in
       let missing_part =
-        PointsToBlock (missing_block_src, Undef, missing_block)
+        Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var lhs_var_id), Expr.Var lhs_var_id)
       in
-      let missing = add_heap_pred missing_part state.missing in
-      let rhs_norm = expr_normalize rhs_expr state in
-      begin match lhs_norm with
-      | Var id ->
-        assign_to_variable id rhs_norm { state with missing }
-      | _ ->
-        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
-        let current =
-          { state.current with pure = exp :: state.current.pure }
-        in
-        [{ state with current; missing }]
-      end
+      let ok_state = { state with
+        missing = { state.missing with
+          pure = missing_part :: state.missing.pure } }
+      in
+      [ err_state; ok_state ]
+
+  and exec_store_deref_check_heap_pred loc lhs_var_id lhs_offset rhs_expr state =
+    let open State in
+    let open Formula in
+    match state_heap_pred_find_block_points_to lhs_var_id state with
+    | Some (PointsToBlock (_, size, block)) ->
+      if block.freed then
+        (* freed block *)
+        [{ state with
+          status = Error;
+          err_loc = Some loc;
+          err_issue = Some IssueType.atlas_use_after_free; }]
+      else
+        (* correct *)
+        exec_store_deref_check_offset loc lhs_var_id lhs_offset size rhs_expr state
     | _ ->
-      (* Error: missing heap predicate *)
+      (* missing resouce *)
+      let err_state = { state with
+        status = Error;
+        err_loc = Some loc; }
+      in
       let missing_block = {
         id = Id.fresh ();
         base = 0L;
         end_ = 0L;
-        freed = false;
-      } in
-      let missing_part = 
-        PointsToBlock (Var (Id.fresh ()), Undef, missing_block)
+        freed = false; }
       in
-      let missing = add_heap_pred missing_part state.missing in
-      let rhs_norm = expr_normalize rhs_expr state in
-      begin match lhs_norm with
-      | Var id ->
-        assign_to_variable id rhs_norm { state with missing }
+      let missing_part =
+        PointsToBlock (Expr.Var lhs_var_id, Expr.Undef, missing_block)
+      in
+      let spatial = missing_part :: state.missing.spatial in
+      let ok_state = { state with
+        missing = { state.missing with spatial } }
+      in
+      [err_state; ok_state]
+      |> concat_map_ok_states
+        (exec_store_deref_check_offset loc lhs_var_id lhs_offset Expr.Undef rhs_expr)
+
+  and exec_store_deref_check_offset loc lhs_var_id lhs_offset block_size rhs_expr state =
+    let open State in
+    if (Int64.compare 0L lhs_offset) < 0 then
+      (* offset out of bounds *)
+      [{ state with
+        status = Error;
+        err_loc = Some loc; }]
+    else begin
+      match eval_state_expr_to_int64_opt block_size state with
+      | Some s when (Int64.compare lhs_offset s) > 0 ->
+        (* offset out of bounds *)
+        [{ state with
+          status = Error;
+          err_loc = Some loc; }]
       | _ ->
-        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
-        let current =
-          { state.current with pure = exp :: state.current.pure }
-        in
-        [{ state with current; missing }]
+        (* correct *)
+        let rhs_norm = expr_normalize rhs_expr state in
+        exec_store_deref_assign lhs_var_id lhs_offset rhs_norm state
       end
   
-  and has_error_exec_store loc block_src_expr block_size_expr offset is_freed_block state =
+  and exec_store_deref_assign lhs_var_id lhs_offset rhs_norm state =
     let open State in
-    let src_offset =
-      match find_opt_ptr_base block_src_expr state with
-      | Some id ->
-        eval_offset id block_src_expr state
-      | None ->
-        None
-    in
-    let size =
-      eval_state_expr_to_int64_opt block_size_expr state
-    in
-    let abs_offset = Option.bind src_offset
-      ~f:(fun x -> Some (Stdlib.Int64.add x offset))
-    in
-    let is_out_of_bounds = 
-      match abs_offset, size with
-      | Some off, None
-        when (Int64.compare off 0L) < 0 ->
-          true
-      | Some off, Some s
-        when (Int64.compare off 0L) < 0 ||
-        (Int64.compare off s) > 0 ->
-          true
+    let src = Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)) in
+    let spatial_part, block_cell_id =
+      (* block cell can already exist! *)
+      match state_heap_pred_find_exp_points_to src state with
+      | Some ((Formula.PointsToExp (_, _, Var id)) as hp) ->
+        hp, id
       | _ ->
-        false
+        let block_cell_id = Id.fresh () in
+        let spatial_part =
+          Formula.PointsToExp (src, Undef, Var block_cell_id)
+        in
+        spatial_part, block_cell_id
     in
-    if is_out_of_bounds then
-      (* Error : offset out of bounds *)
-      Some [{ state with
-        status = Error;
-        err_loc = Some loc;
-        (* err_issue = TODO register new issue type *) }]
-    else
-      if is_freed_block then
-        (* Error: block is freed *)
-        Some [{ state with
-          status = Error;
-          err_loc = Some loc;
-          (* err_issue = TODO register new issue type *) }]
-      else
-        None
-
-  (** Finds a id of a variable inside [expr] using type information from [state]*)
-  and find_opt_ptr_base expr state =
-    let open State in
-    match expr with
-    | Expr.Var id ->
-      begin match VarIdMap.find_opt id state.types with
-      | Some typ ->
-        if Typ.is_pointer typ then
-          Some id
-        else
-          None
-      | None ->
-        None
-      end
-    | Expr.UnOp (_, e) ->
-      find_opt_ptr_base e state
-    | Expr.BinOp (_, e1, e2) ->
-      begin match find_opt_ptr_base e1 state with
-      | (Some _) as res -> res
-      | None ->
-        find_opt_ptr_base e2 state
-      end
-    | _ ->
-      None
+    let spatial = spatial_part :: state.current.spatial in
+    let pure = Expr.BinOp (Peq, Var block_cell_id, rhs_norm) :: state.current.pure in
+    [{state with current = { spatial; pure }}]
 
 
   and exec_malloc_instr lhs typ actual state =

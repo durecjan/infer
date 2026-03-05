@@ -422,3 +422,36 @@ let heap_pred_take_opt id spatial =
     traverse (hp :: acc) l
   in
   traverse [] spatial
+
+(** Traverses pure constraints and looks for (Base(Var [id])==exp) *)
+let rec find_pure_base_expr id = function
+  | [] -> None
+  | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
+    when Id.equal id id' -> Some exp
+  | _ :: rest -> find_pure_base_expr id rest
+
+(** Evaluates [expr] to Int64 and compares it to 0L *)
+let is_zero expr =
+  match eval_expr_to_int64 expr with
+  | Some i when Int64.equal i 0L ->
+    true
+  | _ ->
+    false
+
+(** Traverses heap predicates and looks for PointsToBlock (Var [id], size, dest) *)
+let rec heap_pred_find_block_points_to id = function
+  | [] -> None
+  | (PointsToBlock (Expr.Var id', _, _)) as hp :: _
+    when Id.equal id' id ->
+      Some hp
+  | _ :: rest ->
+    heap_pred_find_block_points_to id rest
+
+(** Traverses heap predicates and looks for PointsToExp ([src], size, dest) *)
+let rec heap_pred_find_exp_points_to src = function
+  | [] -> None
+  | (PointsToExp (src', _, _)) as hp :: _
+    when Expr.equal src' src ->
+      Some hp
+  | _ :: rest ->
+    heap_pred_find_exp_points_to src rest

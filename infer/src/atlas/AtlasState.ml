@@ -5,17 +5,15 @@ module Expr = AtlasFormula.Expr
 
 module VarIdMap = Stdlib.Map.Make (Id)
 
-type status = Ok | Error
+type status = Ok | Error of IssueType.t option * Location.t option
 
 type t = {
   current: Formula.t;             (* current formula *)
   missing: Formula.t;             (* missing part of formula *)
   vars: (Var.t * Id.t) list;      (* variable association list *)
-  types: Typ.t VarIdMap.t;           (* type map *)
-  subst: Id.t VarIdMap.t;            (* variable id substitution map *)
+  types: Typ.t VarIdMap.t;        (* type map *)
+  subst: Id.t VarIdMap.t;         (* variable id substitution map *)
   status: status;                 (* status = Ok | Error *)
-  err_loc: Location.t option;     (* location of error *)
-  err_issue: IssueType.t option;  (* issue type of error *)
 }
 
 let empty = {
@@ -25,8 +23,6 @@ let empty = {
   types = VarIdMap.empty;
   subst = VarIdMap.empty;
   status = Ok;
-  err_loc = None;
-  err_issue = None;
 }
 
 
@@ -201,7 +197,28 @@ and subst_to_string vars subst =
 
 and status_to_string s =
   match s with
-    Ok -> "" | Error -> "ERROR_STATE\n"
+    Ok ->
+      "OK\n"
+  | Error (Some issue, Some loc) ->
+    "ERROR\n" ^
+    "ISSUE=" ^ issue.unique_id ^ "\n" ^
+    "LOCATION=" ^ loc_to_string loc ^ "\n"
+  | Error (Some issue, None) ->
+    "ERROR\n" ^
+    "ISSUE=" ^ issue.unique_id ^ "\n"
+  | Error (None, Some loc) ->
+    "ERROR\n" ^
+    "LOCATION=" ^ loc_to_string loc ^ "\n"
+  | Error (None, None) ->
+    "ERROR\n"
+
+and loc_to_string loc = 
+  let open Location in
+  "[line " ^
+  Int.to_string (loc.line) ^
+  "; column " ^
+  Int.to_string (loc.col) ^
+  "]"
 
 
 (* debugging prints *)

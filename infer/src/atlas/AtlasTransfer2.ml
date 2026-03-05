@@ -96,6 +96,7 @@ module TransferFunctions2 = struct
     states
 
   and exec_load_instr loc lhs typ rhs rhs_expr state =
+    (* TODO ATLAS-1.bug *)
     let open State in
     let lhs_id = Id.fresh () in
     let state = { state with
@@ -109,9 +110,8 @@ module TransferFunctions2 = struct
       | None ->
         (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
-            status = Error;
-            err_loc = Some loc;
-            (* err_issue = TODO register new issue type *) }]
+            status = Error (
+              None, Some loc); }]
     end else
       assign_to_variable lhs_id rhs_expr state
 
@@ -228,16 +228,14 @@ module TransferFunctions2 = struct
       if (Int64.compare off size') > 0 || (Int64.compare off 0L) < 0 then
         (* Error: offset out of bounds *)
         [{ state with
-            status = Error;
-            err_loc = Some loc;
-            (* err_issue = TODO register new issue type *) }]
+            status = Error (
+              None, Some loc); }]
       else
         if block.freed then
           (* Error: block is freed *)
           [{ state with
-              status = Error;
-              err_loc = Some loc;
-              (* err_issue = TODO register new issue type *) }]
+              status = Error (
+                None, Some loc); }]
         else
           let new_src = expr_normalize (BinOp (Pplus, src, Const (Int off))) state in
           (* TODO: consider removing size from ExpPointsTo *)
@@ -249,9 +247,8 @@ module TransferFunctions2 = struct
     | None ->
       (* Error: missing heap predicate *)
       let err_state = { state with
-        status = Error;
-        err_loc = Some loc;
-        (* err_issue = TODO register new issue type *) }
+        status = Error (
+          None, Some loc); }
       in
       let missing_block = {
       id = Id.fresh ();
@@ -278,9 +275,8 @@ module TransferFunctions2 = struct
       | None ->
         (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
-            status = Error;
-            err_loc = Some loc;
-            (* err_issue = TODO register new issue type *) }]
+            status = Error (
+              None, Some loc); }]
     end else
       let rhs_norm = expr_normalize rhs_expr state in
       let lhs_norm = expr_normalize lhs_expr state in
@@ -306,7 +302,7 @@ module TransferFunctions2 = struct
     List.concat_map ~f:(fun s ->
       match s.status with
       | Ok -> f s
-      | Error -> [s])
+      | Error _ -> [s])
     states
 
   and exec_store_deref_check_base loc lhs_var_id state =
@@ -316,16 +312,16 @@ module TransferFunctions2 = struct
     | Some e when Formula.is_zero e ->
       (* Base() == 0*)
       [{ state with
-        status = Error;
-        err_loc = Some loc; }]
+        status = Error (
+          None, Some loc); }]
     | Some e when Expr.equal e (Expr.Var lhs_var_id) ->
       (* correct *)
       [state]
     | _ ->
       (* missing resource *)
       let err_state = { state with
-        status = Error;
-        err_loc = Some loc; }
+        status = Error (
+          None, Some loc); }
       in
       let missing_part =
         Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var lhs_var_id), Expr.Var lhs_var_id)
@@ -344,17 +340,17 @@ module TransferFunctions2 = struct
       if block.freed then
         (* freed block *)
         [{ state with
-          status = Error;
-          err_loc = Some loc;
-          err_issue = Some IssueType.atlas_use_after_free; }]
+          status = Error (
+            Some IssueType.atlas_use_after_free,
+            Some loc); }]
       else
         (* correct *)
         exec_store_deref_check_offset loc lhs_var_id lhs_offset size rhs_expr state
     | _ ->
       (* missing resouce *)
       let err_state = { state with
-        status = Error;
-        err_loc = Some loc; }
+        status = Error (
+          None, Some loc); }
       in
       let missing_block = {
         id = Id.fresh ();
@@ -378,15 +374,15 @@ module TransferFunctions2 = struct
     if (Int64.compare 0L lhs_offset) < 0 then
       (* offset out of bounds *)
       [{ state with
-        status = Error;
-        err_loc = Some loc; }]
+        status = Error (
+          None, Some loc); }]
     else begin
       match eval_state_expr_to_int64_opt block_size state with
       | Some s when (Int64.compare lhs_offset s) > 0 ->
         (* offset out of bounds *)
         [{ state with
-          status = Error;
-          err_loc = Some loc; }]
+          status = Error (
+            None, Some loc); }]
       | _ ->
         (* correct *)
         let rhs_norm = expr_normalize rhs_expr state in
@@ -460,9 +456,8 @@ module TransferFunctions2 = struct
         free_block loc base_id offset state
       | None ->
         [{ state with
-          status = Error;
-          err_loc = Some loc;
-          (* err_issue = register new issue *)}]
+          status = Error (
+            None, Some loc); }]
       end
 
   and exec_metadata_instr metadata state =
@@ -534,9 +529,8 @@ module TransferFunctions2 = struct
         in
         let err_state = { state with
           current = { state.current with pure };
-          status = Error;
-          err_loc = Some loc;
-          (* err_issue = register new issue *) }
+          status = Error (
+            None, Some loc); }
         in
         let missing_block = {
           id = Id.fresh ();
@@ -570,16 +564,16 @@ module TransferFunctions2 = struct
       if not (Int64.equal var_off 0L) then
         (* Error: freeing memory address not returned by malloc *)
         Some [{ state with
-          status = Error;
-          err_loc = Some loc;
-          err_issue = Some IssueType.atlas_free_non_base_pointer }]
+          status = Error (
+            Some IssueType.atlas_free_non_base_pointer,
+            Some loc); }]
       else
         if is_freed_block then
           (* Error: double free *)
           Some [{ state with
-            status = Error;
-            err_loc = Some loc;
-            err_issue = Some IssueType.atlas_double_free }]
+            status = Error (
+              Some IssueType.atlas_double_free,
+              Some loc); }]
         else
           (* Ok *)
           None
@@ -594,6 +588,7 @@ end
     let start_node = get_start_node proc_desc in
     let states_at = ref IdMap.empty in
     let error_states = ref [] in
+    let ok_states = ref [] in
     let add_states node new_states = 
       let old = IdMap.find_opt (Node.get_id node) !states_at
         |> Option.value ~default:[] in
@@ -615,24 +610,25 @@ end
           ~f:(fun states instr ->
             List.concat_map ~f:(fun state ->
               match state.status with
-                Error -> [state]
+                Error _ -> [state]
               | Ok ->
                 exec_instr node analysis_data state instr
               ) states
             ) instrs
       in
-      let ok_states, new_errors =
+      let ok_states', new_errors =
         Stdlib.List.partition (fun s ->
           match s.status with
             Ok -> true
-          | Error -> false)
+          | Error _ -> false)
           outgoing
       in
       error_states := new_errors @ !error_states;
-      if not (List.is_empty ok_states) then
+      ok_states := ok_states' @ !ok_states;
+      if not (List.is_empty ok_states') then
         Node.get_succs node
         |> List.iter ~f:(fun succ ->
           add_states succ outgoing;
           Stdlib.Queue.add succ worklist)
     done;
-    (!states_at, !error_states)
+    (!ok_states, !error_states)

@@ -409,3 +409,39 @@ let rec heap_pred_find_opt_block_points_to_by_dest dest state =
       Some hp
   | _ :: rest ->
     find_points_to_block src rest
+
+(** Traverses both current and missing pure constraints of [state], looking for (Base(Var [id])==exp) *)
+let state_find_pure_base_expr id state =
+  let curr_base, miss_base =
+    Formula.find_pure_base_expr id state.current.pure,
+    Formula.find_pure_base_expr id state.missing.pure
+  in
+  match curr_base, miss_base with
+  | Some b, None | None, Some b ->
+    Some b
+  | _ ->
+    None
+
+(** Traverses both current and missing heap predicates of [state], looking for PointsToBlock (Var [id], size, dest) *)
+let state_heap_pred_find_block_points_to id state =
+  let curr_hp, miss_hp =
+    Formula.heap_pred_find_block_points_to id state.current.spatial,
+    Formula.heap_pred_find_block_points_to id state.missing.spatial
+  in
+  match curr_hp, miss_hp with
+  | Some hp, None | None, Some hp ->
+    Some hp
+  | _ ->
+    None
+
+(** Traverses both current and missing heap predicates of [state], looking for PointsToExp ([src], size, dest) *)
+let state_heap_pred_find_exp_points_to src state =
+  let curr_hp, miss_hp =
+    Formula.heap_pred_find_exp_points_to src state.current.spatial,
+    Formula.heap_pred_find_exp_points_to src state.missing.spatial
+  in
+  match curr_hp, miss_hp with
+  | Some hp, None | None, Some hp ->
+    Some hp
+  | _ ->
+    None

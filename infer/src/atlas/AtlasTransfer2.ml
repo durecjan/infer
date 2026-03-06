@@ -63,15 +63,12 @@ module TransferFunctions2 = struct
     let open State in
     let _r = reporter_of_analysis analysis_data in
     let states = match instr with
-    | Sil.Load { id; e = rhs; typ; loc } ->
-      (* Format.print_string ("\nSIL.Load rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
-      exec_load_instr loc id typ rhs (sil_exp_to_expr rhs state) state
-    | Sil.Store {e1 = lhs; typ = lhs_typ; e2 = rhs; loc} ->
-      (* Format.print_string ("\nSIL store lhs:" ^ sil_exp_to_string lhs ^ "\n"); *)
-      (* Format.print_string ("\nSIL store rhs:" ^ sil_exp_to_string rhs ^ "\n"); *)
-      let lhs_expr = sil_exp_to_expr lhs state in
-      let rhs_expr = sil_exp_to_expr rhs state in
-      exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state
+    | Sil.Load { id; e; typ; loc } ->
+      exec_load_instr loc id typ e (sil_exp_to_expr e state) state
+    | Sil.Store {e1; typ; e2; loc} ->
+      let lhs_expr = sil_exp_to_expr e1 state in
+      let rhs_expr = sil_exp_to_expr e2 state in
+      exec_store_instr loc typ e1 lhs_expr rhs_expr state
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
@@ -103,8 +100,9 @@ module TransferFunctions2 = struct
       vars = (Var.of_id lhs, lhs_id) :: state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
+    let rhs_norm = expr_normalize rhs_expr state in
     if is_dereference_sil_exp rhs then begin match
-      get_base_and_offset_from_expr rhs (expr_normalize rhs_expr state) state with
+      get_base_and_offset_from_expr rhs rhs_norm state with
         Some (rhs_id, off) ->
           exec_load_deref loc lhs_id rhs_id off state
       | None ->
@@ -113,7 +111,7 @@ module TransferFunctions2 = struct
             status = Error (
               None, Some loc); }]
     end else
-      assign_to_variable lhs_id rhs_expr state
+      assign_to_variable lhs_id rhs_norm state
 
   (** Tries to extract base (pointer variable) and offset
       from given [expr] using the Sil [exp] and [state]. 
@@ -191,6 +189,7 @@ module TransferFunctions2 = struct
     | Exp.Lindex (e, _) -> is_dereference_sil_exp e
     | _ -> false
 
+  (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constaitn (Var ([lhs_id]) == [rhs]) to [state] *)
   and assign_to_variable lhs_id rhs state =
     let open Expr in
     let open State in
@@ -208,70 +207,107 @@ module TransferFunctions2 = struct
       in
       [{ state with current }]
   
-  (** Ids [lhs_id] and [rhs_id] must be canonical!
-    At this point does not support loading multiple cells,
-    heap_pred_find_opt uses only id, not Var id + Const Int offset
-    to match heap predicate, so the block might still be missing
-    and we just found some other block at different offset TODO *)
+  (** Ids [lhs_id] and [rhs_id] must be canonical! *)
   and exec_load_deref loc lhs_id rhs_id off state =
-    let open Formula in
+    [state]
+    |> concat_map_ok_states
+      (exec_deref_check_base loc rhs_id)
+    |> concat_map_ok_states
+      (exec_load_deref_check_heap_pred loc lhs_id rhs_id off)
+  
+  and exec_load_deref_check_heap_pred loc lhs_id rhs_id off state =
     let open State in
-    let open Expr in
-    match heap_pred_find_opt rhs_id state.current with
-      Some PointsToBlock (src, size, block)
-    | Some PointsToUniformBlock (src, size, block, _) ->
-      let size' =
-        match eval_expr_to_int64 size with
-          Some i -> i
-        | None -> Int64.max_value (* TODO fix me: should throw after we make sure this cannot happen *)
-      in
-      if (Int64.compare off size') > 0 || (Int64.compare off 0L) < 0 then
-        (* Error: offset out of bounds *)
+    let open Formula in
+    match state_heap_pred_find_block_points_to rhs_id state with
+    | Some PointsToBlock (_, size, block) ->
+      if block.freed then
+        (* freed block *)
         [{ state with
-            status = Error (
-              None, Some loc); }]
+          status = Error (
+            Some IssueType.atlas_use_after_free, Some loc;) }]
       else
-        if block.freed then
-          (* Error: block is freed *)
-          [{ state with
-              status = Error (
-                None, Some loc); }]
-        else
-          let new_src = expr_normalize (BinOp (Pplus, src, Const (Int off))) state in
-          (* TODO: consider removing size from ExpPointsTo *)
-          let pred = PointsToExp (new_src, Const (Int 0L), Var lhs_id) in
-          let current = add_heap_pred pred state.current in
-          [{ state with current }]
-    | Some PointsToExp _
-      (* Error: missing memory block *)
-    | None ->
-      (* Error: missing heap predicate *)
+        (* TODO check offset *)
+        exec_load_deref_check_offset loc lhs_id rhs_id off size state
+    | _ ->
+      (* missing resource *)
       let err_state = { state with
         status = Error (
-          None, Some loc); }
+          Some IssueType.atlas_use_after_free, Some loc); }
       in
       let missing_block = {
-      id = Id.fresh ();
-      base = 0L;
-      end_ = 0L; (* do we really need base, end_ ? *)
-      freed = false; }
+        id = Id.fresh ();
+        base = 0L;
+        end_ = 0L;
+        freed = false; }
       in
-      let missing_part = PointsToBlock (Var rhs_id, Const (Int Int64.max_value), missing_block) in
-      let missing = add_heap_pred missing_part state.missing in
-      let src = BinOp (Pplus, Var rhs_id, Const (Int off)) in
-      let current_part = PointsToExp (src, Const (Int 0L), Var lhs_id) in
-      (* TODO: consider removing size from ExpPointsTo *)
-      let current = add_heap_pred current_part state.current in
-      err_state :: [{ state with current = current; missing = missing }]
+      let missing_part =
+        PointsToBlock (Expr.Var rhs_id, Expr.Undef, missing_block)
+      in
+      let spatial = missing_part :: state.missing.spatial in
+      let ok_state = { state with
+        missing = { state.missing with spatial } }
+      in
+      [err_state; ok_state]
+      |> concat_map_ok_states
+        (exec_load_deref_check_offset loc lhs_id rhs_id off Expr.Undef)
 
-  and exec_store_instr loc _lhs_typ lhs lhs_expr rhs_expr state =
+  and exec_load_deref_check_offset loc lhs_id rhs_id rhs_offset block_size state =
+    let open State in
+    if (Int64.compare 0L rhs_offset) < 0 then
+      (* offset out of bounds *)
+      [{ state with
+        status = Error (
+          None, Some loc); }]
+    else begin
+      match eval_state_expr_to_int64_opt block_size state with
+      | Some s when (Int64.compare rhs_offset s) > 0 ->
+        (* offset out of bounds *)
+        [{ state with
+          status = Error (
+            None, Some loc); }]
+      | _ ->
+        (* correct *)
+        exec_load_deref_assign loc lhs_id rhs_id rhs_offset state
+      end
+
+  and exec_load_deref_assign loc lhs_id rhs_id rhs_offset state =
+    let open State in
+    let src =
+      Expr.BinOp (Pplus, Var rhs_id, Const (Int rhs_offset))
+    in
+    match state_heap_pred_find_exp_points_to src state with
+    | Some PointsToExp (_, _, Var cell_id) ->
+      [(subst_add ~from_:lhs_id ~to_:cell_id state)]
+    | _ ->
+      (* missing resource *)
+      (* also it is possible it's a uniform block created by calloc() *)
+      let cell_id = Id.fresh () in
+      let missing_part =
+        Formula.PointsToExp (src, Undef, Var cell_id)
+      in
+      let current_part = 
+        Expr.BinOp (Peq, Var cell_id, Undef)
+      in
+      let ok_state = { state with
+        missing = { state.missing with
+          spatial = missing_part :: state.missing.spatial };
+        current = { state.current with
+          pure = current_part :: state.current.pure } }
+      in
+      let error_state = { state with
+        status = Error (
+          None, Some loc) }
+      in
+      [error_state; ok_state]
+
+  and exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
     let open Expr in
     if is_dereference_sil_exp lhs then
       let lhs_norm = expr_normalize lhs_expr state in
       begin match get_base_and_offset_from_expr lhs lhs_norm state with
         Some (lhs_id, off) ->
-          exec_store_deref loc lhs_id off rhs_expr state
+          exec_store_deref loc lhs_typ lhs_id off rhs_expr state
       | None ->
         (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
         [{ state with
@@ -290,12 +326,12 @@ module TransferFunctions2 = struct
         in [{ state with current }]
       end
 
-  and exec_store_deref loc lhs_var_id lhs_offset rhs_expr state =
+  and exec_store_deref loc lhs_typ lhs_var_id lhs_offset rhs_expr state =
     [state]
     |> concat_map_ok_states
-      (exec_store_deref_check_base loc lhs_var_id)
+      (exec_deref_check_base loc lhs_var_id)
     |> concat_map_ok_states
-      (exec_store_deref_check_heap_pred loc lhs_var_id lhs_offset rhs_expr)
+      (exec_store_deref_check_heap_pred loc lhs_typ lhs_var_id lhs_offset rhs_expr)
   
   and concat_map_ok_states f states = 
     let open State in
@@ -305,7 +341,7 @@ module TransferFunctions2 = struct
       | Error _ -> [s])
     states
 
-  and exec_store_deref_check_base loc lhs_var_id state =
+  and exec_deref_check_base loc lhs_var_id state =
     let open State in
     let open Formula in
     match state_find_pure_base_expr lhs_var_id state with
@@ -332,7 +368,7 @@ module TransferFunctions2 = struct
       in
       [ err_state; ok_state ]
 
-  and exec_store_deref_check_heap_pred loc lhs_var_id lhs_offset rhs_expr state =
+  and exec_store_deref_check_heap_pred loc lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in
     let open Formula in
     match state_heap_pred_find_block_points_to lhs_var_id state with
@@ -345,7 +381,7 @@ module TransferFunctions2 = struct
             Some loc); }]
       else
         (* correct *)
-        exec_store_deref_check_offset loc lhs_var_id lhs_offset size rhs_expr state
+        exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset size rhs_expr state
     | _ ->
       (* missing resouce *)
       let err_state = { state with
@@ -367,9 +403,9 @@ module TransferFunctions2 = struct
       in
       [err_state; ok_state]
       |> concat_map_ok_states
-        (exec_store_deref_check_offset loc lhs_var_id lhs_offset Expr.Undef rhs_expr)
+        (exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset Expr.Undef rhs_expr)
 
-  and exec_store_deref_check_offset loc lhs_var_id lhs_offset block_size rhs_expr state =
+  and exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset block_size rhs_expr state =
     let open State in
     if (Int64.compare 0L lhs_offset) < 0 then
       (* offset out of bounds *)
@@ -386,10 +422,10 @@ module TransferFunctions2 = struct
       | _ ->
         (* correct *)
         let rhs_norm = expr_normalize rhs_expr state in
-        exec_store_deref_assign lhs_var_id lhs_offset rhs_norm state
+        exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm state
       end
   
-  and exec_store_deref_assign lhs_var_id lhs_offset rhs_norm state =
+  and exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm state =
     let open State in
     let src = Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)) in
     let spatial_part, block_cell_id =
@@ -405,8 +441,11 @@ module TransferFunctions2 = struct
         spatial_part, block_cell_id
     in
     let spatial = spatial_part :: state.current.spatial in
-    let pure = Expr.BinOp (Peq, Var block_cell_id, rhs_norm) :: state.current.pure in
-    [{state with current = { spatial; pure }}]
+    let pure =
+      Expr.BinOp (Peq, Var block_cell_id, rhs_norm) :: state.current.pure
+    in
+    let types = VarIdMap.add block_cell_id lhs_typ state.types in
+    [{state with current = { spatial; pure; }; types; }]
 
 
   and exec_malloc_instr lhs typ actual state =
@@ -477,19 +516,6 @@ module TransferFunctions2 = struct
                 making a new canonical id or removing the constraints *)
     | Skip | _ ->
       [state]
-
-    (** Tries to extract size from Expr.t [e] using [state] *)
-    and get_malloc_size_of_sil_exp e state =
-      let open State in
-      let open Expr in
-      match e with
-      | Var id ->
-        begin
-          match Formula.lookup_pure_const_exp_of_id id state.current.pure with
-          | Some exp -> exp
-          | None -> e
-        end
-      | _ -> e
 
     (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [loc] *)
     and free_block loc id off state =

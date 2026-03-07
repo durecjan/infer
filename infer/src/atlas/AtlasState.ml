@@ -181,8 +181,12 @@ let rec to_string state =
   Formula.to_string state.vars state.current 
   ^ "\n----------------\nMissing:\n"
   ^ Formula.to_string state.vars state.missing
+  ^ "\n----------------\nVars:\n"
+  ^ vars_to_string state.vars
   ^ "\n----------------\nSubstitutions:\n"
   ^ subst_to_string state.vars state.subst
+  ^ "\n----------------\nTypes:\n"
+  ^ types_to_string state.types
   ^ "\n================"
 
 and subst_to_string vars subst =
@@ -220,6 +224,23 @@ and loc_to_string loc =
   Int.to_string (loc.col) ^
   "]"
 
+and vars_to_string vars =
+  String.concat (
+    List.map vars
+    ~f:(fun (var, id) ->
+      let var_str = match var with
+      | Var.ProgramVar pvar ->
+        Pvar.get_simplified_name pvar
+      | Var.LogicalVar ident ->
+        Ident.to_string ident
+      in
+      "(" ^ var_str ^ ";" ^ Int.to_string id ^ ") "))
+
+and types_to_string types =
+  String.concat (
+    List.map (VarIdMap.bindings types)
+    ~f:(fun (id, typ) ->
+      "(" ^ Typ.to_string typ ^ ";" ^ Int.to_string id ^ ") "))
 
 (* debugging prints *)
 

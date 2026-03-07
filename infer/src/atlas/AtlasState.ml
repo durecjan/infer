@@ -50,9 +50,9 @@ let subst_add ~from_ ~to_ s =
     If a known variable is encountered, it's canonical Id
     is used in the conversion. If the variable is unknown,
     it is converted as Expr.Undef *)
-let rec sil_exp_to_expr e s =
-  match Exp.ignore_cast e with
-    Exp.Cast (_, inner) -> sil_exp_to_expr inner s
+let rec sil_exp_to_expr e tenv s =
+  match e with
+    Exp.Cast (_, inner) -> sil_exp_to_expr inner tenv s
   | Exp.Const c -> sil_const_exp_to_expr c
   | Exp.Sizeof sz -> sil_sizeof_exp_to_expr sz
   | Exp.Lvar pvar -> begin match
@@ -74,32 +74,28 @@ let rec sil_exp_to_expr e s =
       Expr.Undef
     end
   | Exp.UnOp (op, exp, _) ->
-    let exp' = sil_exp_to_expr exp s in
+    let exp' = sil_exp_to_expr exp tenv s in
     let op' = sil_unop_exp_to_expr op in
     Expr.UnOp (op', exp')
   | Exp.BinOp ((Binop.Gt | Binop.Ge) as op, e1, e2) ->
-    let lhs = sil_exp_to_expr e1 s in
-    let rhs = sil_exp_to_expr e2 s in
+    let lhs = sil_exp_to_expr e1 tenv s in
+    let rhs = sil_exp_to_expr e2 tenv s in
     let op' = sil_binop_exp_to_expr op in
     Expr.BinOp (op', rhs, lhs)
   | Exp.BinOp (op, e1, e2) ->
-    let lhs = sil_exp_to_expr e1 s in
-    let rhs = sil_exp_to_expr e2 s in
+    let lhs = sil_exp_to_expr e1 tenv s in
+    let rhs = sil_exp_to_expr e2 tenv s in
     let op' = sil_binop_exp_to_expr op in
     Expr.BinOp (op', lhs, rhs)
-  | Exp.Lfield ({ exp; is_implicit = _ }, _fieldname, typ) ->
-      let base = sil_exp_to_expr exp s in
-      begin match sil_lfield_offset_bytes (*fieldname*) typ with
-        Some off ->
-        Expr.BinOp (Expr.Pplus, base, Const (Int off))
-      | None ->
-        (* TODO rethink this fallback idea vs. Expr.Undef offset *)
-        base
-      end
+  | Exp.Lfield ({ exp; is_implicit = _ }, fieldname, typ) ->
+      let base = sil_exp_to_expr exp tenv s in
+      let offset = sil_struct_field_offset_bytes tenv fieldname typ in
+      Expr.BinOp (Pplus, base, Const (Int offset))
   | Exp.Lindex (base, index) ->
-      let base' = sil_exp_to_expr base s in
-      let index' = sil_exp_to_expr index s in
-      Expr.BinOp (Pplus, base', index')
+      let base' = sil_exp_to_expr base tenv s in
+      let index' = sil_exp_to_expr index tenv s in
+      let offset = sil_array_offset_bytes base index' tenv s in
+      Expr.BinOp (Pplus, base', offset)
   | _ -> Expr.Undef
 
 and sil_const_exp_to_expr c =
@@ -116,38 +112,90 @@ and sil_sizeof_exp_to_expr sz =
   (* | { nbytes = Some i; dynamic_length = exp } *)
   | _ -> Expr.Undef
 
-and sil_lfield_offset_bytes (*tenv*) (*fieldname*) typ =
-  sil_lindex_element_size typ
-
-and sil_lindex_element_size typ =
+and sil_struct_field_offset_bytes tenv target_field struct_typ =
   let open Typ in
+  let open Struct in
+  match struct_typ.desc with
+  | Typ.Tstruct name ->
+    begin match Tenv.lookup tenv name with
+    | Some { fields } ->
+      let rec aux acc = function
+        | [] -> acc
+        | { name; typ } :: rest ->
+          if Fieldname.equal name target_field then
+            acc
+          else
+            let size = typ_size_of tenv typ in
+            aux (Stdlib.Int64.add acc size) rest
+      in
+      aux 0L fields
+    | _ ->
+      0L
+    end
+  | _ ->
+    0L
+
+and sil_array_offset_bytes base index tenv s =
+  let temp_vars =
+    Sequence.map ~f:(fun id -> Var.of_id id) (Exp.free_vars base)
+  in
+  let pvars =
+    Sequence.map ~f:(fun p -> Var.of_pvar p) (Exp.program_vars base)
+  in
+  let vars = Sequence.append temp_vars pvars |> Sequence.to_list in
+  let var_ids = List.map vars
+    ~f:(fun var ->
+      get_canonical_var_id var s)
+  in
+  match List.filter_opt var_ids with
+  | [id] ->
+    begin match VarIdMap.find_opt id s.types with
+    | Some t ->
+      let size_of_t = typ_size_of tenv t in
+      Expr.BinOp (Expr.Pmult, index, Const (Int size_of_t))
+    | None -> index
+    end
+  | _ -> index  (* TODO maybe not the best fallback *)
+
+
+and typ_size_of tenv typ =
+  let open Typ in
+  let open Struct in
   match typ.desc with
   (* for now assume 64bit architecture *)
-  (* TODO wire up to infer's runtime info *)
-    Tint ikind ->
+  (* TODO wire up to infer's runtime info -- i did not find any *)
+  | Tint ikind ->
       begin match ikind with
-        IChar -> Some 1L
-      | ISChar -> Some 1L
-      | IUChar -> Some 1L
-      | IBool -> Some 1L
-      | IInt -> Some 4L
-      | IUInt -> Some 4L
-      | IShort -> Some 2L
-      | IUShort -> Some 2L
-      | ILong -> Some 8L
-      | IULong -> Some 8L
-      | ILongLong -> Some 16L
-      | IULongLong -> Some 16L
-      | I128 -> Some 32L
-      | IU128 -> Some 32L
+      | IChar | ISChar | IUChar | IBool -> 1L
+      | IInt | IUInt -> 4L
+      | IShort | IUShort -> 2L
+      | ILong | IULong | ILongLong | IULongLong -> 8L
+      | I128 | IU128 -> 16L
       end
-  | Tfloat _ -> None
-  | Tvoid -> None
-  | Tfun _ -> None
-  | Tptr (_, _) -> None
-  | Tstruct _ -> None
-  | TVar _ -> None
-  | Tarray _ -> None
+  | Tfloat fkind ->
+    begin match fkind with
+    | FFloat -> 4L
+    | FDouble | FLongDouble -> 8L
+    end
+  | Tvoid -> 0L
+  | Tfun _ -> 8L
+  | Tptr (_, _) -> 8L
+  | Tstruct name ->
+    begin match Tenv.lookup tenv name with
+    | Some { fields } ->
+      let rec sum acc = function
+        | [] -> acc
+        | { name = _; typ } :: rest ->
+          let size = typ_size_of tenv typ in
+          sum (Stdlib.Int64.add acc size) rest
+      in
+      sum 0L fields
+    | _ ->
+      0L
+    end
+  | Tarray {elt; length = _; stride = _} ->
+    typ_size_of tenv elt
+  | TVar _ -> 0L (* C++ template variables *)
 
 and sil_unop_exp_to_expr op =
   match op with
@@ -173,6 +221,27 @@ and sil_binop_exp_to_expr op =
   | Binop.BOr -> Expr.BVor
   | Binop.LAnd -> Expr.Land
   | Binop.LOr -> Expr.Lor
+
+
+let sil_get_pointer_variable_id exp s =
+  let vars = Exp.free_vars exp |> Sequence.to_list in
+  let var_ids = List.map vars
+    ~f:(fun ident ->
+      get_canonical_var_id (Var.of_id ident) s)
+  in
+  let pointers = List.filter var_ids
+    ~f:(fun id ->
+      match id with
+      | None -> false (* should not really happen, unless global variable *)
+      | Some id ->
+        begin match VarIdMap.find_opt id s.types with
+        | Some typ -> Typ.is_pointer typ
+        | None -> false
+      end)
+  in
+  match pointers with
+  | [Some base] -> Some base
+  | _ -> None
 
 
 let rec to_string state =

@@ -123,7 +123,7 @@ module Expr = struct
     else
       match lookup_variable v vars with
         Some var -> var_string var
-      | None -> Int.to_string v
+      | None -> "Var(" ^ (Int.to_string v) ^ ")"
 
   and var_string = function
       Var.ProgramVar pvar -> Pvar.get_simplified_name pvar

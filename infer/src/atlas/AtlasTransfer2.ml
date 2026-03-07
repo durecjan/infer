@@ -60,11 +60,13 @@ module TransferFunctions2 = struct
     Format.fprintf Format.err_formatter "@[<h>%a;@]@;" (Sil.pp_instr ~print_types:true Pp.text) instr;
     Format.print_newline ();
 
+    let open IntraproceduralAnalysis in
     let open State in
+    let tenv = analysis_data.tenv in
     let _r = reporter_of_analysis analysis_data in
     let states = match instr with
     | Sil.Load { id; e; typ; loc } ->
-      let rhs_expr = sil_exp_to_expr e state in
+      let rhs_expr = sil_exp_to_expr e tenv state in
 
       Format.print_string (
         "[SIL_LOAD]\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
@@ -75,8 +77,8 @@ module TransferFunctions2 = struct
       Format.print_string (
         "[SIL_STORE]\n[SIL_INSTR_LHS]: " ^ sil_exp_to_string e1 ^ "\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e2) ;
 
-      let lhs_expr = sil_exp_to_expr e1 state in
-      let rhs_expr = sil_exp_to_expr e2 state in
+      let lhs_expr = sil_exp_to_expr e1 tenv state in
+      let rhs_expr = sil_exp_to_expr e2 tenv state in
 
       Format.print_string (
         "\n[LHS_EXPR]: " ^ Expr.to_string state.vars lhs_expr ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
@@ -85,7 +87,7 @@ module TransferFunctions2 = struct
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-          let actual_expr = sil_exp_to_expr actual state in
+          let actual_expr = sil_exp_to_expr actual tenv state in
 
           Format.print_string (
             "[SIL_MALLOC]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
@@ -94,10 +96,10 @@ module TransferFunctions2 = struct
     | Sil.Call
       ( _, Exp.Const (Const.Cfun procname), (actual, _) :: _, loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
-          let actual_expr = sil_exp_to_expr actual state in
+          let actual_expr = sil_exp_to_expr actual tenv state in
 
           Format.print_string (
-            "[SIL_MALLOC]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
+            "[SIL_FREE]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
 
           exec_free_instr loc actual actual_expr state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
@@ -140,36 +142,13 @@ module TransferFunctions2 = struct
       Always pass a normalized [expr]! *)
   and get_base_and_offset_from_expr exp expr state =
     let open State in
-    (* get temporaries and map them to our variable ids *)
-    let vars = Exp.free_vars exp |> Sequence.to_list in
-    let var_ids = List.map ~f:(fun ident ->
-      get_canonical_var_id (Var.of_id ident) state)
-      vars
-    in
-    (* filter variable ids, looking for variable that has pointer type *)
-    let pointers = 
-      List.filter ~f:(fun id ->
-        match id with
-          None -> false (* should not really happen, unless global variable *)
-        | Some id ->
-          begin match VarIdMap.find_opt id state.types with
-            Some typ -> Typ.is_pointer typ
-          | None -> false
-        end)
-        var_ids
-    in
-    (* evaluate offset *)
-    match pointers with
-    | [Some base] -> 
-      Format.print_string "\n[get_base_and_offset_from_expr]: found base pointer variable\n" ;
+    match sil_get_pointer_variable_id exp state with
+    | Some base ->
       begin match eval_offset base expr state with
-        Some offset -> Format.print_string "\n[get_base_and_offset_from_expr]: found offset\n" ; Some (base, offset)
-      | None -> Format.print_string "\n[get_base_and_offset_from_expr]: failed to find offset - defaulting to 0L\n" ; Some (base, 0L) (* TODO revisit *)
+        Some offset -> Some (base, offset)
+      | None -> Some (base, 0L) (* TODO revisit *)
       end
-    | _ ->
-      (* there should not be multiple pointers *)
-      Format.print_string "\n[get_base_and_offset_from_expr]: failed to find base pointer variable\n" ;
-      None
+    | None -> None
 
   (** Evaluates [expr], skipping [base] since it is
     a known pointer, handling BinOp | Const | Var ,
@@ -208,10 +187,19 @@ module TransferFunctions2 = struct
 
   and is_dereference_sil_exp exp =
     match Exp.ignore_cast exp with
-      Exp.Var _ -> true
-    | Exp.Lfield ({ exp = e }, _, _) -> is_dereference_sil_exp e
-    | Exp.Lindex (e, _) -> is_dereference_sil_exp e
-    | _ -> false
+      Exp.Var _ ->
+        true
+    | Exp.Lfield ({ exp = e }, _, _) ->
+      is_dereference_sil_exp e
+    | Exp.Lindex (e, _) ->
+      is_dereference_sil_exp e
+    | Exp.UnOp (_, e, _) ->
+      is_dereference_sil_exp e
+    | Exp.BinOp (_, e1, e2) ->
+      is_dereference_sil_exp e1 ||
+      is_dereference_sil_exp e2
+    | _ ->
+      false
 
   (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constaitn (Var ([lhs_id]) == [rhs]) to [state] *)
   and assign_to_variable lhs_id rhs state =
@@ -454,10 +442,8 @@ module TransferFunctions2 = struct
 
   and exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset block_size rhs_expr state =
     let open State in
-    Format.print_string "[exec_store_deref_check_offset]: checking offset";
     if (Int64.compare lhs_offset 0L) < 0 then begin
       (* offset out of bounds *)
-      Format.print_string ("[exec_store_deref_check_offset]: lower bound check failed (offset=" ^ Int64.to_string lhs_offset ^ ")");
       [{ state with
         status = Error (
           None, Some loc); }]
@@ -465,7 +451,6 @@ module TransferFunctions2 = struct
       match eval_state_expr_to_int64_opt block_size state with
       | Some s when (Int64.compare lhs_offset s) > 0 ->
         (* offset out of bounds *)
-        Format.print_string "[exec_store_deref_check_offset]: upper bound check failed";
         [{ state with
           status = Error (
             None, Some loc); }]

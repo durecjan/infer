@@ -536,13 +536,15 @@ module TransferFunctions2 = struct
 
   and exec_metadata_instr metadata state =
     let open Sil in
-    let open State in
     match metadata with
-    | VariableLifetimeBegins { pvar; typ; loc = _; is_cpp_structured_binding = _} ->
+    | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
+      (*
       let id = Id.fresh () in
       [{ state with
         vars = (Var.of_pvar pvar, id) :: state.vars;
         types = VarIdMap.add id typ state.types }]
+      *)
+      [state]
     | Nullify (_pvar, _loc) ->
       [state] (* TODO *)
     | ExitScope (_var_list, _loc) ->

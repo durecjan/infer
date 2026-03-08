@@ -16,7 +16,7 @@ type t = {
   status: status;                 (* status = Ok | Error *)
 }
 
-let empty = {
+let empty_ = {
   current = Formula.empty;
   missing = Formula.empty;
   vars = [];
@@ -24,6 +24,26 @@ let empty = {
   subst = VarIdMap.empty;
   status = Ok;
 }
+
+let rec empty analysis_data =
+  let open IntraproceduralAnalysis in
+  let open ProcAttributes in
+  let s = empty_ in
+  let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
+  let locals = Procdesc.get_locals analysis_data.proc_desc in
+  List.fold ~init:s locals
+    ~f:(fun state var -> 
+      let pvar = Pvar.mk var.name proc_name in
+      state_add_var pvar var.typ state)
+
+and state_add_var ?id v t s =
+  let id' = match id with
+  | Some id -> id
+  | None -> Id.fresh ()
+  in
+  { s with 
+    vars = (Var.of_pvar v, id') :: s.vars;
+    types = VarIdMap.add id' t s.types}
 
 
 (** Searches for canonical Id of variable [v], using state [s] *)

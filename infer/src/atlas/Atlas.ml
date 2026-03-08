@@ -1,7 +1,7 @@
 open! IStd
 
 let checker (analysis_data : IntraproceduralAnalysis.t) : unit =
-  let init_state = AtlasState.empty in
+  let init_state = AtlasState.empty analysis_data in
   let states, err_states = AtlasTransfer2.run analysis_data init_state in
   let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
   Format.printf

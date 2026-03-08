@@ -3,19 +3,26 @@ module Formula = AtlasFormula
 module Id = AtlasFormula.Id
 module Expr = AtlasFormula.Expr
 
+(** Variable Id map *)
 module VarIdMap = Stdlib.Map.Make (Id)
 
+(** Substitution expression *)
+type subst_expr = Var of Id.t | Ptr of { base: Id.t ; offset: Int64.t }
+
+(** State status *)
 type status = Ok | Error of IssueType.t option * Location.t option
 
+(** Abstract state *)
 type t = {
-  current: Formula.t;             (* current formula *)
-  missing: Formula.t;             (* missing part of formula *)
-  vars: (Var.t * Id.t) list;      (* variable association list *)
-  types: Typ.t VarIdMap.t;        (* type map *)
-  subst: Id.t VarIdMap.t;         (* variable id substitution map *)
-  status: status;                 (* status = Ok | Error *)
+  current: Formula.t;             (** Current part of formula *)
+  missing: Formula.t;             (** Missing part of formula *)
+  vars: (Var.t * Id.t) list;      (** Sil variable map *)
+  types: Typ.t VarIdMap.t;        (** Type map *)
+  subst: subst_expr VarIdMap.t;   (** Substitution map *)
+  status: status;                 (** State status *)
 }
 
+(** Empty state *)
 let empty_ = {
   current = Formula.empty;
   missing = Formula.empty;
@@ -25,26 +32,30 @@ let empty_ = {
   status = Ok;
 }
 
-let rec empty analysis_data =
+(** State initialized with local variables and their types *)
+let rec empty analysis =
   let open IntraproceduralAnalysis in
   let open ProcAttributes in
   let s = empty_ in
-  let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
-  let locals = Procdesc.get_locals analysis_data.proc_desc in
+  let proc_name = Procdesc.get_proc_name analysis.proc_desc in
+  let locals = Procdesc.get_locals analysis.proc_desc in
   List.fold ~init:s locals
     ~f:(fun state var -> 
       let pvar = Pvar.mk var.name proc_name in
-      state_add_var pvar var.typ state)
+      state_add_variable pvar var.typ state)
 
-and state_add_var ?id v t s =
+(** Adds variable [v] with type [t] into state [s]. if [id] is present, it is used, otherwise fresh id is made. *)
+and state_add_variable ?id v t s =
   let id' = match id with
   | Some id -> id
   | None -> Id.fresh ()
   in
   { s with 
     vars = (Var.of_pvar v, id') :: s.vars;
-    types = VarIdMap.add id' t s.types}
+    types = VarIdMap.add id' t s.types }
 
+
+(* ==================== equality substitution helpers ==================== *)
 
 (** Searches for canonical Id of variable [v], using state [s] *)
 let rec get_canonical_var_id v s =
@@ -55,7 +66,22 @@ let rec get_canonical_var_id v s =
 and canonical_id subst id =
   match VarIdMap.find_opt id subst with
   | None -> id
-  | Some id' -> canonical_id subst id'
+  | Some Var id' -> canonical_id subst id'
+  | Some Ptr { base } -> canonical_id subst base
+
+(** Searches for canonical Expr.t of variable [v], using state [s] *)
+let rec get_canonical_expr v s =
+  match Formula.lookup_variable_id v s.vars with
+  | None -> None
+  | Some id -> Some (canonical_expr s.subst id 0L)
+
+and canonical_expr subst id rel_offset =
+  match VarIdMap.find_opt id subst with
+  | None -> Ptr { base = id; offset = rel_offset }
+  | Some Var id' -> canonical_expr subst id' rel_offset
+  | Some Ptr { base; offset } ->
+    let abs_offset = Stdlib.Int64.add rel_offset offset in
+    canonical_expr subst base abs_offset
 
 (** Adds substitution between Ids [~from], [~to] to state [s] *)
 let subst_add ~from_ ~to_ s =
@@ -64,7 +90,282 @@ let subst_add ~from_ ~to_ s =
   if Id.equal from_canonical to_canonical then
     s
   else
-    { s with subst = VarIdMap.add from_canonical to_canonical s.subst }
+    { s with subst = VarIdMap.add from_canonical (Var to_canonical) s.subst }
+
+(** Adds substitution between Id [~from] and substitution expression [~to] to state [s].
+    If [~from] is resolved as canonical [Ptr { base; offset }], no substitution is added. *)
+let subst_expr_add ~from_ ~to_ s =
+  let from_canonical = canonical_expr s.subst from_ 0L in
+  let to_canonical = canonical_expr s.subst to_ 0L in
+  match from_canonical, to_canonical with
+  | Var id1, Var id2
+    when Id.equal id1 id2 -> s
+  | Ptr { base = b1; offset = off1 }, Ptr { base = b2; offset = off2 }
+    when Id.equal b1 b2 && Int64.equal off1 off2 -> s
+  | Var from_id, to_canonical ->
+    { s with subst =
+      VarIdMap.add from_id to_canonical s.subst }
+  | Ptr _, _ -> s (* not allowed *)
+
+let subst_expr_to_formula_expr = function
+  | Var id -> Expr.Var id
+  | Ptr { base; offset } -> Expr.BinOp (Pplus, Var base, Const (Int offset))
+
+
+(* ==================== Exp.t helpers ==================== *)
+
+(** Checks whether Sil Exp.t [exp] contains any program variable Pvar.t *)
+let rec has_sil_program_var exp =
+  match Exp.ignore_cast exp with
+  | Exp.Lvar _ ->
+    true
+  | Exp.Lfield ({ exp = e }, _, _) ->
+    has_sil_program_var e
+  | Exp.Lindex (e, _) ->
+    has_sil_program_var e
+  | Exp.UnOp (_, e, _) ->
+    has_sil_program_var e
+  | Exp.BinOp (_, e1, e2) ->
+    has_sil_program_var e1 ||
+    has_sil_program_var e2
+    | _ ->
+      false
+
+(** Checks whether Sil Exp.t [exp] suggests a dereference *)
+let rec is_sil_dereference exp =
+  match Exp.ignore_cast exp with
+    Exp.Var _ ->
+      true
+  | Exp.Lfield ({ exp = e }, _, _) ->
+    is_sil_dereference e
+  | Exp.Lindex (e, _) ->
+    is_sil_dereference e
+  | Exp.UnOp (_, e, _) ->
+    is_sil_dereference e
+  | Exp.BinOp (_, e1, e2) ->
+    is_sil_dereference e1 ||
+    is_sil_dereference e2
+  | _ ->
+    false
+
+
+(* ==================== Expr.t helpers ==================== *)
+
+(** Use for dereference! Extracts base variable and evaluated offset from given [expr] *)
+let rec expr_base_and_offset expr state =
+  let open Typ in
+  let rec is_pointer = function
+    | Typ.Tptr _ -> true
+    | Typ.Tarray { elt } -> is_pointer elt.desc
+    | _ -> false
+  in
+  let var_ids = expr_variable_ids expr in
+  let pointers = List.filter var_ids
+    ~f:(fun id ->
+      match VarIdMap.find_opt id state.types with
+      | Some t -> is_pointer t.desc
+      | None -> false)
+  in
+  match pointers with
+  | [base] ->
+    Some (base, expr_eval_offset expr base state)
+  | _ ->
+    None
+
+(** Extracts all variable ids from given [expr] *)
+and expr_variable_ids expr =
+  let rec extract ids = function
+    | Expr.Undef -> ids
+    | Expr.Var id -> id :: ids
+    | Expr.Const _ -> ids
+    | Expr.UnOp (_, e) -> extract ids e
+    | Expr.BinOp (_, e1, e2) ->
+      let ids = extract ids e1 in
+      extract ids e2
+  in
+  extract [] expr
+
+(** Evaluates offset of given [expr], skipping base variable [skip_id] in the process. *)
+and expr_eval_offset expr skip_id state =
+  let lookup_pure id =
+    Formula.lookup_pure_const_exp_of_id id state.current.pure
+  in
+  let rec eval off = function
+    | Expr.Undef -> off
+    | Expr.Var id when Id.equal id skip_id -> off
+    | Expr.Var id ->
+      begin match lookup_pure id with
+      | Some e -> eval off (expr_normalize e state)
+      | None -> off
+      end
+    | Expr.Const (Int i) -> Stdlib.Int64.add off i
+    | Expr.Const _ -> off
+    | Expr.UnOp (op, e) ->
+      let inner = eval 0L e in
+      begin match op with
+      | Puminus ->
+        Stdlib.Int64.sub off inner
+      | Lnot | BVnot | Base | End -> off
+      end
+    | Expr.BinOp (op, e1, e2) ->
+      let lhs = eval 0L e1 in
+      let rhs = eval 0L e2 in
+      let res = match op with
+        | Pplus ->
+          Stdlib.Int64.add lhs rhs
+        | Pminus ->
+          Stdlib.Int64.sub lhs rhs
+        | Pmult ->
+          Stdlib.Int64.mul lhs rhs
+        | Pdiv when (Int64.compare rhs 0L) <> 0 ->
+          Stdlib.Int64.div lhs rhs
+        | Pmod when (Int64.compare rhs 0L) <> 0 ->
+          Stdlib.Int64.rem lhs rhs
+        | BVlshift | BVrshift
+        | Pless | Plesseq | Peq | Pneq
+        | BVand | BVor | BVxor
+        | Land | Lor | _ -> 0L
+      in
+      Stdlib.Int64.add off res
+  in
+  eval 0L (expr_normalize expr state)
+
+(** Currently only normalizes arithmetic operations TODO *)
+and expr_normalize expr _state =
+  let open Expr in 
+  let norm = expr_normalize in
+  match expr with
+    Var _ | Const _ | Undef ->
+      expr
+  | UnOp (op, e) ->
+    let e' = norm e _state in
+    begin match op, e' with
+      Puminus, Const (Int i) ->
+      Const (Int (Int64.neg i))
+    | Lnot, Const (Int i) ->
+      Const (Int (if (Int64.compare i 0L) <> 0 then 0L else 1L))
+    | BVnot, Const (Int i) ->
+      Const (Int (Stdlib.Int64.lognot i))
+    | Puminus, UnOp (Puminus, e_inner) ->
+      e_inner
+    | _ ->
+      UnOp (op, e')
+    end
+  | BinOp (op, e1, e2) ->
+    let e1' = norm e1 _state in
+    let e2' = norm e2 _state in
+    begin match op, e1, e2 with
+      Pplus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.add i1 i2))
+    | Pminus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.sub i1 i2))
+    | Pmult, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.mul i1 i2))
+    | Pdiv, Const (Int i1), Const (Int i2)
+      when (Int64.compare i2 0L) <> 0 ->
+      Const (Int (Stdlib.Int64.div i1 i2))
+    | Pmod,   Const (Int i1), Const (Int i2)
+      when (Int64.compare i2 0L) <> 0 ->
+      Const (Int (Int64.rem i1 i2))
+
+    | Pplus, e, Const (Int 0L)
+    | Pplus, Const (Int 0L), e ->
+      e
+    | Pminus, e, Const (Int 0L) ->
+      e
+    | Pmult, e, Const (Int 1L)
+    | Pmult, Const (Int 1L), e ->
+      e
+    | Pmult, _, Const (Int 0L)
+    | Pmult, Const (Int 0L), _ ->
+      Const (Int 0L)
+
+    | Land, Const (Int 0L), _
+    | Land, _, Const (Int 0L) ->
+      Const (Int 0L)
+    | Lor, Const (Int 1L), _
+    | Lor, _, Const (Int 1L) ->
+      Const (Int 1L)
+
+    | _ ->
+      BinOp (op, e1', e2')
+    end
+
+(** Evaluates [expr], handling BinOp | Const | Var ,
+    where Var must have a chain of pure constraints,
+    eventually leading to Const. If any part fails
+    to evaluate, method returns None *)
+let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int64, need to refactor again *)
+  let open Formula in
+  let open Expr in
+  (* TODO a lot of None cases, revisit *)
+  let rec eval acc = function
+      Var id -> begin match
+        lookup_pure_const_exp_of_id id state.current.pure with
+          Some e -> eval acc e
+        | None -> None 
+      end
+    | BinOp (Pplus, e1, e2) ->
+      begin match eval acc e1 with
+        Some acc1 -> eval acc1 e2
+      | None ->
+          match eval acc e2 with
+            Some acc2 -> eval acc2 e1
+          | None -> None
+      end
+    | BinOp (Pminus, e, Const (Int i)) ->
+        eval (Stdlib.Int64.sub acc i) e
+    | Const (Int i) ->
+        Some (Stdlib.Int64.add acc i)
+    | _ ->
+      None
+  in
+  eval 0L expr
+
+
+(* ==================== pure constraint helpers ==================== *)
+
+(** Traverses both current and missing pure constraints of [state], looking for (Base(Var [id])==exp) *)
+let state_find_pure_base_expr id state =
+  let curr_base, miss_base =
+    Formula.find_pure_base_expr id state.current.pure,
+    Formula.find_pure_base_expr id state.missing.pure
+  in
+  match curr_base, miss_base with
+  | Some b, None | None, Some b ->
+    Some b
+  | _ ->
+    None
+
+
+(* ==================== heap predicate helpers ==================== *)
+
+(** Traverses both current and missing heap predicates of [state], looking for PointsToBlock (Var [id], size, dest) *)
+let state_heap_pred_find_block_points_to id state =
+  let curr_hp, miss_hp =
+    Formula.heap_pred_find_block_points_to id state.current.spatial,
+    Formula.heap_pred_find_block_points_to id state.missing.spatial
+  in
+  match curr_hp, miss_hp with
+  | Some hp, None | None, Some hp ->
+    Some hp
+  | _ ->
+    None
+
+(** Traverses both current and missing heap predicates of [state], looking for PointsToExp ([src], size, dest) *)
+let state_heap_pred_find_exp_points_to src state =
+  let curr_hp, miss_hp =
+    Formula.heap_pred_find_exp_points_to src state.current.spatial,
+    Formula.heap_pred_find_exp_points_to src state.missing.spatial
+  in
+  match curr_hp, miss_hp with
+  | Some hp, None | None, Some hp ->
+    Some hp
+  | _ ->
+    None
+
+
+(* ==================== Exp.t -> Expr.t conversion ==================== *)
 
 (** Converts SIL Exp.t [e] to custom Expr.t interpretation.
     If a known variable is encountered, it's canonical Id
@@ -76,22 +377,16 @@ let rec sil_exp_to_expr e tenv s =
   | Exp.Const c -> sil_const_exp_to_expr c
   | Exp.Sizeof sz -> sil_sizeof_exp_to_expr sz
   | Exp.Lvar pvar -> begin match
-    get_canonical_var_id (Var.of_pvar pvar) s with
-      Some id ->
-      Expr.Var id
+    get_canonical_expr (Var.of_pvar pvar) s with
+    | Some exp -> subst_expr_to_formula_expr exp
     | None ->
-      if Pvar.is_return pvar then
-        Expr.ret
-      else
-        (* TODO could be a global variable *)
-        Expr.Undef
+      if Pvar.is_return pvar then Expr.ret
+      else Expr.Undef (* TODO could be a global variable *)
     end
   | Exp.Var ident -> begin match
-    get_canonical_var_id (Var.of_id ident) s with
-      Some id ->
-      Expr.Var id
-    | None ->
-      Expr.Undef
+    get_canonical_expr (Var.of_id ident) s with
+    | Some exp -> subst_expr_to_formula_expr exp
+    | None -> Expr.Undef
     end
   | Exp.UnOp (op, exp, _) ->
     let exp' = sil_exp_to_expr exp tenv s in
@@ -177,7 +472,6 @@ and sil_array_offset_bytes base index tenv s =
     end
   | _ -> index  (* TODO maybe not the best fallback *)
 
-
 and typ_size_of tenv typ =
   let open Typ in
   let open Struct in
@@ -243,26 +537,7 @@ and sil_binop_exp_to_expr op =
   | Binop.LOr -> Expr.Lor
 
 
-let sil_get_pointer_variable_id exp s =
-  let vars = Exp.free_vars exp |> Sequence.to_list in
-  let var_ids = List.map vars
-    ~f:(fun ident ->
-      get_canonical_var_id (Var.of_id ident) s)
-  in
-  let pointers = List.filter var_ids
-    ~f:(fun id ->
-      match id with
-      | None -> false (* should not really happen, unless global variable *)
-      | Some id ->
-        begin match VarIdMap.find_opt id s.types with
-        | Some typ -> Typ.is_pointer typ
-        | None -> false
-      end)
-  in
-  match pointers with
-  | [Some base] -> Some base
-  | _ -> None
-
+(* ==================== pretty printing ==================== *)
 
 let rec to_string state =
   status_to_string state.status ^
@@ -282,11 +557,17 @@ and subst_to_string vars subst =
   let traversal =
     VarIdMap.fold
     (fun from_ to_ traversal ->
-      traversal ^ Formula.Expr.var_to_string vars from_ ^ "==" ^ Formula.Expr.var_to_string vars to_ ^ ";")
+      traversal ^ Expr.var_to_string vars from_ ^ "==" ^ subst_expr_to_string vars to_ ^ ";")
     subst
     "{"
   in
   traversal ^ "}"
+
+and subst_expr_to_string vars = function
+  | Var id -> 
+    Expr.var_to_string vars id
+  | Ptr { base; offset } ->
+    "(" ^ Expr.var_to_string vars base ^ "+" ^ Int64.to_string offset ^ ")"
 
 and status_to_string s =
   match s with
@@ -331,7 +612,6 @@ and types_to_string types =
     ~f:(fun (id, typ) ->
       "(" ^ Typ.to_string typ ^ ";" ^ Int.to_string id ^ ") "))
 
-(* debugging prints *)
 
 let rec sil_exp_to_string e =
   let open Exp in
@@ -403,172 +683,3 @@ let rec sil_exp_to_string e =
   and typ_opt_to_string = function
       Some t -> "Some(" ^ Typ.to_string t ^ ")"
     | None -> "None"
-
-(** TODO: for now aggregating arithmetic operations should be enough *)
-let rec expr_normalize expr state =
-  let open Expr in 
-  let norm = expr_normalize in
-  match expr with
-    Var _ | Const _ | Undef ->
-      expr
-  | UnOp (op, e) ->
-    let e' = norm e state in
-    begin match op, e' with
-      Puminus, Const (Int i) ->
-      Const (Int (Int64.neg i))
-    | Lnot, Const (Int i) ->
-      Const (Int (if (Int64.compare i 0L) <> 0 then 0L else 1L))
-    | BVnot, Const (Int i) ->
-      Const (Int (Stdlib.Int64.lognot i))
-    | Puminus, UnOp (Puminus, e_inner) ->
-      e_inner
-    | _ ->
-      UnOp (op, e')
-    end
-  | BinOp (op, e1, e2) ->
-    let e1' = norm e1 state in
-    let e2' = norm e2 state in
-    begin match op, e1, e2 with
-      Pplus, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.add i1 i2))
-    | Pminus, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.sub i1 i2))
-    | Pmult, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.mul i1 i2))
-    | Pdiv, Const (Int i1), Const (Int i2)
-      when (Int64.compare i2 0L) <> 0 ->
-      Const (Int (Stdlib.Int64.div i1 i2))
-    | Pmod,   Const (Int i1), Const (Int i2)
-      when (Int64.compare i2 0L) <> 0 ->
-      Const (Int (Int64.rem i1 i2))
-
-    | Pplus, e, Const (Int 0L)
-    | Pplus, Const (Int 0L), e ->
-      e
-    | Pminus, e, Const (Int 0L) ->
-      e
-    | Pmult, e, Const (Int 1L)
-    | Pmult, Const (Int 1L), e ->
-      e
-    | Pmult, _, Const (Int 0L)
-    | Pmult, Const (Int 0L), _ ->
-      Const (Int 0L)
-
-    | Land, Const (Int 0L), _
-    | Land, _, Const (Int 0L) ->
-      Const (Int 0L)
-    | Lor, Const (Int 1L), _
-    | Lor, _, Const (Int 1L) ->
-      Const (Int 1L)
-
-    | _ ->
-      BinOp (op, e1', e2')
-    end
-
-(** Evaluates [expr], handling BinOp | Const | Var ,
-    where Var must have a chain of pure constraints,
-    eventually leading to Const. If any part fails
-    to evaluate, method returns None *)
-let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int64, need to refactor again *)
-  let open Formula in
-  let open Expr in
-  (* TODO a lot of None cases, revisit *)
-  let rec eval acc = function
-      Var id -> begin match
-        lookup_pure_const_exp_of_id id state.current.pure with
-          Some e -> eval acc e
-        | None -> None 
-      end
-    | BinOp (Pplus, e1, e2) ->
-      begin match eval acc e1 with
-        Some acc1 -> eval acc1 e2
-      | None ->
-          match eval acc e2 with
-            Some acc2 -> eval acc2 e1
-          | None -> None
-      end
-    | BinOp (Pminus, e, Const (Int i)) ->
-        eval (Stdlib.Int64.sub acc i) e
-    | Const (Int i) ->
-        Some (Stdlib.Int64.add acc i)
-    | _ ->
-      None
-  in
-  eval 0L expr
-
-(** Searches through [state] heap predicates (both current and missing) and looks for PointsToExp with [dest],
-    then proceeeds to look for PointsToBlock | PointsToUniformBlock using the obtained src. Returns everything
-    that was found, meaning (PointsToExp option * (PointsToBlock | PointsToUniformBlock) option). [dest] expression
-    must be normalized! *)
-let rec heap_pred_find_opt_block_points_to_by_dest dest state =
-  match find_points_to_exp dest state.missing.spatial,
-    find_points_to_exp dest state.current.spatial
-  with
-  | Some (src, points_to_exp), None
-  | None, Some (src, points_to_exp) ->
-    begin match find_points_to_block src state.missing.spatial,
-      find_points_to_block src state.current.spatial
-    with
-    | Some points_to_block, None
-    | None, Some points_to_block ->
-      (Some points_to_exp, Some points_to_block)
-    | _ ->
-      (Some points_to_exp, None)
-    end
-  | _ ->
-    (None, None)
-
-  and find_points_to_exp dest = function
-  | [] -> None
-  | Formula.PointsToExp (src, _, dest') as hp :: _
-    when Expr.equal dest' dest ->
-      Some (src, hp)
-  | _ :: rest ->
-    find_points_to_exp dest rest
-
-  and find_points_to_block src = function
-  | [] -> None
-  | Formula.PointsToBlock (src', _, _) as hp :: _
-    when Expr.equal src' src ->
-      Some hp
-  | Formula.PointsToUniformBlock (src', _, _, _) as hp :: _
-    when Expr.equal src' src ->
-      Some hp
-  | _ :: rest ->
-    find_points_to_block src rest
-
-(** Traverses both current and missing pure constraints of [state], looking for (Base(Var [id])==exp) *)
-let state_find_pure_base_expr id state =
-  let curr_base, miss_base =
-    Formula.find_pure_base_expr id state.current.pure,
-    Formula.find_pure_base_expr id state.missing.pure
-  in
-  match curr_base, miss_base with
-  | Some b, None | None, Some b ->
-    Some b
-  | _ ->
-    None
-
-(** Traverses both current and missing heap predicates of [state], looking for PointsToBlock (Var [id], size, dest) *)
-let state_heap_pred_find_block_points_to id state =
-  let curr_hp, miss_hp =
-    Formula.heap_pred_find_block_points_to id state.current.spatial,
-    Formula.heap_pred_find_block_points_to id state.missing.spatial
-  in
-  match curr_hp, miss_hp with
-  | Some hp, None | None, Some hp ->
-    Some hp
-  | _ ->
-    None
-
-(** Traverses both current and missing heap predicates of [state], looking for PointsToExp ([src], size, dest) *)
-let state_heap_pred_find_exp_points_to src state =
-  let curr_hp, miss_hp =
-    Formula.heap_pred_find_exp_points_to src state.current.spatial,
-    Formula.heap_pred_find_exp_points_to src state.missing.spatial
-  in
-  match curr_hp, miss_hp with
-  | Some hp, None | None, Some hp ->
-    Some hp
-  | _ ->
-    None

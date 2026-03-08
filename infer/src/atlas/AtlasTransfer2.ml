@@ -106,7 +106,7 @@ module TransferFunctions2 = struct
       [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
     | Sil.Metadata metadata ->
       exec_metadata_instr metadata state
-    | _ ->
+    | Sil.Call _ ->
       [state]
     in
 
@@ -124,96 +124,52 @@ module TransferFunctions2 = struct
       vars = (Var.of_id lhs, lhs_id) :: state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
-    let rhs_norm = expr_normalize rhs_expr state in
-    if is_dereference_sil_exp rhs then begin match
-      get_base_and_offset_from_expr rhs rhs_norm state with
-        Some (rhs_id, off) ->
-          exec_load_deref loc lhs_id rhs_id off state
-      | None ->
-        (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
-        [{ state with
+    if Typ.is_pointer typ then begin
+      (* we are loading an address *)
+      if is_sil_dereference rhs then
+        begin match
+          expr_base_and_offset rhs_expr state
+        with
+        | Some (rhs_id, off) ->
+            exec_load_deref loc lhs_id rhs_id off state
+        | None ->
+          (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
+          [{ state with
             status = Error (
               None, Some loc); }]
-    end else
-      assign_to_variable lhs_id rhs_norm state
-
-  (** Tries to extract base (pointer variable) and offset
-      from given [expr] using the Sil [exp] and [state]. 
-      Always pass a normalized [expr]! *)
-  and get_base_and_offset_from_expr exp expr state =
-    let open State in
-    match sil_get_pointer_variable_id exp state with
-    | Some base ->
-      begin match eval_offset base expr state with
-        Some offset -> Some (base, offset)
-      | None -> Some (base, 0L) (* TODO revisit *)
-      end
-    | None -> None
-
-  (** Evaluates [expr], skipping [base] since it is
-    a known pointer, handling BinOp | Const | Var ,
-    where Var must have a chain of pure constraints,
-    eventually leading to Const. If any part fails
-    to evaluate, method returns None *)
-  and eval_offset base expr state =
-    let open Formula in
-    let open Expr in
-    let open State in
-    (* TODO a lot of None cases, revisit *)
-    let rec eval_offset acc = function
-        Var id when Id.equal id base ->
-        Some acc
-      | Var id -> begin match
-          lookup_pure_const_exp_of_id id state.current.pure with
-            Some e -> eval_offset acc e
-          | None -> None 
-        end
-      | BinOp (Pplus, e1, e2) ->
-        begin match eval_offset acc e1 with
-          Some acc1 -> eval_offset acc1 e2
+      end else
+        begin match
+          expr_base_and_offset rhs_expr state
+        with
+        | Some (rhs_id, off) ->
+          let rhs_canonical =
+            canonical_expr state.subst rhs_id off
+          in
+          [{ state with
+            subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
-            match eval_offset acc e2 with
-              Some acc2 -> eval_offset acc2 e1
-            | None -> None
+          (* TODO: also should throw *)
+          [{ state with
+            status = Error (
+              None, Some loc); }]
         end
-      | BinOp (Pminus, e, Const (Int i)) ->
-          eval_offset (Stdlib.Int64.sub acc i) e
-      | Const (Int i) ->
-          Some (Stdlib.Int64.add acc i)
-      | _ ->
-        None
-    in
-    eval_offset 0L expr
-
-  and is_dereference_sil_exp exp =
-    match Exp.ignore_cast exp with
-      Exp.Var _ ->
-        true
-    | Exp.Lfield ({ exp = e }, _, _) ->
-      is_dereference_sil_exp e
-    | Exp.Lindex (e, _) ->
-      is_dereference_sil_exp e
-    | Exp.UnOp (_, e, _) ->
-      is_dereference_sil_exp e
-    | Exp.BinOp (_, e1, e2) ->
-      is_dereference_sil_exp e1 ||
-      is_dereference_sil_exp e2
-    | _ ->
-      false
+    end else
+      let rhs_norm = expr_normalize rhs_expr state in
+      assign_to_variable lhs_id rhs_norm state
 
   (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constaitn (Var ([lhs_id]) == [rhs]) to [state] *)
   and assign_to_variable lhs_id rhs state =
     let open Expr in
     let open State in
     match rhs with
-    | Var rhs_id ->
+    | Expr.Var rhs_id ->
       (* Both Ids already canonical *)
       if Id.equal lhs_id rhs_id then
         [state]
       else
-        [{ state with subst = VarIdMap.add lhs_id rhs_id state.subst }]
+        [{ state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
     | _ ->
-      let exp = BinOp (Peq, Var lhs_id, expr_normalize rhs state) in
+      let exp = Expr.BinOp (Peq, Var lhs_id, expr_normalize rhs state) in
       let current =
         { state.current with pure = exp :: state.current.pure }
       in
@@ -325,16 +281,51 @@ module TransferFunctions2 = struct
   and exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
     let open Expr in
-    if is_dereference_sil_exp lhs then
-      let lhs_norm = expr_normalize lhs_expr state in
-      begin match get_base_and_offset_from_expr lhs lhs_norm state with
-        Some (lhs_id, off) ->
-          exec_store_deref loc lhs_typ lhs_id off rhs_expr state
-      | None ->
-        (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
-        [{ state with
+    if Typ.is_pointer lhs_typ then begin
+      if is_sil_dereference lhs then
+        begin match
+          expr_base_and_offset lhs_expr state
+        with
+        | Some (lhs_id, off) ->
+            exec_store_deref loc lhs_typ lhs_id off rhs_expr state
+        | None ->
+          (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
+          [{ state with
             status = Error (
               None, Some loc); }]
+      end else
+        begin Format.print_string "\n[exec_store_instr: calling expr_base_and_offset]\n"; match 
+          expr_base_and_offset lhs_expr state
+        with
+        | Some (lhs_id, off) ->
+          Format.print_string ("\n[exec_store_instr: found some (id=" ^ Int.to_string lhs_id ^ "; offset=" ^ Int64.to_string off ^ ")" ^ "]\n");
+          let lhs_canonical =
+            canonical_expr state.subst lhs_id off
+          in
+          Format.print_string "\n[exec_store_instr: matching rhs_norm]\n";
+          let rhs_norm = expr_normalize rhs_expr state in
+          begin match rhs_norm with
+          | Var id ->
+            Format.print_string ("\n[exec_store_instr: found rhs_id=" ^ Int.to_string id ^ "]\n");
+            [{ state with subst =
+              VarIdMap.add id lhs_canonical state.subst }]
+          | _ ->
+            Format.print_string "\n[exec_store_instr: matching rhs_norm failed, defaulting to adding pure expression]\n";
+            let pure_part =
+              Expr.BinOp (Peq, subst_expr_to_formula_expr lhs_canonical, rhs_norm)
+            in
+            let current =
+              { state.current with pure = pure_part :: state.current.pure }
+            in
+            [{ state with current }]
+          end
+        | None ->
+          Format.print_string "\n[exec_store_instr: expr_base_and_offset call found nothing]\n";
+          (* TODO: should also throw *)
+          [{ state with
+            status = Error (
+              None, Some loc); }]
+        end
     end else
       let rhs_norm = expr_normalize rhs_expr state in
       let lhs_norm = expr_normalize lhs_expr state in
@@ -342,7 +333,7 @@ module TransferFunctions2 = struct
         Var id ->
         assign_to_variable id rhs_norm state
       | _ ->
-        let exp = BinOp (Peq, lhs_norm, rhs_norm) in
+        let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
         let current =
           { state.current with pure = exp :: state.current.pure }
         in [{ state with current }]
@@ -518,14 +509,15 @@ module TransferFunctions2 = struct
       };
     }]
 
-  and exec_free_instr loc actual actual_expr state =
+  and exec_free_instr loc _actual actual_expr state =
     let open State in
     let open Expr in
-    match actual_expr with
-      Const (Ptr 0) -> 
+    match expr_normalize actual_expr state with
+    | Const (Ptr 0) | Const (Int 0L) -> 
         [state] (* free(NULL); *)
     | _ -> begin match
-      get_base_and_offset_from_expr actual actual_expr state with
+        expr_base_and_offset actual_expr state 
+      with
         Some (base_id, offset) ->
         free_block loc base_id offset state
       | None ->

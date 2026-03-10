@@ -51,7 +51,9 @@ let rec empty analysis =
     ~f:(fun state (pvar, typ) ->
       state_add_variable pvar typ state)
   in
-  state_add_variable ret_var ret_typ with_formals
+  { with_formals with 
+    vars = (Var.of_pvar ret_var, 0) :: with_formals.vars;
+    types = VarIdMap.add 0 ret_typ with_formals.types }
 
 (** Adds variable [v] with type [t] into state [s]. if [id] is present, it is used, otherwise fresh id is made. *)
 and state_add_variable ?id v t s =

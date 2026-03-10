@@ -220,7 +220,7 @@ and expr_eval_offset expr skip_id state =
       begin match op with
       | Puminus ->
         Stdlib.Int64.sub off inner
-      | Lnot | BVnot | Base | End -> off
+      | Lnot | BVnot | Base | End | Freed -> off
       end
     | Expr.BinOp (op, e1, e2) ->
       let lhs = eval 0L e1 in

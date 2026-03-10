@@ -175,13 +175,6 @@ type t = {
   pure: pure;
 }
 
-and block = {
-  id : int;
-  base : Int64.t;
-  end_ : Int64.t;
-  freed : bool
-}
-
 and heap_pred =
   | BlockPointsTo of Expr.t * Expr.t (* source, size *)
   | ExpPointsTo of Expr.t * Expr.t * Expr.t (* source, size, destination *)

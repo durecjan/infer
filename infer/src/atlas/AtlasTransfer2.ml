@@ -187,8 +187,8 @@ module TransferFunctions2 = struct
     let open State in
     let open Formula in
     match state_heap_pred_find_block_points_to rhs_id state with
-    | Some PointsToBlock (_, size, block) ->
-      if block.freed then
+    | Some BlockPointsTo (_, size) ->
+      if false (* TODO FIX ME find Freed() constraint *) then
         (* freed block *)
         [{ state with
           status = Error (
@@ -206,14 +206,8 @@ module TransferFunctions2 = struct
         status = Error (
           Some IssueType.atlas_use_after_free, Some loc); }
       in
-      let missing_block = {
-        id = Id.fresh ();
-        base = 0L;
-        end_ = 0L;
-        freed = false; }
-      in
       let missing_part =
-        PointsToBlock (Expr.Var rhs_id, Expr.Undef, missing_block)
+        BlockPointsTo (Expr.Var rhs_id, Expr.Undef)
       in
       let spatial = missing_part :: state.missing.spatial in
       let ok_state = { state with
@@ -254,14 +248,14 @@ module TransferFunctions2 = struct
       Expr.BinOp (Pplus, Var rhs_id, Const (Int rhs_offset))
     in
     match state_heap_pred_find_exp_points_to src state with
-    | Some PointsToExp (_, _, Var cell_id) ->
+    | Some ExpPointsTo (_, _, Var cell_id) ->
       [(subst_add ~from_:lhs_id ~to_:cell_id state)]
     | _ ->
       (* missing resource *)
       (* also it is possible it's a uniform block created by calloc() *)
       let cell_id = Id.fresh () in
       let missing_part =
-        Formula.PointsToExp (src, Undef, Var cell_id)
+        Formula.ExpPointsTo (src, Undef, Var cell_id)
       in
       let current_part = 
         Expr.BinOp (Peq, Var cell_id, Undef)
@@ -385,8 +379,8 @@ module TransferFunctions2 = struct
     let open State in
     let open Formula in
     match state_heap_pred_find_block_points_to lhs_var_id state with
-    | Some (PointsToBlock (_, size, block)) ->
-      if block.freed then
+    | Some (BlockPointsTo (_, size)) ->
+      if false (* TODO FIX ME find Freed() constraint *) then
         (* freed block *)
         [{ state with
           status = Error (
@@ -407,14 +401,8 @@ module TransferFunctions2 = struct
         status = Error (
           None, Some loc); }
       in
-      let missing_block = {
-        id = Id.fresh ();
-        base = 0L;
-        end_ = 0L;
-        freed = false; }
-      in
       let missing_part =
-        PointsToBlock (Expr.Var lhs_var_id, Expr.Undef, missing_block)
+        BlockPointsTo (Expr.Var lhs_var_id, Expr.Undef)
       in
       let spatial = missing_part :: state.missing.spatial in
       let ok_state = { state with
@@ -457,12 +445,12 @@ module TransferFunctions2 = struct
     let spatial_part, block_cell_id =
       (* block cell can already exist! *)
       match state_heap_pred_find_exp_points_to src state with
-      | Some ((Formula.PointsToExp (_, _, Var id)) as hp) ->
+      | Some ((Formula.ExpPointsTo (_, _, Var id)) as hp) ->
         hp, id
       | _ ->
         let block_cell_id = Id.fresh () in
         let spatial_part =
-          Formula.PointsToExp (src, Undef, Var block_cell_id)
+          Formula.ExpPointsTo (src, Undef, Var block_cell_id)
         in
         spatial_part, block_cell_id
     in
@@ -491,17 +479,10 @@ module TransferFunctions2 = struct
       Some i -> Const (Int i)
     | None -> size
     in
-    let block = {
-      id = Id.fresh ();
-      base = 0L;
-      end_ = 0L; (* do we really need base, end_ ? *)
-      freed = false;
-    }
-    in
     let { current } = state in [{
       state with
       current = {
-        spatial = PointsToBlock (source, size, block) :: current.spatial;
+        spatial = BlockPointsTo (source, size) :: current.spatial;
         pure =
           BinOp (Peq, UnOp (Base, source), source) ::
           BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
@@ -511,20 +492,18 @@ module TransferFunctions2 = struct
 
   and exec_free_instr loc _actual actual_expr state =
     let open State in
-    let open Expr in
+    (*
     match expr_normalize actual_expr state with
     | Const (Ptr 0) | Const (Int 0L) -> 
         [state] (* free(NULL); *)
-    | _ -> begin match
-        expr_base_and_offset actual_expr state 
-      with
-        Some (base_id, offset) ->
-        free_block loc base_id offset state
-      | None ->
-        [{ state with
-          status = Error (
-            None, Some loc); }]
-      end
+    | _ -> begin *)
+    match expr_base_and_offset actual_expr state with
+    | Some (base_id, offset) ->
+      free_block loc base_id offset state
+    | None ->
+      [{ state with
+        status = Error (
+          None, Some loc); }]
 
   and exec_metadata_instr metadata state =
     let open Sil in
@@ -552,50 +531,44 @@ module TransferFunctions2 = struct
       let open Formula in
       let open Expr in
       match heap_pred_take_opt id state.current.spatial with
-      | Some (PointsToBlock (source, size, block), rest) ->
-        begin match has_error_exec_free loc off block.freed state with
+      | Some (((BlockPointsTo (source, _)) as hp), rest) ->
+        begin match has_error_exec_free loc off false (* TODO FIX ME find Freed() constraint *) state with
           Some error -> error
         | None ->
-          let block' = { block with freed = true } in
-          let spatial =
-            PointsToBlock (source, size, block') :: rest
+          let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
+          let pure =
+            Expr.UnOp (Expr.Freed, source) :: state.current.pure
           in
           [{ state with
-            current = { state.current with spatial } }]
+            current = { spatial; pure } }]
         end
       (* duplicate code caused by heap_pred not being a record *)
-      | Some (PointsToUniformBlock (source, size, block, const_val), rest) ->
-        begin match has_error_exec_free loc off block.freed state with
+      | Some (((UniformBlockPointsTo (source, _, _)) as hp), rest) ->
+        begin match has_error_exec_free loc off false (* TODO FIX ME find Freed() constraint *) state with
           Some error -> error
         | None ->
-          let block' = { block with freed = true } in
-          let spatial =
-            PointsToUniformBlock (source, size, block', const_val) :: rest
+          let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
+          let pure =
+            Expr.UnOp (Expr.Freed, source) :: state.current.pure
           in
           [{ state with
-            current = { state.current with spatial } }]
+            current = { spatial; pure } }]
         end
       | Some _
         (* Error: missing memory block *)
       | None ->
         (* Error: missing heap predicate *)
         let pure =
-          BinOp (Peq, UnOp (Base, Var id), null) :: state.current.pure
+          BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) :: state.current.pure
         in
         let err_state = { state with
           current = { state.current with pure };
           status = Error (
             None, Some loc); }
         in
-        let missing_block = {
-          id = Id.fresh ();
-          base = 0L;
-          end_ = 0L; (* do we really need base, end_ ? *)
-          freed = false; }
-        in
         (* add id -> { block with freed = false } to missing *)
         let missing_spatial_part =
-          PointsToBlock (Var id, Const (Int Int64.max_value), missing_block)
+          BlockPointsTo (Var id, Const (Int Int64.max_value))
         in
         (* add Base(id) == id & End(id) == id + size to missing *)
         let missing_pure_base_part, missing_pure_end_part = (
@@ -604,14 +577,17 @@ module TransferFunctions2 = struct
         ) in
         (* add id -> { block with freed = true } to current *)
         let current_part =
-          PointsToBlock(Var id, Const (Int Int64.max_value), { missing_block with freed = true })
+          BlockPointsTo(Var id, Const (Int Int64.max_value))
         in
         let missing_part = add_heap_pred missing_spatial_part state.missing in
         let missing =
           { missing_part with
             pure = missing_pure_base_part :: missing_pure_end_part :: missing_part.pure }
         in
-        let current = add_heap_pred current_part state.current in
+        let current = {
+          spatial = current_part :: state.current.spatial;
+          pure = (Expr.UnOp (Expr.Freed, Expr.Var id)) :: state.current.pure }
+        in
         err_state :: [{ state with current; missing }]
 
     and has_error_exec_free loc var_off is_freed_block state = 

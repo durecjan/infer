@@ -32,17 +32,26 @@ let empty_ = {
   status = Ok;
 }
 
-(** State initialized with local variables and their types *)
+(** State initialized with local, formal, return variables and their types *)
 let rec empty analysis =
   let open IntraproceduralAnalysis in
   let open ProcAttributes in
   let s = empty_ in
   let proc_name = Procdesc.get_proc_name analysis.proc_desc in
   let locals = Procdesc.get_locals analysis.proc_desc in
-  List.fold ~init:s locals
+  let formals = Procdesc.get_pvar_formals analysis.proc_desc in
+  let ret_var = Procdesc.get_ret_var analysis.proc_desc in
+  let ret_typ = Procdesc.get_ret_type analysis.proc_desc in
+  let with_locals = List.fold ~init:s locals
     ~f:(fun state var -> 
       let pvar = Pvar.mk var.name proc_name in
       state_add_variable pvar var.typ state)
+  in
+  let with_formals = List.fold ~init:with_locals formals
+    ~f:(fun state (pvar, typ) ->
+      state_add_variable pvar typ state)
+  in
+  state_add_variable ret_var ret_typ with_formals
 
 (** Adds variable [v] with type [t] into state [s]. if [id] is present, it is used, otherwise fresh id is made. *)
 and state_add_variable ?id v t s =
@@ -77,7 +86,11 @@ let rec get_canonical_expr v s =
 
 and canonical_expr subst id rel_offset =
   match VarIdMap.find_opt id subst with
-  | None -> Ptr { base = id; offset = rel_offset }
+  | None ->
+    if Int64.equal rel_offset 0L then
+      Var id
+    else
+      Ptr { base = id; offset = rel_offset }
   | Some Var id' -> canonical_expr subst id' rel_offset
   | Some Ptr { base; offset } ->
     let abs_offset = Stdlib.Int64.add rel_offset offset in

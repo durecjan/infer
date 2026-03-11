@@ -173,6 +173,8 @@ module TransferFunctions2 = struct
     |> concat_map_ok_states
       (exec_deref_check_base loc instr rhs_id)
     |> concat_map_ok_states
+      (exec_deref_check_freed loc instr rhs_id)
+    |> concat_map_ok_states
       (exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off)
   
   and exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off state =
@@ -180,17 +182,11 @@ module TransferFunctions2 = struct
     let open Formula in
     match state_heap_pred_find_block_points_to rhs_id state with
     | Some BlockPointsTo (_, size) ->
-      if false (* TODO FIX ME find Freed() constraint *) then
-        (* freed block *)
-        [{ state with
-          status = Error (None, loc, instr) }]
-      else begin
-        if (Int64.compare off 0L) <> 0 then
-          (* check offset *)
-          exec_load_deref_check_offset loc instr lhs_id rhs_id off size state
-        else
-          exec_load_deref_assign loc instr lhs_id rhs_id off state
-      end
+      if (Int64.compare off 0L) <> 0 then
+        (* check offset *)
+        exec_load_deref_check_offset loc instr lhs_id rhs_id off size state
+      else
+        exec_load_deref_assign loc instr lhs_id rhs_id off state
     | _ ->
       (* missing resource *)
       let err_state = { state with
@@ -298,6 +294,8 @@ module TransferFunctions2 = struct
     |> concat_map_ok_states
       (exec_deref_check_base loc instr lhs_var_id)
     |> concat_map_ok_states
+      (exec_deref_check_freed loc instr lhs_var_id)
+    |> concat_map_ok_states
       (exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr)
   
   and concat_map_ok_states f states = 
@@ -311,9 +309,9 @@ module TransferFunctions2 = struct
   and exec_deref_check_base loc instr lhs_var_id state =
     let open State in
     let open Formula in
-    match state_find_pure_base_expr lhs_var_id state with
-    | Some e when Formula.is_zero e ->
-      (* Base() == 0*)
+    match state_find_pure_unop_eq_expr lhs_var_id Expr.Base state with
+    | Some e when Formula.is_zero_expr e ->
+      (* Base() == 0 *)
       [{ state with
         status = Error (None, loc, instr) }]
     | Some e when Expr.equal e (Expr.Var lhs_var_id) ->
@@ -333,24 +331,23 @@ module TransferFunctions2 = struct
       in
       [ err_state; ok_state ]
 
+  and exec_deref_check_freed loc instr var_id state =
+    if state_is_freed_expr var_id state then
+      [{ state with status = Error (None, loc, instr)}]
+    else [state]
+
   and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in
     let open Formula in
+    (* TODO FIX ME - implement splitting blocks *)
     match state_heap_pred_find_block_points_to lhs_var_id state with
     | Some (BlockPointsTo (_, size)) ->
-      if false (* TODO FIX ME find Freed() constraint *) then
-        (* freed block *)
-        [{ state with
-          status = Error (None, loc, instr) }]
-      else begin
-        (* correct *)
-        if (Int64.compare lhs_offset 0L) <> 0 then
-          exec_store_deref_check_offset loc instr lhs_typ lhs_var_id lhs_offset size rhs_expr state
-        else begin
-          let rhs_norm = expr_normalize rhs_expr state in
-          exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm state
-        end
-      end
+      (* correct *)
+      if (Int64.compare lhs_offset 0L) <> 0 then
+        exec_store_deref_check_offset loc instr lhs_typ lhs_var_id lhs_offset size rhs_expr state
+      else
+        let rhs_norm = expr_normalize rhs_expr state in
+        exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm state
     | _ ->
       (* missing resouce *)
       let err_state = { state with

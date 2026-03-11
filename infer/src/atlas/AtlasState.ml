@@ -10,7 +10,7 @@ module VarIdMap = Stdlib.Map.Make (Id)
 type subst_expr = Var of Id.t | Ptr of { base: Id.t ; offset: Int64.t }
 
 (** State status *)
-type status = Ok | Error of IssueType.t option * Location.t option (* TODO fix me add Sil.instr into the error *)
+type status = Ok | Error of IssueType.t option * Location.t * Sil.instr
 
 (** Abstract state *)
 type t = {
@@ -605,18 +605,15 @@ and status_to_string s =
   match s with
     Ok ->
       "OK\n"
-  | Error (Some issue, Some loc) ->
+  | Error (Some issue, loc, instr) ->
     "ERROR\n" ^
     "ISSUE=" ^ issue.unique_id ^ "\n" ^
-    "LOCATION=" ^ loc_to_string loc ^ "\n"
-  | Error (Some issue, None) ->
-    "ERROR\n" ^
-    "ISSUE=" ^ issue.unique_id ^ "\n"
-  | Error (None, Some loc) ->
-    "ERROR\n" ^
-    "LOCATION=" ^ loc_to_string loc ^ "\n"
-  | Error (None, None) ->
-    "ERROR\n"
+    "LOCATION=" ^ loc_to_string loc ^ "\n" ^
+    "SIL_INSTR=" ^ sil_instr_to_string instr ^ "\n"
+  | Error (None, loc, instr) ->
+    "ERROR\nISSUE=\n" ^
+    "LOCATION=" ^ loc_to_string loc ^ "\n" ^
+    "SIL_INSTR=" ^ sil_instr_to_string instr ^ "\n"
 
 and loc_to_string loc = 
   let open Location in
@@ -625,6 +622,11 @@ and loc_to_string loc =
   "; column " ^
   Int.to_string (loc.col) ^
   "]"
+
+and sil_instr_to_string instr =
+  Format.asprintf "%a"
+    (Sil.pp_instr ~print_types:true Pp.text)
+    instr
 
 and vars_to_string vars =
   String.concat (

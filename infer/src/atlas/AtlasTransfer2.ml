@@ -71,7 +71,7 @@ module TransferFunctions2 = struct
       Format.print_string (
         "[SIL_LOAD]\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
 
-      exec_load_instr loc id typ e rhs_expr state
+      exec_load_instr loc instr id typ e rhs_expr state
     | Sil.Store {e1; typ; e2; loc} ->
 
       Format.print_string (
@@ -83,7 +83,7 @@ module TransferFunctions2 = struct
       Format.print_string (
         "\n[LHS_EXPR]: " ^ Expr.to_string state.vars lhs_expr ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
 
-      exec_store_instr loc typ e1 lhs_expr rhs_expr state
+      exec_store_instr loc instr typ e1 lhs_expr rhs_expr state
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
@@ -101,7 +101,7 @@ module TransferFunctions2 = struct
           Format.print_string (
             "[SIL_FREE]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
 
-          exec_free_instr loc actual actual_expr state
+          exec_free_instr loc instr actual actual_expr state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
       [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
     | Sil.Metadata metadata ->
@@ -117,7 +117,7 @@ module TransferFunctions2 = struct
 
     states
 
-  and exec_load_instr loc lhs typ rhs rhs_expr state =
+  and exec_load_instr loc instr lhs typ rhs rhs_expr state =
     let open State in
     let lhs_id = Id.fresh () in
     let state = { state with
@@ -127,7 +127,7 @@ module TransferFunctions2 = struct
     if is_sil_dereference rhs then
       match expr_base_and_offset rhs_expr state with
       | Some (rhs_id, off) ->
-          exec_load_deref loc lhs_id rhs_id off state
+          exec_load_deref loc instr lhs_id rhs_id off state
       | None ->
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
@@ -165,14 +165,14 @@ module TransferFunctions2 = struct
       [{ state with current }]
   
   (** Ids [lhs_id] and [rhs_id] must be canonical! *)
-  and exec_load_deref loc lhs_id rhs_id off state =
+  and exec_load_deref loc instr lhs_id rhs_id off state =
     [state]
     |> concat_map_ok_states
-      (exec_deref_check_base loc rhs_id)
+      (exec_deref_check_base loc instr rhs_id)
     |> concat_map_ok_states
-      (exec_load_deref_check_heap_pred loc lhs_id rhs_id off)
+      (exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off)
   
-  and exec_load_deref_check_heap_pred loc lhs_id rhs_id off state =
+  and exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off state =
     let open State in
     let open Formula in
     match state_heap_pred_find_block_points_to rhs_id state with
@@ -180,20 +180,18 @@ module TransferFunctions2 = struct
       if false (* TODO FIX ME find Freed() constraint *) then
         (* freed block *)
         [{ state with
-          status = Error (
-            Some IssueType.atlas_use_after_free, Some loc;) }]
+          status = Error (None, loc, instr) }]
       else begin
         if (Int64.compare off 0L) <> 0 then
           (* check offset *)
-          exec_load_deref_check_offset loc lhs_id rhs_id off size state
+          exec_load_deref_check_offset loc instr lhs_id rhs_id off size state
         else
-          exec_load_deref_assign loc lhs_id rhs_id off state
+          exec_load_deref_assign loc instr lhs_id rhs_id off state
       end
     | _ ->
       (* missing resource *)
       let err_state = { state with
-        status = Error (
-          Some IssueType.atlas_use_after_free, Some loc); }
+        status = Error (None, loc, instr) }
       in
       let missing_part =
         BlockPointsTo (Expr.Var rhs_id, Expr.Undef)
@@ -206,32 +204,30 @@ module TransferFunctions2 = struct
       if (Int64.compare off 0L) <> 0 then begin
         [err_state; ok_state]
         |> concat_map_ok_states
-          (exec_load_deref_check_offset loc lhs_id rhs_id off Expr.Undef)
+          (exec_load_deref_check_offset loc instr lhs_id rhs_id off Expr.Undef)
       end else
         [err_state; ok_state]
         |> concat_map_ok_states
-          (exec_load_deref_assign loc lhs_id rhs_id off)
+          (exec_load_deref_assign loc instr lhs_id rhs_id off)
 
-  and exec_load_deref_check_offset loc lhs_id rhs_id rhs_offset block_size state =
+  and exec_load_deref_check_offset loc instr lhs_id rhs_id rhs_offset block_size state =
     let open State in
     if (Int64.compare rhs_offset 0L) < 0 then
       (* offset out of bounds *)
       [{ state with
-        status = Error (
-          None, Some loc); }]
+        status = Error (None, loc, instr) }]
     else begin
       match eval_state_expr_to_int64_opt block_size state with
       | Some s when (Int64.compare rhs_offset s) > 0 ->
         (* offset out of bounds *)
         [{ state with
-          status = Error (
-            None, Some loc); }]
+          status = Error (None, loc, instr) }]
       | _ ->
         (* correct *)
-        exec_load_deref_assign loc lhs_id rhs_id rhs_offset state
+        exec_load_deref_assign loc instr lhs_id rhs_id rhs_offset state
       end
 
-  and exec_load_deref_assign loc lhs_id rhs_id rhs_offset state =
+  and exec_load_deref_assign loc instr lhs_id rhs_id rhs_offset state =
     let open State in
     let src =
       Expr.BinOp (Pplus, Var rhs_id, Const (Int rhs_offset))
@@ -256,17 +252,16 @@ module TransferFunctions2 = struct
           pure = current_part :: state.current.pure } }
       in
       let error_state = { state with
-        status = Error (
-          None, Some loc) }
+        status = Error (None, loc, instr) }
       in
       [error_state; ok_state]
 
-  and exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state =
+  and exec_store_instr loc instr lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
     if is_sil_dereference lhs then
       match expr_base_and_offset lhs_expr state with
       | Some (lhs_id, off) ->
-          exec_store_deref loc lhs_typ lhs_id off rhs_expr state
+          exec_store_deref loc instr lhs_typ lhs_id off rhs_expr state
       | None ->
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
@@ -303,12 +298,12 @@ module TransferFunctions2 = struct
           in [{ state with current }]
     end
 
-  and exec_store_deref loc lhs_typ lhs_var_id lhs_offset rhs_expr state =
+  and exec_store_deref loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     [state]
     |> concat_map_ok_states
-      (exec_deref_check_base loc lhs_var_id)
+      (exec_deref_check_base loc instr lhs_var_id)
     |> concat_map_ok_states
-      (exec_store_deref_check_heap_pred loc lhs_typ lhs_var_id lhs_offset rhs_expr)
+      (exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr)
   
   and concat_map_ok_states f states = 
     let open State in
@@ -318,23 +313,21 @@ module TransferFunctions2 = struct
       | Error _ -> [s])
     states
 
-  and exec_deref_check_base loc lhs_var_id state =
+  and exec_deref_check_base loc instr lhs_var_id state =
     let open State in
     let open Formula in
     match state_find_pure_base_expr lhs_var_id state with
     | Some e when Formula.is_zero e ->
       (* Base() == 0*)
       [{ state with
-        status = Error (
-          None, Some loc); }]
+        status = Error (None, loc, instr) }]
     | Some e when Expr.equal e (Expr.Var lhs_var_id) ->
       (* correct *)
       [state]
     | _ ->
       (* missing resource *)
       let err_state = { state with
-        status = Error (
-          None, Some loc); }
+        status = Error (None, loc, instr) }
       in
       let missing_part =
         Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var lhs_var_id), Expr.Var lhs_var_id)
@@ -345,7 +338,7 @@ module TransferFunctions2 = struct
       in
       [ err_state; ok_state ]
 
-  and exec_store_deref_check_heap_pred loc lhs_typ lhs_var_id lhs_offset rhs_expr state =
+  and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in
     let open Formula in
     match state_heap_pred_find_block_points_to lhs_var_id state with
@@ -353,13 +346,11 @@ module TransferFunctions2 = struct
       if false (* TODO FIX ME find Freed() constraint *) then
         (* freed block *)
         [{ state with
-          status = Error (
-            Some IssueType.atlas_use_after_free,
-            Some loc); }]
+          status = Error (None, loc, instr) }]
       else begin
         (* correct *)
         if (Int64.compare lhs_offset 0L) <> 0 then
-          exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset size rhs_expr state
+          exec_store_deref_check_offset loc instr lhs_typ lhs_var_id lhs_offset size rhs_expr state
         else begin
           let rhs_norm = expr_normalize rhs_expr state in
           exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm state
@@ -368,8 +359,7 @@ module TransferFunctions2 = struct
     | _ ->
       (* missing resouce *)
       let err_state = { state with
-        status = Error (
-          None, Some loc); }
+        status = Error (None, loc, instr) }
       in
       let missing_part =
         BlockPointsTo (Expr.Var lhs_var_id, Expr.Undef)
@@ -382,27 +372,25 @@ module TransferFunctions2 = struct
       if (Int64.compare lhs_offset 0L) <> 0 then begin
         [err_state; ok_state]
         |> concat_map_ok_states
-          (exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset Expr.Undef rhs_expr)
+          (exec_store_deref_check_offset loc instr lhs_typ lhs_var_id lhs_offset Expr.Undef rhs_expr)
       end else
         let rhs_norm = expr_normalize rhs_expr state in
         [err_state; ok_state]
         |> concat_map_ok_states
           (exec_store_deref_assign lhs_typ lhs_var_id lhs_offset rhs_norm)
 
-  and exec_store_deref_check_offset loc lhs_typ lhs_var_id lhs_offset block_size rhs_expr state =
+  and exec_store_deref_check_offset loc instr lhs_typ lhs_var_id lhs_offset block_size rhs_expr state =
     let open State in
     if (Int64.compare lhs_offset 0L) < 0 then begin
       (* offset out of bounds *)
       [{ state with
-        status = Error (
-          None, Some loc); }]
+        status = Error (None, loc, instr) }]
     end else begin
       match eval_state_expr_to_int64_opt block_size state with
       | Some s when (Int64.compare lhs_offset s) > 0 ->
         (* offset out of bounds *)
         [{ state with
-          status = Error (
-            None, Some loc); }]
+          status = Error (None, loc, instr) }]
       | _ ->
         (* correct *)
         let rhs_norm = expr_normalize rhs_expr state in
@@ -460,7 +448,7 @@ module TransferFunctions2 = struct
       };
     }]
 
-  and exec_free_instr loc _actual actual_expr state =
+  and exec_free_instr loc instr _actual actual_expr state =
     let open State in
     (*
     match expr_normalize actual_expr state with
@@ -469,11 +457,10 @@ module TransferFunctions2 = struct
     | _ -> begin *)
     match expr_base_and_offset actual_expr state with
     | Some (base_id, offset) ->
-      free_block loc base_id offset state
+      free_block loc instr base_id offset state
     | None ->
       [{ state with
-        status = Error (
-          None, Some loc); }]
+        status = Error (None, loc, instr) }]
 
   and exec_metadata_instr metadata state =
     let open Sil in
@@ -496,13 +483,13 @@ module TransferFunctions2 = struct
       [state]
 
     (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [loc] *)
-    and free_block loc id off state =
+    and free_block loc instr id off state =
       let open State in
       let open Formula in
       let open Expr in
       match heap_pred_take_opt id state.current.spatial with
       | Some (((BlockPointsTo (source, _)) as hp), rest) ->
-        begin match has_error_exec_free loc off false (* TODO FIX ME find Freed() constraint *) state with
+        begin match has_error_exec_free loc instr off false (* TODO FIX ME find Freed() constraint *) state with
           Some error -> error
         | None ->
           let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
@@ -514,7 +501,7 @@ module TransferFunctions2 = struct
         end
       (* duplicate code caused by heap_pred not being a record *)
       | Some (((UniformBlockPointsTo (source, _, _)) as hp), rest) ->
-        begin match has_error_exec_free loc off false (* TODO FIX ME find Freed() constraint *) state with
+        begin match has_error_exec_free loc instr off false (* TODO FIX ME find Freed() constraint *) state with
           Some error -> error
         | None ->
           let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
@@ -533,8 +520,7 @@ module TransferFunctions2 = struct
         in
         let err_state = { state with
           current = { state.current with pure };
-          status = Error (
-            None, Some loc); }
+          status = Error (None, loc, instr) }
         in
         (* add id -> { block with freed = false } to missing *)
         let missing_spatial_part =
@@ -560,21 +546,17 @@ module TransferFunctions2 = struct
         in
         err_state :: [{ state with current; missing }]
 
-    and has_error_exec_free loc var_off is_freed_block state = 
+    and has_error_exec_free loc instr var_off is_freed_block state = 
       let open State in
       if not (Int64.equal var_off 0L) then
         (* Error: freeing memory address not returned by malloc *)
         Some [{ state with
-          status = Error (
-            Some IssueType.atlas_free_non_base_pointer,
-            Some loc); }]
+          status = Error (None, loc, instr) }]
       else
         if is_freed_block then
           (* Error: double free *)
           Some [{ state with
-            status = Error (
-              Some IssueType.atlas_double_free,
-              Some loc); }]
+            status = Error (None, loc, instr) }]
         else
           (* Ok *)
           None

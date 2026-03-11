@@ -124,6 +124,28 @@ let subst_expr_to_formula_expr = function
   | Var id -> Expr.Var id
   | Ptr { base; offset } -> Expr.BinOp (Pplus, Var base, Const (Int offset))
 
+(** Applies substitution [~from_] [~to_] over current and missing parts of [state].
+    If [~to_] expression is found within a pure constraint or a heap predicate, a synthetic variable will take it's place *)
+let subst_apply ~from_ ~to_ state =
+  let placeholder = Expr.Var (Id.fresh ()) in
+  (* substitute [~to_] param for a placeholder first *)
+  let current_pure = subst_apply_to_pure ~from_:to_ ~to_:placeholder state.current.pure in
+  let missing_pure = subst_apply_to_pure ~from_:to_ ~to_:placeholder state.missing.pure in
+  let current_spatial = subst_apply_to_spatial ~from_:to_ ~to_:placeholder state.current.spatial in
+  let missing_spatial = subst_apply_to_spatial ~from_:to_ ~to_:placeholder state.missing.spatial in
+  let state = { state with 
+    current = { pure = current_pure; spatial = current_spatial };
+    missing = { pure = missing_pure; spatial = missing_spatial} }
+  in
+  (* then apply given substitution *)
+  let current_pure = subst_apply_to_pure ~from_:from_ ~to_:to_ state.current.pure in
+  let missing_pure = subst_apply_to_pure ~from_:from_ ~to_:to_ state.missing.pure in
+  let current_spatial = subst_apply_to_spatial ~from_:from_ ~to_:to_ state.current.spatial in
+  let missing_spatial = subst_apply_to_spatial ~from_:from_ ~to_:to_ state.missing.spatial in
+  { state with 
+    current = { pure = current_pure; spatial = current_spatial };
+    missing = { pure = missing_pure; spatial = missing_spatial} }
+
 
 (* ==================== Exp.t helpers ==================== *)
 
@@ -181,19 +203,11 @@ let rec is_sil_address_assign exp =
 
 (** Use for dereference! Extracts base variable and evaluated offset from given [expr] *)
 let rec expr_base_and_offset expr state =
-  let open Typ in
-  let rec is_pointer = function
-    | Typ.Tptr _ -> true
-    | Typ.Tarray { elt } -> is_pointer elt.desc
-    | _ -> false
-  in
   let var_ids = expr_variable_ids expr in
   let pointers = List.filter var_ids
     ~f:(fun id ->
       match VarIdMap.find_opt id state.types with
-      | Some t ->
-        is_pointer t.desc ||
-        Id.equal id 0 (* return var *)
+      | Some t -> is_pointer_type t
       | None -> false)
   in
   match pointers with
@@ -201,6 +215,14 @@ let rec expr_base_and_offset expr state =
     Some (base, expr_eval_offset expr base state)
   | _ ->
     None
+
+(** Determines whether provided type [t] is a C pointer *)
+and is_pointer_type t =
+  let open Typ in
+  match t.desc with
+  | Typ.Tptr _ -> true
+  | Typ.Tarray { elt } -> is_pointer_type elt
+  | _ -> false
 
 (** Extracts all variable ids from given [expr] *)
 and expr_variable_ids expr =

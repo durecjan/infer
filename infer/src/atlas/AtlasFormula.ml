@@ -335,3 +335,54 @@ let rec heap_pred_find_exp_points_to src = function
       Some hp
   | _ :: rest ->
     heap_pred_find_exp_points_to src rest
+
+(** Replaces every occurence of [~old_] with [~new] within given [expr] *)
+let expr_replace ~old_ ~new_ expr =
+  let rec replace e = 
+    if Expr.equal e old_ then new_
+    else
+      match e with
+      | Expr.Var _
+      | Expr.Const _
+      | Expr.Undef -> e
+      | Expr.UnOp (op, e1) ->
+        Expr.UnOp (op, replace e1)
+      | Expr.BinOp (op, e1, e2) ->
+        Expr.BinOp (op, replace e1, replace e2)
+  in
+  replace expr
+
+(** Applies substitution [~from_] [~to_] over a list of pure constraints [pure] *)
+let subst_apply_to_pure ~from_ ~to_ pure =
+  let rec apply acc = function
+    | [] -> acc
+    | constr :: rest ->
+      let subst = expr_replace ~old_:from_ ~new_:to_ constr in
+      apply (subst :: acc) rest
+  in
+  apply [] pure
+
+(** Applies substitution [~from_] [~to_] over a list of heap predicates [spatial] *)
+let subst_apply_to_spatial ~from_ ~to_ spatial =
+  let rec apply acc = function
+  | [] -> acc
+  | BlockPointsTo (src, size) :: rest ->
+      let subst = BlockPointsTo (
+        expr_replace ~old_:from_ ~new_:to_ src,
+        expr_replace ~old_:from_ ~new_:to_ size)
+      in
+      apply (subst :: acc) rest
+  | UniformBlockPointsTo (src, size, value) :: rest ->
+      let subst = UniformBlockPointsTo (
+        expr_replace ~old_:from_ ~new_:to_ src,
+        expr_replace ~old_:from_ ~new_:to_ size,
+        expr_replace ~old_:from_ ~new_:to_ value)
+      in
+      apply (subst :: acc) rest
+  | ExpPointsTo (src, size, dest) :: rest ->
+      let subst = ExpPointsTo (
+        expr_replace ~old_:from_ ~new_:to_ src,
+        expr_replace ~old_:from_ ~new_:to_ size,
+        expr_replace ~old_:from_ ~new_:to_ dest) in
+      apply (subst :: acc) rest
+  in apply [] spatial

@@ -124,38 +124,27 @@ module TransferFunctions2 = struct
       vars = (Var.of_id lhs, lhs_id) :: state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
-    if Typ.is_pointer typ then begin
-      (* we are loading an address *)
-      if is_sil_dereference rhs then
-        begin match
-          expr_base_and_offset rhs_expr state
-        with
+    if is_sil_dereference rhs then
+      match expr_base_and_offset rhs_expr state with
+      | Some (rhs_id, off) ->
+          exec_load_deref loc lhs_id rhs_id off state
+      | None ->
+        Logging.die InternalError
+          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+    else begin
+      if is_sil_address_assign rhs then
+        match expr_base_and_offset rhs_expr state with
         | Some (rhs_id, off) ->
-            exec_load_deref loc lhs_id rhs_id off state
-        | None ->
-          (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
-          [{ state with
-            status = Error (
-              None, Some loc); }]
-      end else
-        begin match
-          expr_base_and_offset rhs_expr state
-        with
-        | Some (rhs_id, off) ->
-          let rhs_canonical =
-            canonical_expr state.subst rhs_id off
-          in
+          let rhs_canonical = canonical_expr state.subst rhs_id off in
           [{ state with
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
-          (* TODO: also should throw *)
-          [{ state with
-            status = Error (
-              None, Some loc); }]
-        end
-    end else
-      let rhs_norm = expr_normalize rhs_expr state in
-      assign_to_variable lhs_id rhs_norm state
+          Logging.die InternalError
+          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+      else
+        let rhs_norm = expr_normalize rhs_expr state in
+        assign_to_variable lhs_id rhs_norm state
+    end
 
   (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constaitn (Var ([lhs_id]) == [rhs]) to [state] *)
   and assign_to_variable lhs_id rhs state =
@@ -274,64 +263,45 @@ module TransferFunctions2 = struct
 
   and exec_store_instr loc lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
-    let open Expr in
-    if Typ.is_pointer lhs_typ then begin
-      if is_sil_dereference lhs then
-        begin match
-          expr_base_and_offset lhs_expr state
-        with
+    if is_sil_dereference lhs then
+      match expr_base_and_offset lhs_expr state with
+      | Some (lhs_id, off) ->
+          exec_store_deref loc lhs_typ lhs_id off rhs_expr state
+      | None ->
+        Logging.die InternalError
+          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+    else begin
+      if is_sil_address_assign lhs then begin
+        match expr_base_and_offset lhs_expr state with
         | Some (lhs_id, off) ->
-            exec_store_deref loc lhs_typ lhs_id off rhs_expr state
-        | None ->
-          (* TODO: should throw - if is_dereference_sil is true we have to find a base *)
-          [{ state with
-            status = Error (
-              None, Some loc); }]
-      end else
-        begin Format.print_string "\n[exec_store_instr: calling expr_base_and_offset]\n"; match 
-          expr_base_and_offset lhs_expr state
-        with
-        | Some (lhs_id, off) ->
-          Format.print_string ("\n[exec_store_instr: found some (id=" ^ Int.to_string lhs_id ^ "; offset=" ^ Int64.to_string off ^ ")" ^ "]\n");
-          let lhs_canonical =
-            canonical_expr state.subst lhs_id off
-          in
-          Format.print_string "\n[exec_store_instr: matching rhs_norm]\n";
+          let lhs_canonical = canonical_expr state.subst lhs_id off in
           let rhs_norm = expr_normalize rhs_expr state in
-          begin match rhs_norm with
-          | Var id ->
-            Format.print_string ("\n[exec_store_instr: found rhs_id=" ^ Int.to_string id ^ "]\n");
-            [{ state with subst =
-              VarIdMap.add id lhs_canonical state.subst }]
+          begin match lhs_canonical, rhs_norm with
+          | Var lhs_id, Expr.Var rhs_id ->
+            [{ state with
+              subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
           | _ ->
-            Format.print_string "\n[exec_store_instr: matching rhs_norm failed, defaulting to adding pure expression]\n";
             let pure_part =
               Expr.BinOp (Peq, subst_expr_to_formula_expr lhs_canonical, rhs_norm)
             in
-            let current =
-              { state.current with pure = pure_part :: state.current.pure }
-            in
-            [{ state with current }]
+            [{ state with current =
+              { state.current with pure = pure_part :: state.current.pure } }]
           end
         | None ->
-          Format.print_string "\n[exec_store_instr: expr_base_and_offset call found nothing]\n";
-          (* TODO: should also throw *)
-          [{ state with
-            status = Error (
-              None, Some loc); }]
-        end
-    end else
-      let rhs_norm = expr_normalize rhs_expr state in
-      let lhs_norm = expr_normalize lhs_expr state in
-      begin match lhs_norm with
-        Var id ->
-        assign_to_variable id rhs_norm state
-      | _ ->
-        let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
-        let current =
-          { state.current with pure = exp :: state.current.pure }
-        in [{ state with current }]
-      end
+          Logging.die InternalError
+            "[Error] method is_sil_address_assign returned true but no base pointer variable found"
+      end else
+        let rhs_norm = expr_normalize rhs_expr state in
+        let lhs_norm = expr_normalize lhs_expr state in
+        match lhs_norm with
+        | Var id ->
+          assign_to_variable id rhs_norm state
+        | _ ->
+          let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
+          let current =
+            { state.current with pure = exp :: state.current.pure }
+          in [{ state with current }]
+    end
 
   and exec_store_deref loc lhs_typ lhs_var_id lhs_offset rhs_expr state =
     [state]

@@ -10,7 +10,7 @@ module VarIdMap = Stdlib.Map.Make (Id)
 type subst_expr = Var of Id.t | Ptr of { base: Id.t ; offset: Int64.t }
 
 (** State status *)
-type status = Ok | Error of IssueType.t option * Location.t option
+type status = Ok | Error of IssueType.t option * Location.t option (* TODO fix me add Sil.instr into the error *)
 
 (** Abstract state *)
 type t = {
@@ -163,6 +163,21 @@ let rec is_sil_dereference exp =
   | _ ->
     false
 
+let rec is_sil_address_assign exp =
+  match Exp.ignore_cast exp with
+  | Exp.Lvar _ ->
+    true
+  | Exp.Lfield ({ exp = e }, _, _) ->
+    is_sil_address_assign e
+  | Exp.Lindex (e, _) ->
+    is_sil_address_assign e
+  | Exp.UnOp (_, e, _) ->
+    is_sil_address_assign e
+  | Exp.BinOp (_, e1, e2) ->
+    is_sil_address_assign e1 ||
+    is_sil_address_assign e2
+  | _ ->
+    false
 
 (* ==================== Expr.t helpers ==================== *)
 
@@ -178,7 +193,9 @@ let rec expr_base_and_offset expr state =
   let pointers = List.filter var_ids
     ~f:(fun id ->
       match VarIdMap.find_opt id state.types with
-      | Some t -> is_pointer t.desc
+      | Some t ->
+        is_pointer t.desc ||
+        Id.equal id 0 (* return var *)
       | None -> false)
   in
   match pointers with

@@ -377,11 +377,18 @@ let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int
 
 (* ==================== pure constraint helpers ==================== *)
 
-(** Traverses both current and missing pure constraints of [state], looking for (Base(Var [id])==exp) *)
-let state_find_pure_base_expr id state =
+(** Traverses both current and missing pure constraints of [state], looking for ([unop](Var [id])==exp) *)
+let state_find_pure_unop_eq_expr id unop state =
   let curr_base, miss_base =
-    Formula.find_pure_base_expr id state.current.pure,
-    Formula.find_pure_base_expr id state.missing.pure
+    match unop with
+    | Expr.Base ->
+      Formula.find_pure_base_expr id state.current.pure,
+      Formula.find_pure_base_expr id state.missing.pure
+    | Expr.End ->
+      Formula.find_pure_end_expr id state.current.pure,
+      Formula.find_pure_end_expr id state.missing.pure
+    | _ ->
+      None, None
   in
   match curr_base, miss_base with
   | Some b, None | None, Some b ->
@@ -389,6 +396,13 @@ let state_find_pure_base_expr id state =
   | _ ->
     None
 
+(** Traverses both current and missing pure constraints of [state], looking for (Freed(Var [id])) *)
+let state_is_freed_expr id state =
+  let curr_freed, miss_freed =
+    Formula.has_freed_expr id state.current.pure,
+    Formula.has_freed_expr id state.missing.pure
+  in
+  curr_freed || miss_freed
 
 (* ==================== heap predicate helpers ==================== *)
 

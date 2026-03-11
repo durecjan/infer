@@ -290,8 +290,22 @@ let rec find_pure_base_expr id = function
     when Id.equal id id' -> Some exp
   | _ :: rest -> find_pure_base_expr id rest
 
+(** Traverses pure constraints and looks for (End(Var [id])==exp) *)
+let rec find_pure_end_expr id = function
+  | [] -> None
+  | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
+    when Id.equal id id' -> Some exp
+  | _ :: rest -> find_pure_end_expr id rest
+
+(** Determines whether the given expression list contains (Freed(Var [id]) expression *)
+let rec has_freed_expr id = function
+  | [] -> false
+  | Expr.UnOp (Freed, Var id') :: _ 
+    when Id.equal id id' -> true
+  | _ :: rest -> has_freed_expr id rest
+
 (** Evaluates [expr] to Int64 and compares it to 0L *)
-let rec is_zero expr =
+let rec is_zero_expr expr =
   match eval_expr_to_int64 expr with
   | Some i when Int64.equal i 0L ->
     true

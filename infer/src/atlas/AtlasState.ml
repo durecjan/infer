@@ -2,9 +2,7 @@
 module Formula = AtlasFormula
 module Id = AtlasFormula.Id
 module Expr = AtlasFormula.Expr
-
-(** Variable Id map *)
-module VarIdMap = Stdlib.Map.Make (Id)
+open !Formula
 
 (** Substitution expression *)
 type subst_expr = Var of Id.t | Ptr of { base: Id.t ; offset: Int64.t }
@@ -16,7 +14,7 @@ type status = Ok | Error of IssueType.t option * Location.t * Sil.instr
 type t = {
   current: Formula.t;             (** Current part of formula *)
   missing: Formula.t;             (** Missing part of formula *)
-  vars: (Var.t * Id.t) list;      (** Sil variable map *)
+  vars: Var.t VarIdMap.t;      (** Sil variable map *)
   types: Typ.t VarIdMap.t;        (** Type map *)
   subst: subst_expr VarIdMap.t;   (** Substitution map *)
   status: status;                 (** State status *)
@@ -26,7 +24,7 @@ type t = {
 let empty_ = {
   current = Formula.empty;
   missing = Formula.empty;
-  vars = [];
+  vars = VarIdMap.empty;
   types = VarIdMap.empty;
   subst = VarIdMap.empty;
   status = Ok;
@@ -52,7 +50,7 @@ let rec empty analysis =
       state_add_variable pvar typ state)
   in
   { with_formals with 
-    vars = (Var.of_pvar ret_var, 0) :: with_formals.vars;
+    vars = VarIdMap.add 0 (Var.of_pvar ret_var) with_formals.vars;
     types = VarIdMap.add 0 ret_typ with_formals.types }
 
 (** Adds variable [v] with type [t] into state [s]. if [id] is present, it is used, otherwise fresh id is made. *)
@@ -62,7 +60,7 @@ and state_add_variable ?id v t s =
   | None -> Id.fresh ()
   in
   { s with 
-    vars = (Var.of_pvar v, id') :: s.vars;
+    vars = VarIdMap.add id' (Var.of_pvar v) s.vars;
     types = VarIdMap.add id' t s.types }
 
 
@@ -629,9 +627,10 @@ and sil_instr_to_string instr =
     instr
 
 and vars_to_string vars =
+  let bindings = VarIdMap.bindings vars in
   String.concat (
-    List.map vars
-    ~f:(fun (var, id) ->
+    List.map bindings
+    ~f:(fun (id, var) ->
       let var_str = match var with
       | Var.ProgramVar pvar ->
         Pvar.get_simplified_name pvar

@@ -51,6 +51,9 @@ module Expr = Formula.Expr
 module State = AtlasState
 module Id = Formula.Id
 
+open !Formula
+open !State
+
 module TransferFunctions2 = struct
   module CFG = ProcCfg.Normal
 
@@ -121,7 +124,7 @@ module TransferFunctions2 = struct
     let open State in
     let lhs_id = Id.fresh () in
     let state = { state with
-      vars = (Var.of_id lhs, lhs_id) :: state.vars;
+      vars = VarIdMap.add lhs_id (Var.of_id lhs) state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
     if is_sil_dereference rhs then
@@ -426,7 +429,7 @@ module TransferFunctions2 = struct
     let open Expr in
     let lhs_id = Id.fresh () in
     let state = { state with
-      vars = (Var.of_id lhs, lhs_id) :: state.vars;
+      vars = VarIdMap.add lhs_id (Var.of_id lhs) state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
     let source = Expr.Var lhs_id in
@@ -466,6 +469,7 @@ module TransferFunctions2 = struct
     let open Sil in
     match metadata with
     | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
+      (* TODO FIX ME - ADD Base(pvar) = End(pvar) = Expr.Const (Int 0) to state.current.pure *)
       (*
       let id = Id.fresh () in
       [{ state with

@@ -15,15 +15,18 @@ module Id = struct
 
 end
 
-let rec lookup_variable id vars =
-  match vars with
-    [] -> None
-  | (a,b)::l -> if Id.equal b id then Some a else lookup_variable id l
+(** Variable Id map *)
+module VarIdMap = Stdlib.Map.Make (Id)
 
-let rec lookup_variable_id v vars =
-  match vars with
-    [] -> None
-  | (a,b)::l -> if Var.equal a v then Some b else lookup_variable_id v l
+let lookup_variable id vars =
+  VarIdMap.find_opt id vars
+
+let lookup_variable_id v vars =
+  let rec find_var = function
+    | [] -> None
+    | (a, b) :: l -> if Var.equal b v then Some a else find_var l 
+  in
+  find_var (VarIdMap.bindings vars)
 
 module Expr = struct
   type t =
@@ -210,7 +213,7 @@ let rec spatial_to_string vars s =
 let to_string vars f =
   spatial_to_string vars f.spatial ^ "\n" ^ pure_to_string vars f.pure
 
-module IdSet = Stdlib.Set.Make (Int)
+module IdSet = Stdlib.Set.Make (Id)
 
 let lookup_pure_const_exp_of_id id pure =
   let rec resolve visited id =

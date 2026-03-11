@@ -135,7 +135,7 @@ module TransferFunctions2 = struct
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
     else begin
-      if is_sil_address_assign rhs then
+      if is_sil_address_assign rhs && is_pointer_type typ then
         match expr_base_and_offset rhs_expr state with
         | Some (rhs_id, off) ->
           let rhs_canonical = canonical_expr state.subst rhs_id off in
@@ -269,22 +269,14 @@ module TransferFunctions2 = struct
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
     else begin
-      if is_sil_address_assign lhs then begin
+      if is_sil_address_assign lhs && is_pointer_type lhs_typ then begin
         match expr_base_and_offset lhs_expr state with
         | Some (lhs_id, off) ->
           let lhs_canonical = canonical_expr state.subst lhs_id off in
+          let lhs_norm = expr_normalize (subst_expr_to_formula_expr lhs_canonical) state in
           let rhs_norm = expr_normalize rhs_expr state in
-          begin match lhs_canonical, rhs_norm with
-          | Var lhs_id, Expr.Var rhs_id ->
-            [{ state with
-              subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
-          | _ ->
-            let pure_part =
-              Expr.BinOp (Peq, subst_expr_to_formula_expr lhs_canonical, rhs_norm)
-            in
-            [{ state with current =
-              { state.current with pure = pure_part :: state.current.pure } }]
-          end
+          (* it must be ensured rhs contains a temp variable~! *)
+          [(subst_apply ~from_:rhs_norm ~to_:lhs_norm state)]
         | None ->
           Logging.die InternalError
             "[Error] method is_sil_address_assign returned true but no base pointer variable found"
@@ -468,22 +460,36 @@ module TransferFunctions2 = struct
   and exec_metadata_instr metadata state =
     let open Sil in
     match metadata with
-    | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
-      (* TODO FIX ME - ADD Base(pvar) = End(pvar) = Expr.Const (Int 0) to state.current.pure *)
-      (*
-      let id = Id.fresh () in
-      [{ state with
-        vars = (Var.of_pvar pvar, id) :: state.vars;
-        types = VarIdMap.add id typ state.types }]
-      *)
+    | VariableLifetimeBegins { pvar; typ = _; loc = _; is_cpp_structured_binding = _} ->
+      Format.print_string "\n[SIL_VARIABLE_LIFETIME_BEGINS]\n";
+      begin match
+        lookup_variable_id (Var.of_pvar pvar) state.vars
+      with
+      | Some id ->
+        let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) in
+        let end_constr = Expr.BinOp (Peq, UnOp (End, Var id), Const (Int 0L)) in
+        let current = { state.current with
+          pure = base_constr :: end_constr :: state.current.pure } in
+        [{ state with current }]
+      | None -> Logging.die InternalError
+        "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
+      end
+    | ExitScope (_var_list, _loc) ->
+      Format.print_string "\n[SIL_EXIT_SCOPE]\n";
       [state]
     | Nullify (_pvar, _loc) ->
-      [state] (* TODO *)
-    | ExitScope (_var_list, _loc) ->
-      [state] (* TODO - maybe when var id is present in the substitution map,
-                we can remove it and re-shuffle the change through formula,
-                making a new canonical id or removing the constraints *)
-    | Skip | _ ->
+      Format.print_string "\n[SIL_NULLIFY]\n";
+      [state]
+    | Skip ->
+      Format.print_string "\n[SIL_SKIP]\n";
+      [state]
+    | LoopBackEdge _ ->
+      Format.print_string "\n[SIL_LOOPBACK_EDGE]\n";
+      [state]
+    | LoopEntry _ ->
+      Format.print_string "\n[SIL_LOOP_ENTRY]\n";
+      [state]
+    | _ ->
       [state]
 
     (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [loc] *)

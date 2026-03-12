@@ -414,14 +414,49 @@ module TransferFunctions2 = struct
       [state]
 
   and store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr state =
+    let rhs_norm = expr_normalize rhs_expr state in
+    let try_block_split hps =
+      state_heap_try_block_split hps lhs_var_id lhs_offset cell_size
+    in
+    let assign ?to_missing:(to_missing=false) state lhs_id lhs_expr =
+      store_dereference_assign ~to_missing:to_missing state lhs_typ lhs_id lhs_expr rhs_norm
+    in
     let curr_hps, curr_rest, miss_hps, miss_rest =
       state_heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
-    match state_heap_try_store
-      state curr_hps lhs_var_id lhs_offset cell_size
-    with
-    | _ ->
-      [state]
+    match try_block_split curr_hps with
+    | Some block_split_res ->
+      begin match block_split_res with
+      | ExpExactMatch dest -> [state] (* TODO RETURN HERE *)
+      | BlockExactMatch { to_remove; to_add; new_dest_id }
+      | BlockEdgeMatch { to_remove; to_add; new_dest_id }
+      | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
+        [state]
+      end
+    | None ->
+      begin match try_block_split miss_hps with
+      | Some block_split_res ->
+        begin match block_split_res with
+        | ExpExactMatch dest -> [state]
+        | BlockExactMatch { to_remove; to_add; new_dest_id }
+        | BlockEdgeMatch { to_remove; to_add; new_dest_id }
+        | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
+          [state]
+      end
+      | None ->
+        (* missing resource *)
+        let err_state = { state with status = Error (None, loc, instr) } in
+        let cell_id = Id.fresh () in
+        let lhs_expr = Expr.Var cell_id in
+        let missing_spatial = ExpPointsTo (
+          Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+          Expr.Const (Int cell_size),
+          lhs_expr)
+        in
+        let spatial = missing_spatial :: state.missing.spatial in
+        let state = { state with missing = { state.missing with spatial } } in
+        err_state :: assign ~to_missing:true state cell_id lhs_expr
+      end
 
   and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in

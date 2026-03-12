@@ -343,6 +343,50 @@ and expr_normalize expr _state =
       BinOp (op, e1', e2')
     end
 
+(** Evaluates [expr], Var must have a chain of pure constraints, eventually leading to Const *)
+let state_eval_expr_to_int64 expr state =
+  let lookup_pure id =
+    Formula.lookup_pure_const_exp_of_id id state.current.pure
+  in
+  let rec eval off = function
+    | Expr.Undef -> off
+    | Expr.Var id ->
+      begin match lookup_pure id with
+      | Some e -> eval off (expr_normalize e state)
+      | None -> off
+      end
+    | Expr.Const (Int i) -> Stdlib.Int64.add off i
+    | Expr.Const _ -> off
+    | Expr.UnOp (op, e) ->
+      let inner = eval 0L e in
+      begin match op with
+      | Puminus ->
+        Stdlib.Int64.sub off inner
+      | Lnot | BVnot | Base | End | Freed -> off
+      end
+    | Expr.BinOp (op, e1, e2) ->
+      let lhs = eval 0L e1 in
+      let rhs = eval 0L e2 in
+      let res = match op with
+        | Pplus ->
+          Stdlib.Int64.add lhs rhs
+        | Pminus ->
+          Stdlib.Int64.sub lhs rhs
+        | Pmult ->
+          Stdlib.Int64.mul lhs rhs
+        | Pdiv when (Int64.compare rhs 0L) <> 0 ->
+          Stdlib.Int64.div lhs rhs
+        | Pmod when (Int64.compare rhs 0L) <> 0 ->
+          Stdlib.Int64.rem lhs rhs
+        | BVlshift | BVrshift
+        | Pless | Plesseq | Peq | Pneq
+        | BVand | BVor | BVxor
+        | Land | Lor | _ -> 0L
+      in
+      Stdlib.Int64.add off res
+  in
+  eval 0L (expr_normalize expr state)
+
 (** Evaluates [expr], handling BinOp | Const | Var ,
     where Var must have a chain of pure constraints,
     eventually leading to Const. If any part fails
@@ -409,6 +453,17 @@ let state_is_freed_expr id state =
   in
   curr_freed || miss_freed
 
+(** Adds expression ([lhs_expr] == [rhs_expr]) to pure constraints of current or missing part of [state], based on [to_missing].
+    Also updates [state.types] with [lhs_typ]*)
+let store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lhs_id lhs_expr rhs_expr =
+  let types = VarIdMap.add lhs_id lhs_typ state.types in
+  let pure_part = Expr.BinOp (Peq, lhs_expr, rhs_expr) in
+  let pure = pure_part :: (if to_missing then state.missing.pure else state.current.pure) in
+  if to_missing then
+    [{ state with types; missing = { state.missing with pure } }]
+  else
+    [{ state with types; current = { state.current with pure } }]
+
 
 (* ==================== heap predicate helpers ==================== *)
 
@@ -419,58 +474,102 @@ type block_split_res =
   | BlockEdgeMatch of { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } (* new cell matched the edge of some BlockPointsTo | UniformBlockPointsTo *)
   | BlockMiddleMatch of { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } (* new cell matched the middle of some BlockPointsTo | UniformBlockPointsTo *)
 
-let state_heap_try_store state hps lhs_var_id lhs_offset cell_size =
-  let is_exact_match src size =
+let state_heap_try_block_split hps lhs_var_id lhs_offset cell_size =
+  let try_exp_exact_match src size dest =
     match src, size with
     | Expr.BinOp (Pplus, Var _, Const (Int off)),
       Expr.Const (Int size)
         when Int64.equal off lhs_offset &&
-          Int64.equal size cell_size -> true
-    | _ -> false
+          Int64.equal size cell_size ->
+            Some (ExpExactMatch dest)
+    | _ -> None
   in
-  let is_partial_match_eq_offset src size =
+  let try_block_exact_match hp src size =
     match src, size with
     | Expr.BinOp (Pplus, Var _, Const (Int off)),
       Expr.Const (Int size)
-        when Int64.equal off lhs_offset &&
-          (Int64.compare size cell_size ) >= 0 -> true
-    | _ -> false
+        when Int64.equal off lhs_offset && Int64.equal size cell_size ->
+          let to_remove = hp in
+          let new_dest_id = Id.fresh () in
+          let to_add = [
+            ExpPointsTo (
+              Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+              Expr.Const (Int cell_size),
+              Expr.Var new_dest_id) ]
+          in
+          Some (BlockExactMatch { to_remove; to_add; new_dest_id})
+    | _ -> None
   in
-  let rec try_store = function
+  let try_block_left_edge_match hp src size =
+    match src, size with
+    | Expr.BinOp (Pplus, Var _, Const (Int off)),
+      Expr.Const (Int size)
+        when Int64.equal off lhs_offset && (Int64.compare size cell_size ) >= 0 ->
+          let to_remove = hp in
+          let new_dest_id = Id.fresh () in
+          let to_add = [
+            ExpPointsTo (
+              Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+              Expr.Const (Int cell_size),
+              Expr.Var new_dest_id) ;
+            BlockPointsTo (
+              Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+              Expr.Const (Int (Stdlib.Int64.sub size cell_size))) ]
+          in
+          Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
+    | _ -> None
+  in
+  let try_block_right_edge_or_middle_match hp src size =
+    match src, size with
+    | Expr.BinOp (Pplus, Var _, Const (Int off)),
+      Expr.Const (Int size)
+        when (Int64.compare size (Stdlib.Int64.add cell_size (Stdlib.Int64.sub lhs_offset off))) >= 0 ->
+          let to_remove = hp in
+          let new_dest_id = Id.fresh () in
+          let to_add_new_cell = ExpPointsTo (
+            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+            Expr.Const (Int cell_size),
+            Expr.Var new_dest_id)
+          in
+          let to_add_left_block = BlockPointsTo (
+            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int off)),
+            Expr.Const (Int (Stdlib.Int64.sub lhs_offset off)))
+          in
+          if (Int64.compare size (Stdlib.Int64.add (Stdlib.Int64.sub lhs_offset off) cell_size)) > 0 then
+            let to_add = [
+              to_add_new_cell;
+              to_add_left_block;
+              BlockPointsTo (
+                Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset off))),
+                Expr.Const (Int (Stdlib.Int64.sub size (Stdlib.Int64.add (Stdlib.Int64.sub lhs_offset off) cell_size)))) ]
+            in
+            Some (BlockMiddleMatch { to_remove; to_add; new_dest_id })
+          else
+            let to_add = [ to_add_new_cell; to_add_left_block ] in
+            Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
+    | _ -> None
+  in
+  let rec try_block_split = function
     | [] -> None
-    | ExpPointsTo (src, size, dest) :: _
-      when is_exact_match src size ->
-        Some (ExpExactMatch dest)
-    | ((BlockPointsTo (src, size)) as hp) :: _
-      when is_exact_match src size ->
-        let to_remove = hp in
-        let new_dest_id = Id.fresh () in
-        let to_add = [
-          ExpPointsTo (
-            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
-            Expr.Const (Int cell_size),
-            Expr.Var new_dest_id) ]
-        in
-        Some (BlockExactMatch { to_remove; to_add; new_dest_id})
-    | ((BlockPointsTo (src, size)) as hp) :: _
-      when is_partial_match_eq_offset src size ->
-        let to_remove = hp in
-        let new_dest_id = Id.fresh () in
-        let to_add = [
-          ExpPointsTo (
-            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
-            Expr.Const (Int cell_size),
-            Expr.Var new_dest_id) ;
-          BlockPointsTo (
-            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
-            Expr.Const (Int (* Stdlib.Int64.sub size *) cell_size)) ]
-        in
-        Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
-    | _ :: rest -> try_store rest
+    | ExpPointsTo (src, size, dest) :: rest ->
+      begin match try_exp_exact_match src size dest with
+      | Some res -> Some res
+      | None -> try_block_split rest
+      end
+    | ((BlockPointsTo (src, size)) as hp) :: rest ->
+      begin match try_block_exact_match hp src size with
+      | Some res -> Some res
+      | None -> begin match try_block_left_edge_match hp src size with
+        | Some res -> Some res
+        | None -> begin match try_block_right_edge_or_middle_match hp src size with
+          | Some res -> Some res
+          | None -> try_block_split rest
+          end
+        end
+      end
+    | _ :: rest -> try_block_split rest
   in
-  match try_store hps with
-  | Some _ -> [state]
-  | None -> [state]
+  try_block_split hps
 
 (** Traverses both current and missing heap predicates of [state], looking for:
     ExpPointsTo (src, size, _) | BlockPointsTo (src, size) | UniformBlockPointsTo (src, size, _)

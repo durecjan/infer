@@ -171,9 +171,9 @@ module TransferFunctions2 = struct
   and exec_load_deref loc instr lhs_id rhs_id off state =
     [state]
     |> concat_map_ok_states
-      (exec_deref_check_base loc instr rhs_id)
+      (exec_deref_check_base loc instr rhs_id off)
     |> concat_map_ok_states
-      (exec_deref_check_freed loc instr rhs_id)
+      (dereference_check_freed loc instr rhs_id)
     |> concat_map_ok_states
       (exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off)
   
@@ -292,9 +292,9 @@ module TransferFunctions2 = struct
   and exec_store_deref loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     [state]
     |> concat_map_ok_states
-      (exec_deref_check_base loc instr lhs_var_id)
+      (dereference_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
-      (exec_deref_check_freed loc instr lhs_var_id)
+      (exec_deref_check_base loc instr lhs_var_id lhs_offset)
     |> concat_map_ok_states
       (exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr)
   
@@ -306,24 +306,30 @@ module TransferFunctions2 = struct
       | Error _ -> [s])
     states
 
-  and exec_deref_check_base loc instr lhs_var_id state =
+  and dereference_check_freed loc instr var_id state =
+    if state_is_freed_expr var_id state then
+      [{ state with status = Error (None, loc, instr)}]
+    else [state]
+
+  and exec_deref_check_base loc instr var_id offset state =
     let open State in
     let open Formula in
-    match state_find_pure_unop_eq_expr lhs_var_id Expr.Base state with
-    | Some e when Formula.is_zero_expr e ->
+    match state_find_pure_unop_eq_expr var_id Expr.Base state with
+    | Some (e, _) when Formula.is_zero_expr e ->
       (* Base() == 0 *)
       [{ state with
         status = Error (None, loc, instr) }]
-    | Some e when Expr.equal e (Expr.Var lhs_var_id) ->
-      (* correct *)
-      [state]
-    | _ ->
+    | Some (e, is_current) ->
+      dereference_check_lower_bound loc instr e is_current var_id offset state
+    | None ->
       (* missing resource *)
       let err_state = { state with
         status = Error (None, loc, instr) }
       in
-      let missing_part =
-        Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var lhs_var_id), Expr.Var lhs_var_id)
+      let missing_part = Expr.BinOp (
+        Peq,
+        Expr.UnOp (Base, Var var_id), 
+        Expr.BinOp (Pplus, Var var_id, Const (Int (Int64.min 0L offset))))
       in
       let ok_state = { state with
         missing = { state.missing with
@@ -331,10 +337,29 @@ module TransferFunctions2 = struct
       in
       [ err_state; ok_state ]
 
-  and exec_deref_check_freed loc instr var_id state =
-    if state_is_freed_expr var_id state then
-      [{ state with status = Error (None, loc, instr)}]
-    else [state]
+  and dereference_check_lower_bound loc instr base_exp is_current var_id offset state =
+    let base_offset = expr_eval_offset base_exp var_id state in
+    if (Int64.compare offset base_offset) < 0 then begin
+      if is_current then
+        (* offset out of bounds *)
+        [{ state with status = Error (None, loc, instr) }]
+      else
+        (* missing resource - we can lower the bound *)
+        let to_remove = Expr.BinOp (Peq, UnOp (Base, Var var_id), base_exp) in
+        let missing_pure = Stdlib.List.filter
+          (fun e -> not (Expr.equal e to_remove))
+          state.missing.pure
+        in
+        let to_add = Expr.BinOp (
+          Peq,
+          UnOp (Base, Var var_id),
+          BinOp (Pplus, Var var_id, Const (Int offset)))
+        in
+        [{ state with missing = {
+          state.missing with pure = to_add :: missing_pure } }]
+      end
+    else
+      [state]
 
   and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in

@@ -377,24 +377,29 @@ let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int
 
 (* ==================== pure constraint helpers ==================== *)
 
-(** Traverses both current and missing pure constraints of [state], looking for ([unop](Var [id])==exp) *)
+(** Traverses both current and missing pure constraints of [state], looking for ([unop](Var [id])==exp)
+    Returns (Some exp, is_current) | None *)
 let state_find_pure_unop_eq_expr id unop state =
-  let curr_base, miss_base =
-    match unop with
-    | Expr.Base ->
-      Formula.find_pure_base_expr id state.current.pure,
-      Formula.find_pure_base_expr id state.missing.pure
-    | Expr.End ->
-      Formula.find_pure_end_expr id state.current.pure,
-      Formula.find_pure_end_expr id state.missing.pure
-    | _ ->
-      None, None
-  in
-  match curr_base, miss_base with
-  | Some b, None | None, Some b ->
-    Some b
-  | _ ->
-    None
+  match unop with
+  | Expr.Base ->
+    begin match Formula.find_pure_base_expr id state.current.pure with
+    | Some b -> Some (b, true)
+    | None ->
+      begin match Formula.find_pure_base_expr id state.missing.pure with
+      | Some b -> Some (b, false)
+      | None -> None
+      end
+    end
+  | Expr.End ->
+    begin match Formula.find_pure_end_expr id state.current.pure with
+    | Some b -> Some (b, true)
+    | None ->
+      begin match Formula.find_pure_end_expr id state.missing.pure with
+      | Some b -> Some (b, false)
+      | None -> None
+      end
+    end
+  | _ -> None
 
 (** Traverses both current and missing pure constraints of [state], looking for (Freed(Var [id])) *)
 let state_is_freed_expr id state =

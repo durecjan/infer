@@ -74,7 +74,7 @@ module TransferFunctions2 = struct
       Format.print_string (
         "[SIL_LOAD]\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
 
-      exec_load_instr loc instr id typ e rhs_expr state
+      exec_load_instr loc instr id tenv typ e rhs_expr state
     | Sil.Store {e1; typ; e2; loc} ->
 
       Format.print_string (
@@ -86,7 +86,7 @@ module TransferFunctions2 = struct
       Format.print_string (
         "\n[LHS_EXPR]: " ^ Expr.to_string state.vars lhs_expr ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
 
-      exec_store_instr loc instr typ e1 lhs_expr rhs_expr state
+      exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr state
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
@@ -120,7 +120,7 @@ module TransferFunctions2 = struct
 
     states
 
-  and exec_load_instr loc instr lhs typ rhs rhs_expr state =
+  and exec_load_instr loc instr lhs tenv typ rhs rhs_expr state =
     let open State in
     let lhs_id = Id.fresh () in
     let state = { state with
@@ -130,7 +130,7 @@ module TransferFunctions2 = struct
     if is_sil_dereference rhs then
       match expr_base_and_offset rhs_expr state with
       | Some (rhs_id, off) ->
-          exec_load_deref loc instr lhs_id rhs_id off state
+          exec_load_deref loc instr lhs_id tenv typ rhs_id off state
       | None ->
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
@@ -168,12 +168,15 @@ module TransferFunctions2 = struct
       [{ state with current }]
   
   (** Ids [lhs_id] and [rhs_id] must be canonical! *)
-  and exec_load_deref loc instr lhs_id rhs_id off state =
+  and exec_load_deref loc instr lhs_id tenv rhs_typ rhs_id off state =
+    let cell_size = typ_size_of tenv rhs_typ in
     [state]
+    |> concat_map_ok_states
+      (dereference_check_freed loc instr rhs_id)
     |> concat_map_ok_states
       (exec_deref_check_base loc instr rhs_id off)
     |> concat_map_ok_states
-      (dereference_check_freed loc instr rhs_id)
+      (exec_deref_check_end loc instr rhs_id off cell_size)
     |> concat_map_ok_states
       (exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off)
   
@@ -255,12 +258,12 @@ module TransferFunctions2 = struct
       in
       [error_state; ok_state]
 
-  and exec_store_instr loc instr lhs_typ lhs lhs_expr rhs_expr state =
+  and exec_store_instr loc instr tenv lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
     if is_sil_dereference lhs then
       match expr_base_and_offset lhs_expr state with
       | Some (lhs_id, off) ->
-          exec_store_deref loc instr lhs_typ lhs_id off rhs_expr state
+          exec_store_deref loc instr tenv lhs_typ lhs_id off rhs_expr state
       | None ->
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
@@ -289,12 +292,15 @@ module TransferFunctions2 = struct
           in [{ state with current }]
     end
 
-  and exec_store_deref loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
+  and exec_store_deref loc instr tenv lhs_typ lhs_var_id lhs_offset rhs_expr state =
+    let cell_size = typ_size_of tenv lhs_typ in
     [state]
     |> concat_map_ok_states
       (dereference_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
       (exec_deref_check_base loc instr lhs_var_id lhs_offset)
+    |> concat_map_ok_states
+      (exec_deref_check_end loc instr lhs_var_id lhs_offset cell_size)
     |> concat_map_ok_states
       (exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr)
   
@@ -312,8 +318,6 @@ module TransferFunctions2 = struct
     else [state]
 
   and exec_deref_check_base loc instr var_id offset state =
-    let open State in
-    let open Formula in
     match state_find_pure_unop_eq_expr var_id Expr.Base state with
     | Some (e, _) when Formula.is_zero_expr e ->
       (* Base() == 0 *)
@@ -354,6 +358,54 @@ module TransferFunctions2 = struct
           Peq,
           UnOp (Base, Var var_id),
           BinOp (Pplus, Var var_id, Const (Int offset)))
+        in
+        [{ state with missing = {
+          state.missing with pure = to_add :: missing_pure } }]
+      end
+    else
+      [state]
+
+  and exec_deref_check_end loc instr var_id offset cell_size state =
+    match state_find_pure_unop_eq_expr var_id Expr.End state with
+    | Some (e, _) when Formula.is_zero_expr e ->
+      (* Base() == 0 *)
+      [{ state with
+        status = Error (None, loc, instr) }]
+    | Some (e, is_current) ->
+      dereference_check_upper_bound loc instr e is_current var_id offset cell_size state
+    | None ->
+      (* missing resource *)
+      let err_state = { state with
+        status = Error (None, loc, instr) }
+      in
+      let missing_part = Expr.BinOp (
+        Peq,
+        Expr.UnOp (End, Var var_id),
+        Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))))
+      in
+      let ok_state = { state with
+        missing = { state.missing with
+          pure = missing_part :: state.missing.pure } }
+      in
+      [ err_state; ok_state ]
+
+  and dereference_check_upper_bound loc instr end_expr is_current var_id offset cell_size state =
+    let end_offset = expr_eval_offset end_expr var_id state in
+    if (Int64.compare offset end_offset) > 0 then begin
+      if is_current then
+        (* offset out of bounds *)
+        [{ state with status = Error (None, loc, instr) }]
+      else
+        (* missing resource - we can increase the bound *)
+        let to_remove = Expr.BinOp (Peq, UnOp (End, Var var_id), end_expr) in
+        let missing_pure = Stdlib.List.filter
+          (fun e -> not (Expr.equal e to_remove))
+          state.missing.pure
+        in
+        let to_add = Expr.BinOp (
+          Peq,
+          UnOp (Base, Var var_id),
+          BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))))
         in
         [{ state with missing = {
           state.missing with pure = to_add :: missing_pure } }]

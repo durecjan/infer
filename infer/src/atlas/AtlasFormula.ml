@@ -400,3 +400,50 @@ let subst_apply_to_spatial ~from_ ~to_ spatial =
         expr_replace ~old_:from_ ~new_:to_ dest) in
       apply (subst :: acc) rest
   in apply [] spatial
+
+(** Traverses given heap predicate list [spatial], looking for:
+    ExpPointsTo (src, size, _) | BlockPointsTo (src, size) | UniformBlockPointsTo (src, size, _)
+    where src = (Var [var_id] + (num <= [var_offset])) and size >= [cell_size].*)
+let heap_find_block_fragments spatial var_id var_offset cell_size =
+  let is_block_fragment src size = 
+    match src, size with
+    | Expr.BinOp (Pplus, Var id, Const (Int off)),
+      Expr.Const (Int size) ->
+        Id.equal id var_id && 
+        (Int64.compare off var_offset) <= 0 &&
+        (Int64.compare size cell_size) >= 0
+    | _ -> false
+  in
+  Stdlib.List.partition
+    (fun hp ->
+      match hp with
+      | ExpPointsTo (src, size, _)
+        when is_block_fragment src size ->
+          true
+      | BlockPointsTo (src, size)
+        when is_block_fragment src size ->
+          true
+      | UniformBlockPointsTo (src, size, _)
+        when is_block_fragment src size ->
+          true
+      | _ -> false)
+    spatial
+
+(** Sorts given heap predicates [hps] by their source offset, i.e. src = [Expr.BinOp (Pplus, Var _, Const (Int offset))].
+    If any given heap predicate does not match this pattern, exception is raised *)
+let rec sort_heap_preds_by_offset_desc hps =
+  hps
+  |> List.map ~f:(fun hp -> (points_to_src_offset hp, hp))
+  |> List.sort ~compare:(fun (o1, _) (o2, _) -> Int64.compare o2 o1)
+  |> List.map ~f:snd
+
+and points_to_src_offset hp =
+  let src =
+    match hp with
+    | BlockPointsTo (src, _)
+    | ExpPointsTo (src, _, _)
+    | UniformBlockPointsTo (src, _, _) -> src
+  in
+  match src with
+  | Expr.BinOp (Pplus, Var _, Const (Int i)) -> i
+  | _ -> Logging.die InternalError "unexpected src format"

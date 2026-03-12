@@ -409,7 +409,87 @@ let state_is_freed_expr id state =
   in
   curr_freed || miss_freed
 
+
 (* ==================== heap predicate helpers ==================== *)
+
+(** Intermediate result of block splitting *)
+type block_split_res =
+  | ExpExactMatch of Expr.t (* new cell matched some existing ExpPointsTo with destination expression *)
+  | BlockExactMatch of { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } (* new cell matched exactly some BlockPointsTo | UniformBlockPointsTo *)
+  | BlockEdgeMatch of { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } (* new cell matched the edge of some BlockPointsTo | UniformBlockPointsTo *)
+  | BlockMiddleMatch of { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } (* new cell matched the middle of some BlockPointsTo | UniformBlockPointsTo *)
+
+let state_heap_try_store state hps lhs_var_id lhs_offset cell_size =
+  let is_exact_match src size =
+    match src, size with
+    | Expr.BinOp (Pplus, Var _, Const (Int off)),
+      Expr.Const (Int size)
+        when Int64.equal off lhs_offset &&
+          Int64.equal size cell_size -> true
+    | _ -> false
+  in
+  let is_partial_match_eq_offset src size =
+    match src, size with
+    | Expr.BinOp (Pplus, Var _, Const (Int off)),
+      Expr.Const (Int size)
+        when Int64.equal off lhs_offset &&
+          (Int64.compare size cell_size ) >= 0 -> true
+    | _ -> false
+  in
+  let rec try_store = function
+    | [] -> None
+    | ExpPointsTo (src, size, dest) :: _
+      when is_exact_match src size ->
+        Some (ExpExactMatch dest)
+    | ((BlockPointsTo (src, size)) as hp) :: _
+      when is_exact_match src size ->
+        let to_remove = hp in
+        let new_dest_id = Id.fresh () in
+        let to_add = [
+          ExpPointsTo (
+            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+            Expr.Const (Int cell_size),
+            Expr.Var new_dest_id) ]
+        in
+        Some (BlockExactMatch { to_remove; to_add; new_dest_id})
+    | ((BlockPointsTo (src, size)) as hp) :: _
+      when is_partial_match_eq_offset src size ->
+        let to_remove = hp in
+        let new_dest_id = Id.fresh () in
+        let to_add = [
+          ExpPointsTo (
+            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+            Expr.Const (Int cell_size),
+            Expr.Var new_dest_id) ;
+          BlockPointsTo (
+            Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+            Expr.Const (Int (* Stdlib.Int64.sub size *) cell_size)) ]
+        in
+        Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
+    | _ :: rest -> try_store rest
+  in
+  match try_store hps with
+  | Some _ -> [state]
+  | None -> [state]
+
+(** Traverses both current and missing heap predicates of [state], looking for:
+    ExpPointsTo (src, size, _) | BlockPointsTo (src, size) | UniformBlockPointsTo (src, size, _)
+    where src = (Var [var_id] + (num <= [var_offset])) and size >= [cell_size].
+    Resulting lists are ordered by src offset descending *)
+let state_heap_find_block_fragments state var_id var_offset cell_size =
+  let current, current_rest = Formula.heap_find_block_fragments
+    state.current.spatial var_id var_offset cell_size
+  in
+  let missing, missing_rest = Formula.heap_find_block_fragments
+    state.missing.spatial var_id var_offset cell_size
+  in
+  let sorted_current =
+    Formula.sort_heap_preds_by_offset_desc current
+  in
+  let sorted_missing =
+    Formula.sort_heap_preds_by_offset_desc missing
+  in
+  sorted_current, current_rest, sorted_missing, missing_rest
 
 (** Traverses both current and missing heap predicates of [state], looking for PointsToBlock (Var [id], size, dest) *)
 let state_heap_pred_find_block_points_to id state =

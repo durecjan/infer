@@ -413,6 +413,16 @@ module TransferFunctions2 = struct
     else
       [state]
 
+  and store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr state =
+    let curr_hps, curr_rest, miss_hps, miss_rest =
+      state_heap_find_block_fragments state lhs_var_id lhs_offset cell_size
+    in
+    match state_heap_try_store
+      state curr_hps lhs_var_id lhs_offset cell_size
+    with
+    | _ ->
+      [state]
+
   and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let open State in
     let open Formula in

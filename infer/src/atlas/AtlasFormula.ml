@@ -293,7 +293,7 @@ let rec find_pure_base_expr id = function
 (** Traverses pure constraints and looks for (End(Var [id])==exp) *)
 let rec find_pure_end_expr id = function
   | [] -> None
-  | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
+  | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.End, Expr.Var id'), exp) :: _
     when Id.equal id id' -> Some exp
   | _ :: rest -> find_pure_end_expr id rest
 
@@ -412,6 +412,11 @@ let heap_find_block_fragments spatial var_id var_offset cell_size =
         Id.equal id var_id && 
         (Int64.compare off var_offset) <= 0 &&
         (Int64.compare size cell_size) >= 0
+    | Expr.Var id,
+      Expr.Const (Int size) ->
+        Id.equal id var_id &&
+        (Int64.compare 0L var_offset) <= 0 &&
+        (Int64.compare size cell_size) >= 0
     | _ -> false
   in
   Stdlib.List.partition
@@ -446,4 +451,16 @@ and points_to_src_offset hp =
   in
   match src with
   | Expr.BinOp (Pplus, Var _, Const (Int i)) -> i
+  | Expr.Var _ -> 0L
   | _ -> Logging.die InternalError "unexpected src format"
+
+(** Determines whether heap predicates are equal using [Expr.equal] *)
+let heap_pred_equal a b =
+  match a, b with
+  | BlockPointsTo (src1, size1), BlockPointsTo (src2, size2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2
+  | ExpPointsTo (src1, size1, dest1), ExpPointsTo (src2, size2, dest2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal dest1 dest2
+  | UniformBlockPointsTo (src1, size1, value1), UniformBlockPointsTo (src2, size2, value2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal value1 value2
+  | _ -> false

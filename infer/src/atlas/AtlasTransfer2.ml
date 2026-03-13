@@ -294,15 +294,17 @@ module TransferFunctions2 = struct
 
   and exec_store_deref loc instr tenv lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let cell_size = typ_size_of tenv lhs_typ in
+    let byte_offset = Stdlib.Int64.mul lhs_offset cell_size in
+    Format.print_string ("[Info]: computed byte offset of " ^ Int64.to_string byte_offset ^ "\n");
     [state]
     |> concat_map_ok_states
       (dereference_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
-      (exec_deref_check_base loc instr lhs_var_id lhs_offset)
+      (exec_deref_check_base loc instr lhs_var_id byte_offset)
     |> concat_map_ok_states
-      (exec_deref_check_end loc instr lhs_var_id lhs_offset cell_size)
+      (exec_deref_check_end loc instr lhs_var_id byte_offset cell_size)
     |> concat_map_ok_states
-      (exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr)
+      (store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id byte_offset cell_size rhs_expr)
   
   and concat_map_ok_states f states = 
     let open State in
@@ -313,8 +315,10 @@ module TransferFunctions2 = struct
     states
 
   and dereference_check_freed loc instr var_id state =
-    if state_is_freed_expr var_id state then
+    if state_is_freed_expr var_id state then begin
+      Format.print_string "[Error]: exec_store failed with: memory block is freed\n";
       [{ state with status = Error (None, loc, instr)}]
+      end
     else [state]
 
   and exec_deref_check_base loc instr var_id offset state =
@@ -344,9 +348,11 @@ module TransferFunctions2 = struct
   and dereference_check_lower_bound loc instr base_exp is_current var_id offset state =
     let base_offset = expr_eval_offset base_exp var_id state in
     if (Int64.compare offset base_offset) < 0 then begin
-      if is_current then
+      if is_current then begin
+        Format.print_string "[Error]: exec_store failed with: offset of expression is lesser than lower bound\n";
         (* offset out of bounds *)
         [{ state with status = Error (None, loc, instr) }]
+        end
       else
         (* missing resource - we can lower the bound *)
         let to_remove = Expr.BinOp (Peq, UnOp (Base, Var var_id), base_exp) in
@@ -392,9 +398,11 @@ module TransferFunctions2 = struct
   and dereference_check_upper_bound loc instr end_expr is_current var_id offset cell_size state =
     let end_offset = expr_eval_offset end_expr var_id state in
     if (Int64.compare offset end_offset) > 0 then begin
-      if is_current then
+      if is_current then begin
         (* offset out of bounds *)
+        Format.print_string "[Error]: exec_store failed with: offset of expression is greater than upper bound \n";
         [{ state with status = Error (None, loc, instr) }]
+        end
       else
         (* missing resource - we can increase the bound *)
         let to_remove = Expr.BinOp (Peq, UnOp (End, Var var_id), end_expr) in
@@ -421,27 +429,89 @@ module TransferFunctions2 = struct
     let assign ?to_missing:(to_missing=false) state lhs_id lhs_expr =
       store_dereference_assign ~to_missing:to_missing state lhs_typ lhs_id lhs_expr rhs_norm
     in
+    let transfor_spatial to_remove from to_add rest =
+      let removed = Stdlib.List.filter
+          (fun hp -> not (heap_pred_equal hp to_remove))
+          from
+        in
+        List.append removed (List.append to_add rest)
+    in
     let curr_hps, curr_rest, miss_hps, miss_rest =
       state_heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
+    let curr_count = List.count curr_hps ~f:(fun _ -> true) in
+    let miss_count = List.count miss_hps ~f:(fun _ -> true) in
+    Format.print_string (
+      "[Block_fragments] - found " ^
+      Int.to_string curr_count ^
+      " in state.current ; found " ^
+      Int.to_string miss_count ^
+      " in state.missing\n"
+    );
+    Format.print_string (
+      "[LHS] - typ=" ^ Typ.to_string lhs_typ ^ " ; id=" ^ Int.to_string lhs_var_id ^ " ; offset=" ^ Int64.to_string lhs_offset ^ "\n"
+    );
     match try_block_split curr_hps with
     | Some block_split_res ->
       begin match block_split_res with
-      | ExpExactMatch dest -> [state] (* TODO RETURN HERE *)
+      | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest } ->
+        let spatial =
+          transfor_spatial to_remove curr_hps to_add curr_rest
+        in
+        let types =
+          VarIdMap.add new_dest_id lhs_typ state.types
+        in
+        let state =
+          { state with current = { state.current with spatial }; types }
+        in
+        [subst_apply ~from_:old_dest ~to_:(Expr.Var new_dest_id) state]
       | BlockExactMatch { to_remove; to_add; new_dest_id }
       | BlockEdgeMatch { to_remove; to_add; new_dest_id }
       | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
-        [state]
+        let spatial =
+          transfor_spatial to_remove curr_hps to_add curr_rest
+        in
+        let state =
+          { state with current = { state.current with spatial } }
+        in
+        let lhs_expr = Expr.Var new_dest_id in
+        assign state new_dest_id lhs_expr
       end
     | None ->
       begin match try_block_split miss_hps with
       | Some block_split_res ->
         begin match block_split_res with
-        | ExpExactMatch dest -> [state]
+        | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest } ->
+          let spatial =
+            transfor_spatial to_remove miss_hps to_add miss_rest
+          in
+          let types =
+            VarIdMap.add new_dest_id lhs_typ state.types
+          in
+          let state =
+            { state with current = { state.missing with spatial }; types }
+          in
+          [subst_apply ~from_:old_dest ~to_:(Expr.Var new_dest_id) state]
+          (*  TODO FIX ME RETURN HERE: this is bullshit we are not assigning anything
+              also other cases are faulty, after we create the new cell and modify state
+              we should be in the same scenario of (address assignment or simple assignemnt)
+              as we have in the base cases of exec_store_instr, we need to consider the type
+              if type is pointer and at the same time if rhs is Lvar | Var we follow
+              substitution as in address assignment, otherwise we fallback to assignement
+              at the same time we need to figure out what shall be done with old_dest 
+              important!: the part of address assignment needs to be implement even for
+              Block*Match cases*)
         | BlockExactMatch { to_remove; to_add; new_dest_id }
         | BlockEdgeMatch { to_remove; to_add; new_dest_id }
         | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
-          [state]
+          let spatial =
+            transfor_spatial to_remove miss_hps to_add miss_rest
+          in
+          let state =
+            { state with missing = { state.missing with spatial } }
+          in
+          let lhs_expr = Expr.Var new_dest_id in
+          assign ~to_missing:true state new_dest_id lhs_expr 
       end
       | None ->
         (* missing resource *)
@@ -580,7 +650,7 @@ module TransferFunctions2 = struct
     let open Sil in
     match metadata with
     | VariableLifetimeBegins { pvar; typ = _; loc = _; is_cpp_structured_binding = _} ->
-      Format.print_string "\n[SIL_VARIABLE_LIFETIME_BEGINS]\n";
+      Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
       begin match
         lookup_variable_id (Var.of_pvar pvar) state.vars
       with
@@ -594,19 +664,19 @@ module TransferFunctions2 = struct
         "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
       end
     | ExitScope (_var_list, _loc) ->
-      Format.print_string "\n[SIL_EXIT_SCOPE]\n";
+      Format.print_string "[SIL_EXIT_SCOPE]\n";
       [state]
     | Nullify (_pvar, _loc) ->
-      Format.print_string "\n[SIL_NULLIFY]\n";
+      Format.print_string "[SIL_NULLIFY]\n";
       [state]
     | Skip ->
-      Format.print_string "\n[SIL_SKIP]\n";
+      Format.print_string "[SIL_SKIP]\n";
       [state]
     | LoopBackEdge _ ->
-      Format.print_string "\n[SIL_LOOPBACK_EDGE]\n";
+      Format.print_string "[SIL_LOOPBACK_EDGE]\n";
       [state]
     | LoopEntry _ ->
-      Format.print_string "\n[SIL_LOOP_ENTRY]\n";
+      Format.print_string "[SIL_LOOP_ENTRY]\n";
       [state]
     | _ ->
       [state]

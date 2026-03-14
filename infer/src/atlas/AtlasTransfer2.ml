@@ -69,7 +69,7 @@ module TransferFunctions2 = struct
     let _r = reporter_of_analysis analysis_data in
     let states = match instr with
     | Sil.Load { id; e; typ; loc } ->
-      let rhs_expr = sil_exp_to_expr e tenv state in
+      let rhs_expr = sil_exp_to_expr ~typ:typ e tenv state in
 
       Format.print_string (
         "[SIL_LOAD]\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
@@ -80,7 +80,7 @@ module TransferFunctions2 = struct
       Format.print_string (
         "[SIL_STORE]\n[SIL_INSTR_LHS]: " ^ sil_exp_to_string e1 ^ "\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e2) ;
 
-      let lhs_expr = sil_exp_to_expr e1 tenv state in
+      let lhs_expr = sil_exp_to_expr ~typ:typ e1 tenv state in
       let rhs_expr = sil_exp_to_expr e2 tenv state in
 
       Format.print_string (
@@ -88,9 +88,9 @@ module TransferFunctions2 = struct
 
       exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr state
     | Sil.Call
-      ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, _) :: _, _loc, _ )
+      ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, actual_typ) :: _, _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-          let actual_expr = sil_exp_to_expr actual tenv state in
+          let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
 
           Format.print_string (
             "[SIL_MALLOC]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
@@ -294,17 +294,15 @@ module TransferFunctions2 = struct
 
   and exec_store_deref loc instr tenv lhs_typ lhs_var_id lhs_offset rhs_expr state =
     let cell_size = typ_size_of tenv lhs_typ in
-    let byte_offset = Stdlib.Int64.mul lhs_offset cell_size in
-    Format.print_string ("[Info]: computed byte offset of " ^ Int64.to_string byte_offset ^ "\n");
     [state]
     |> concat_map_ok_states
       (dereference_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
-      (exec_deref_check_base loc instr lhs_var_id byte_offset)
+      (exec_deref_check_base loc instr lhs_var_id lhs_offset)
     |> concat_map_ok_states
-      (exec_deref_check_end loc instr lhs_var_id byte_offset cell_size)
+      (exec_deref_check_end loc instr lhs_var_id lhs_offset cell_size)
     |> concat_map_ok_states
-      (store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id byte_offset cell_size rhs_expr)
+      (store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr)
   
   and concat_map_ok_states f states = 
     let open State in

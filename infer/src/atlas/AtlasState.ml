@@ -671,7 +671,7 @@ let state_heap_pred_find_exp_points_to src state =
     If a known variable is encountered, it's canonical Id
     is used in the conversion. If the variable is unknown,
     it is converted as Expr.Undef *)
-let rec sil_exp_to_expr e tenv s =
+let rec sil_exp_to_expr ?typ e tenv s =
   match e with
     Exp.Cast (_, inner) -> sil_exp_to_expr inner tenv s
   | Exp.Const c -> sil_const_exp_to_expr c
@@ -692,6 +692,17 @@ let rec sil_exp_to_expr e tenv s =
     let exp' = sil_exp_to_expr exp tenv s in
     let op' = sil_unop_exp_to_expr op in
     Expr.UnOp (op', exp')
+  | Exp.BinOp ((Binop.PlusPI | Binop.MinusPI) as op, e1, e2)
+    when Option.is_some typ ->
+      let typ_size = match typ with
+        | Some t -> typ_size_of tenv t
+        | None -> 1L
+      in
+      let lhs = sil_exp_to_expr e1 tenv s in
+      let rhs = sil_exp_to_expr e2 tenv s in
+      let op' = sil_binop_exp_to_expr op in
+      (* if lhs is pointer then TODO make sure pointer is always lhs *)
+      Expr.BinOp (op', lhs, Expr.BinOp (Expr.Pmult, rhs, Const (Int typ_size)))
   | Exp.BinOp ((Binop.Gt | Binop.Ge) as op, e1, e2) ->
     let lhs = sil_exp_to_expr e1 tenv s in
     let rhs = sil_exp_to_expr e2 tenv s in

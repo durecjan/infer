@@ -130,7 +130,7 @@ module TransferFunctions2 = struct
     if is_sil_dereference rhs then
       match expr_base_and_offset rhs_expr state with
       | Some (rhs_id, off) ->
-          exec_load_deref loc instr lhs_id tenv typ rhs_id off state
+          exec_load_deref_ loc instr tenv typ lhs_id rhs_id off state
       | None ->
         Logging.die InternalError
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
@@ -143,7 +143,7 @@ module TransferFunctions2 = struct
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
           Logging.die InternalError
-          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+          "[Error] method is_sil_address_assign returned true but no base pointer variable found"
       else
         let rhs_norm = expr_normalize rhs_expr state in
         assign_to_variable lhs_id rhs_norm state
@@ -167,6 +167,70 @@ module TransferFunctions2 = struct
       in
       [{ state with current }]
   
+  and exec_load_deref_ loc instr tenv rhs_typ lhs_id rhs_var_id rhs_offset state =
+    (* TODO rethink - can it be something else than 8L (pointer) ? *)
+    let cell_size = typ_size_of tenv rhs_typ in
+    [state]
+    |> concat_map_ok_states
+      (dereference_check_freed loc instr rhs_var_id)
+    |> concat_map_ok_states
+      (exec_deref_check_base loc instr rhs_var_id rhs_offset)
+    |> concat_map_ok_states
+      (exec_deref_check_end loc instr rhs_var_id rhs_offset cell_size)
+    |> concat_map_ok_states
+      (load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size)
+
+  and load_dereference_try_match_heap_predicates _loc _instr lhs_id rhs_var_id rhs_offset cell_size state =
+    let current, _ = Formula.heap_find_block_fragments
+    state.current.spatial rhs_var_id rhs_offset cell_size
+    in
+    let missing, _ = Formula.heap_find_block_fragments
+      state.missing.spatial rhs_var_id rhs_offset cell_size
+    in
+    let is_exact_match src size =
+      match src, size with
+      | Expr.BinOp (Pplus, Var _, Const (Int off)),
+        Expr.Const (Int size')
+          when Int64.equal off rhs_offset ||
+          (* off <= rhs_offset already checked via heap_find_block_fragments *)
+          (Int64.compare
+            (Stdlib.Int64.add rhs_offset cell_size)
+            (Stdlib.Int64.add off size') <= 0) -> true
+      | Expr.Var _,
+        Expr.Const (Int size')
+          when Int64.equal 0L rhs_offset ||
+          (Int64.compare
+            (Stdlib.Int64.add rhs_offset cell_size)
+            (Stdlib.Int64.add 0L size') <= 0) -> true
+      | _ -> false
+    in
+    let rec find_points_to_dest = function
+      | [] -> None
+      | Formula.ExpPointsTo (src, size, dest) :: _
+        when is_exact_match src size ->
+          Some dest
+      | Formula.BlockPointsTo (src, size) :: _
+        when is_exact_match src size ->
+          Some Expr.Undef
+      | Formula.UniformBlockPointsTo (src, size, _) :: _
+        when is_exact_match src size ->
+          Some Expr.Undef
+      | _ :: rest -> find_points_to_dest rest
+    in
+    match find_points_to_dest current with
+    | Some Expr.Var id_of_dest ->
+      let subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst in
+      [ { state with subst; } ]
+    | Some _ | None ->
+      begin match find_points_to_dest missing with
+      | Some Expr.Var id_of_dest ->
+        let subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst in
+        [ { state with subst } ]
+      | Some _ | None ->
+        (* TODO FIX ME - what exactly should happen here ? *)
+        [state] (* missing resource *)
+      end
+
   (** Ids [lhs_id] and [rhs_id] must be canonical! *)
   and exec_load_deref loc instr lhs_id tenv rhs_typ rhs_id off state =
     let cell_size = typ_size_of tenv rhs_typ in

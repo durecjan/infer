@@ -452,17 +452,16 @@ module TransferFunctions2 = struct
     match try_block_split curr_hps with
     | Some block_split_res ->
       begin match block_split_res with
-      | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest } ->
+      | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest = _ } ->
+        (* TODO - what to do with old_dest ?? *)
         let spatial =
           transfor_spatial to_remove curr_hps to_add curr_rest
         in
-        let types =
-          VarIdMap.add new_dest_id lhs_typ state.types
-        in
         let state =
-          { state with current = { state.current with spatial }; types }
+          { state with current = { state.current with spatial } }
         in
-        [subst_apply ~from_:old_dest ~to_:(Expr.Var new_dest_id) state]
+        let lhs_expr = Expr.Var new_dest_id in
+        [ assign state new_dest_id lhs_expr ]
       | BlockExactMatch { to_remove; to_add; new_dest_id }
       | BlockEdgeMatch { to_remove; to_add; new_dest_id }
       | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
@@ -473,43 +472,32 @@ module TransferFunctions2 = struct
           { state with current = { state.current with spatial } }
         in
         let lhs_expr = Expr.Var new_dest_id in
-        assign state new_dest_id lhs_expr
+        [ assign state new_dest_id lhs_expr ]
       end
     | None ->
       begin match try_block_split miss_hps with
       | Some block_split_res ->
         begin match block_split_res with
-        | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest } ->
+        | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest = _ } ->
           let spatial =
             transfor_spatial to_remove miss_hps to_add miss_rest
           in
-          let types =
-            VarIdMap.add new_dest_id lhs_typ state.types
+          let state = 
+            { state with missing = { state.missing with spatial } }
           in
-          let state =
-            { state with current = { state.missing with spatial }; types }
-          in
-          [subst_apply ~from_:old_dest ~to_:(Expr.Var new_dest_id) state]
-          (*  TODO FIX ME RETURN HERE: this is bullshit we are not assigning anything
-              also other cases are faulty, after we create the new cell and modify state
-              we should be in the same scenario of (address assignment or simple assignemnt)
-              as we have in the base cases of exec_store_instr, we need to consider the type
-              if type is pointer and at the same time if rhs is Lvar | Var we follow
-              substitution as in address assignment, otherwise we fallback to assignement
-              at the same time we need to figure out what shall be done with old_dest 
-              important!: the part of address assignment needs to be implement even for
-              Block*Match cases*)
+          let lhs_expr = Expr.Var new_dest_id in
+          [ assign ~to_missing:true state new_dest_id lhs_expr ]
         | BlockExactMatch { to_remove; to_add; new_dest_id }
         | BlockEdgeMatch { to_remove; to_add; new_dest_id }
         | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
           let spatial =
             transfor_spatial to_remove miss_hps to_add miss_rest
           in
-          let state =
+          let state = 
             { state with missing = { state.missing with spatial } }
           in
           let lhs_expr = Expr.Var new_dest_id in
-          assign ~to_missing:true state new_dest_id lhs_expr 
+          [ assign ~to_missing:true state new_dest_id lhs_expr ]
       end
       | None ->
         (* missing resource *)
@@ -523,7 +511,7 @@ module TransferFunctions2 = struct
         in
         let spatial = missing_spatial :: state.missing.spatial in
         let state = { state with missing = { state.missing with spatial } } in
-        err_state :: assign ~to_missing:true state cell_id lhs_expr
+        err_state :: [ assign ~to_missing:true state cell_id lhs_expr ]
       end
 
   and exec_store_deref_check_heap_pred loc instr lhs_typ lhs_var_id lhs_offset rhs_expr state =
@@ -647,20 +635,24 @@ module TransferFunctions2 = struct
   and exec_metadata_instr metadata state =
     let open Sil in
     match metadata with
-    | VariableLifetimeBegins { pvar; typ = _; loc = _; is_cpp_structured_binding = _} ->
+    | VariableLifetimeBegins { pvar; typ; loc = _; is_cpp_structured_binding = _}
+      when not (is_pointer_type typ) ->
+        Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
+        begin match
+          lookup_variable_id (Var.of_pvar pvar) state.vars
+        with
+        | Some id ->
+          let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) in
+          let end_constr = Expr.BinOp (Peq, UnOp (End, Var id), Const (Int 0L)) in
+          let current = { state.current with
+            pure = base_constr :: end_constr :: state.current.pure } in
+          [{ state with current }]
+        | None -> Logging.die InternalError
+          "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
+        end
+    | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
       Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
-      begin match
-        lookup_variable_id (Var.of_pvar pvar) state.vars
-      with
-      | Some id ->
-        let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) in
-        let end_constr = Expr.BinOp (Peq, UnOp (End, Var id), Const (Int 0L)) in
-        let current = { state.current with
-          pure = base_constr :: end_constr :: state.current.pure } in
-        [{ state with current }]
-      | None -> Logging.die InternalError
-        "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
-      end
+      [state]
     | ExitScope (_var_list, _loc) ->
       Format.print_string "[SIL_EXIT_SCOPE]\n";
       [state]

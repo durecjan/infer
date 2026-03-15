@@ -127,17 +127,6 @@ let subst_expr_to_formula_expr = function
 (** Applies substitution [~from_] [~to_] over current and missing parts of [state].
     If [~to_] expression is found within a pure constraint or a heap predicate, a synthetic variable will take it's place *)
 let subst_apply ~from_ ~to_ state =
-  let placeholder = Expr.Var (Id.fresh ()) in
-  (* substitute [~to_] param for a placeholder first *)
-  let current_pure = subst_apply_to_pure ~from_:to_ ~to_:placeholder state.current.pure in
-  let missing_pure = subst_apply_to_pure ~from_:to_ ~to_:placeholder state.missing.pure in
-  let current_spatial = subst_apply_to_spatial ~from_:to_ ~to_:placeholder state.current.spatial in
-  let missing_spatial = subst_apply_to_spatial ~from_:to_ ~to_:placeholder state.missing.spatial in
-  let state = { state with 
-    current = { pure = current_pure; spatial = current_spatial };
-    missing = { pure = missing_pure; spatial = missing_spatial} }
-  in
-  (* then apply given substitution *)
   let current_pure = subst_apply_to_pure ~from_:from_ ~to_:to_ state.current.pure in
   let missing_pure = subst_apply_to_pure ~from_:from_ ~to_:to_ state.missing.pure in
   let current_spatial = subst_apply_to_spatial ~from_:from_ ~to_:to_ state.current.spatial in
@@ -455,22 +444,35 @@ let state_is_freed_expr id state =
 
 (** Adds expression ([lhs_expr] == [rhs_expr]) to pure constraints of current or missing part of [state], based on [to_missing].
     Also updates [state.types] with [lhs_typ] *)
-let store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lhs_id lhs_expr rhs_expr =
+let rec store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lhs_id lhs_expr rhs_expr =
   let types = VarIdMap.add lhs_id lhs_typ state.types in
-  let pure_part =
-    Expr.BinOp (Peq, lhs_expr, rhs_expr) ::
-    Expr.BinOp (Peq, UnOp (Base, Var lhs_id), Const (Int 0L)) ::
-    Expr.BinOp (Peq, UnOp (End, Var lhs_id), Const (Int 0L)) ::
-    []
-  in
-  let pure = List.append
-    pure_part
-    (if to_missing then state.missing.pure else state.current.pure)
-  in
-  if to_missing then
-    [{ state with types; missing = { state.missing with pure } }]
+  if is_pointer_type lhs_typ then
+    store_dereference_address_assign { state with types } lhs_expr rhs_expr
   else
-    [{ state with types; current = { state.current with pure } }]
+    let pure_part =
+      Expr.BinOp (Peq, lhs_expr, rhs_expr) ::
+      Expr.BinOp (Peq, UnOp (Base, Var lhs_id), Const (Int 0L)) ::
+      [ Expr.BinOp (Peq, UnOp (End, Var lhs_id), Const (Int 0L)) ]
+    in
+    let pure = List.append
+      pure_part
+      (if to_missing then state.missing.pure else state.current.pure)
+    in
+    if to_missing then
+      { state with types; missing = { state.missing with pure } }
+    else
+      { state with types; current = { state.current with pure } }
+
+and store_dereference_address_assign state lhs_expr rhs_expr =
+  match expr_base_and_offset rhs_expr state with
+  | Some (rhs_id, rhs_offset) ->
+    let rhs_canonical = canonical_expr state.subst rhs_id rhs_offset in
+    let rhs_norm = expr_normalize (subst_expr_to_formula_expr rhs_canonical) state in
+    let lhs_norm = expr_normalize lhs_expr state in
+    subst_apply ~from_:rhs_norm ~to_:lhs_norm state
+  | None ->
+    Logging.die InternalError
+      "[Error] store_dereference_address_assign - failed to found base pointer variable"
 
 
 (* ==================== heap predicate helpers ==================== *)

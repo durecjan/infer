@@ -180,147 +180,67 @@ module TransferFunctions2 = struct
     |> concat_map_ok_states
       (load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size)
 
-  and load_dereference_try_match_heap_predicates _loc _instr lhs_id rhs_var_id rhs_offset cell_size state =
-    let current, _ = Formula.heap_find_block_fragments
-    state.current.spatial rhs_var_id rhs_offset cell_size
+  and load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size state =
+    let curr_hps, curr_rest, miss_hps, miss_rest =
+      state_heap_find_block_fragments state rhs_var_id rhs_offset cell_size
     in
-    let missing, _ = Formula.heap_find_block_fragments
-      state.missing.spatial rhs_var_id rhs_offset cell_size
+    let try_match hps =
+      state_heap_try_match hps rhs_var_id rhs_offset cell_size
     in
-    let is_exact_match src size =
-      match src, size with
-      | Expr.BinOp (Pplus, Var _, Const (Int off)),
-        Expr.Const (Int size')
-          when Int64.equal off rhs_offset ||
-          (* off <= rhs_offset already checked via heap_find_block_fragments *)
-          (Int64.compare
-            (Stdlib.Int64.add rhs_offset cell_size)
-            (Stdlib.Int64.add off size') <= 0) -> true
-      | Expr.Var _,
-        Expr.Const (Int size')
-          when Int64.equal 0L rhs_offset ||
-          (Int64.compare
-            (Stdlib.Int64.add rhs_offset cell_size)
-            (Stdlib.Int64.add 0L size') <= 0) -> true
-      | _ -> false
+    let transfor_spatial to_remove from to_add rest =
+      let removed = Stdlib.List.filter
+        (fun hp -> not (heap_pred_equal hp to_remove))
+        from
+      in
+      List.append removed (List.append to_add rest)
     in
-    let rec find_points_to_dest = function
-      | [] -> None
-      | Formula.ExpPointsTo (src, size, dest) :: _
-        when is_exact_match src size ->
-          Some dest
-      | Formula.BlockPointsTo (src, size) :: _
-        when is_exact_match src size ->
-          Some Expr.Undef
-      | Formula.UniformBlockPointsTo (src, size, _) :: _
-        when is_exact_match src size ->
-          Some Expr.Undef
-      | _ :: rest -> find_points_to_dest rest
-    in
-    match find_points_to_dest current with
-    | Some Expr.Var id_of_dest ->
-      let subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst in
-      [ { state with subst; } ]
-    | Some _ | None ->
-      begin match find_points_to_dest missing with
-      | Some Expr.Var id_of_dest ->
+    let handle_match_result match_res hps rest ~is_missing state =
+      match match_res with
+      | MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
         let subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst in
-        [ { state with subst } ]
-      | Some _ | None ->
-        (* TODO FIX ME - what exactly should happen here ? *)
-        [state] (* missing resource *)
-      end
-
-  (** Ids [lhs_id] and [rhs_id] must be canonical! *)
-  and exec_load_deref loc instr lhs_id tenv rhs_typ rhs_id off state =
-    let cell_size = typ_size_of tenv rhs_typ in
-    [state]
-    |> concat_map_ok_states
-      (dereference_check_freed loc instr rhs_id)
-    |> concat_map_ok_states
-      (exec_deref_check_base loc instr rhs_id off)
-    |> concat_map_ok_states
-      (exec_deref_check_end loc instr rhs_id off cell_size)
-    |> concat_map_ok_states
-      (exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off)
-  
-  and exec_load_deref_check_heap_pred loc instr lhs_id rhs_id off state =
-    let open State in
-    let open Formula in
-    match state_heap_pred_find_block_points_to rhs_id state with
-    | Some BlockPointsTo (_, size) ->
-      if (Int64.compare off 0L) <> 0 then
-        (* check offset *)
-        exec_load_deref_check_offset loc instr lhs_id rhs_id off size state
-      else
-        exec_load_deref_assign loc instr lhs_id rhs_id off state
-    | _ ->
-      (* missing resource *)
-      let err_state = { state with
-        status = Error (None, loc, instr) }
-      in
-      let missing_part =
-        BlockPointsTo (Expr.Var rhs_id, Expr.Undef)
-      in
-      let spatial = missing_part :: state.missing.spatial in
-      let ok_state = { state with
-        missing = { state.missing with spatial } }
-      in
-      (* only check non-zero offset *)
-      if (Int64.compare off 0L) <> 0 then begin
-        [err_state; ok_state]
-        |> concat_map_ok_states
-          (exec_load_deref_check_offset loc instr lhs_id rhs_id off Expr.Undef)
-      end else
-        [err_state; ok_state]
-        |> concat_map_ok_states
-          (exec_load_deref_assign loc instr lhs_id rhs_id off)
-
-  and exec_load_deref_check_offset loc instr lhs_id rhs_id rhs_offset block_size state =
-    let open State in
-    if (Int64.compare rhs_offset 0L) < 0 then
-      (* offset out of bounds *)
-      [{ state with
-        status = Error (None, loc, instr) }]
-    else begin
-      match eval_state_expr_to_int64_opt block_size state with
-      | Some s when (Int64.compare rhs_offset s) > 0 ->
-        (* offset out of bounds *)
-        [{ state with
-          status = Error (None, loc, instr) }]
-      | _ ->
-        (* correct *)
-        exec_load_deref_assign loc instr lhs_id rhs_id rhs_offset state
-      end
-
-  and exec_load_deref_assign loc instr lhs_id rhs_id rhs_offset state =
-    let open State in
-    let src =
-      Expr.BinOp (Pplus, Var rhs_id, Const (Int rhs_offset))
+        [{ state with subst }]
+      | MatchExpExact { matched = _; dest } ->
+        let exp = Expr.BinOp (Peq, Var lhs_id, dest) in
+        let current = { state.current with pure = exp :: state.current.pure } in
+        [{ state with current }]
+      | MatchBlockSplit block_split_res ->
+        let { to_remove; to_add; new_dest_id } = match block_split_res with
+          | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
+          | BlockExactMatch args
+          | BlockEdgeMatch args
+          | BlockMiddleMatch args -> args
+        in
+        let spatial = transfor_spatial to_remove hps to_add rest in
+        let state =
+          if is_missing then
+            { state with missing = { state.missing with spatial } }
+          else
+            { state with current = { state.current with spatial } }
+        in
+        let subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst in
+        [{ state with subst }]
     in
-    match state_heap_pred_find_exp_points_to src state with
-    | Some ExpPointsTo (_, _, Var cell_id) ->
-      [(subst_add ~from_:lhs_id ~to_:cell_id state)]
-    | _ ->
-      (* missing resource *)
-      (* also it is possible it's a uniform block created by calloc() *)
-      let cell_id = Id.fresh () in
-      let missing_part =
-        Formula.ExpPointsTo (src, Undef, Var cell_id)
-      in
-      let current_part = 
-        Expr.BinOp (Peq, Var cell_id, Undef)
-      in
-      let ok_state = { state with
-        missing = { state.missing with
-          spatial = missing_part :: state.missing.spatial };
-        current = { state.current with
-          pure = current_part :: state.current.pure } }
-      in
-      let error_state = { state with
-        status = Error (None, loc, instr) }
-      in
-      [error_state; ok_state]
+    match try_match curr_hps with
+    | Some match_res ->
+      handle_match_result match_res curr_hps curr_rest ~is_missing:false state
+    | None ->
+      begin match try_match miss_hps with
+      | Some match_res ->
+        handle_match_result match_res miss_hps miss_rest ~is_missing:true state
+      | None ->
+        (* missing resource *)
+        let err_state = { state with status = Error (None, loc, instr) } in
+        let cell_id = Id.fresh () in
+        let missing_spatial = ExpPointsTo (
+          Expr.BinOp (Pplus, Var rhs_var_id, Const (Int rhs_offset)),
+          Expr.Const (Int cell_size),
+          Expr.Var cell_id)
+        in
+        let spatial = missing_spatial :: state.missing.spatial in
+        let state = { state with missing = { state.missing with spatial } } in
+        let subst = VarIdMap.add lhs_id (Var cell_id) state.subst in
+        [err_state; { state with subst }]
+      end
 
   and exec_store_instr loc instr tenv lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
@@ -641,8 +561,22 @@ module TransferFunctions2 = struct
     | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
       Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
       [state]
-    | ExitScope (_var_list, _loc) ->
+    | ExitScope (var_list, _loc) ->
       Format.print_string "[SIL_EXIT_SCOPE]\n";
+      let state = List.fold var_list ~init:state
+        ~f:(fun state var ->
+          match var with
+          | Var.LogicalVar ident ->
+            begin match lookup_variable_id (Var.of_id ident) state.vars with
+            | Some id ->
+              { state with
+                vars = VarIdMap.remove id state.vars;
+                types = VarIdMap.remove id state.types;
+                subst = VarIdMap.remove id state.subst }
+            | None -> state
+            end
+          | _ -> state)
+      in
       [state]
     | Nullify (_pvar, _loc) ->
       Format.print_string "[SIL_NULLIFY]\n";

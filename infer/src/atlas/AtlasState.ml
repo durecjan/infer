@@ -477,7 +477,7 @@ and store_dereference_address_assign state lhs_expr rhs_expr =
 
 (* ==================== heap predicate helpers ==================== *)
 
-type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t } 
+type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t }
 
 (** Intermediate result of block splitting *)
 type block_split_res =
@@ -485,6 +485,11 @@ type block_split_res =
   | BlockExactMatch of block_split_args (* new cell matched exactly some BlockPointsTo | UniformBlockPointsTo *)
   | BlockEdgeMatch of block_split_args (* new cell matched the edge of some BlockPointsTo | UniformBlockPointsTo *)
   | BlockMiddleMatch of block_split_args (* new cell matched the middle of some BlockPointsTo | UniformBlockPointsTo *)
+
+(** Result of heap match (used by load dereference) *)
+type heap_match_res =
+  | MatchExpExact of { matched: heap_pred; dest: Expr.t } (* exact ExpPointsTo match, dest is the existing value *)
+  | MatchBlockSplit of block_split_res (* block contains our cell, needs splitting *)
 
 let state_heap_try_block_split hps lhs_var_id lhs_offset cell_size =
   let eval_exp_exact_match to_remove src size dest =
@@ -622,6 +627,40 @@ let state_heap_try_block_split hps lhs_var_id lhs_offset cell_size =
     | _ :: rest -> try_block_split rest
   in
   try_block_split hps
+
+(** Traverses heap predicates [hps], looking for a match at [var_id]+[offset] of size [cell_size].
+    First tries to find an exact ExpPointsTo match (same offset and size), returning its destination directly.
+    If no exact match, falls back to block splitting via [state_heap_try_block_split]. *)
+let state_heap_try_match hps var_id offset cell_size =
+  let try_exp_exact_match hp src size dest =
+    match src, size with
+    | Expr.BinOp (Pplus, Var _, Const (Int off)),
+      Expr.Const (Int size')
+        when Int64.equal off offset &&
+          Int64.equal size' cell_size ->
+            Some (MatchExpExact { matched = hp; dest })
+    | Expr.Var _,
+      Expr.Const (Int size')
+        when Int64.equal 0L offset &&
+          Int64.equal size' cell_size ->
+            Some (MatchExpExact { matched = hp; dest })
+    | _ -> None
+  in
+  let rec try_match = function
+    | [] -> None
+    | (ExpPointsTo (src, size, dest)) as hp :: rest ->
+      begin match try_exp_exact_match hp src size dest with
+      | Some res -> Some res
+      | None -> try_match rest
+      end
+    | _ :: rest -> try_match rest
+  in
+  match try_match hps with
+  | Some _ as res -> res
+  | None ->
+    match state_heap_try_block_split hps var_id offset cell_size with
+    | Some split_res -> Some (MatchBlockSplit split_res)
+    | None -> None
 
 (** Traverses both current and missing heap predicates of [state], looking for:
     ExpPointsTo (src, size, _) | BlockPointsTo (src, size) | UniformBlockPointsTo (src, size, _)

@@ -526,13 +526,12 @@ module TransferFunctions2 = struct
       };
     }]
 
+  (* Note: free(NULL) is translated by SIL as Metadata.Skip, so we do not handle it here.
+     A NULL value stored in a variable (e.g. void* x = NULL; free(x);) would go through
+     the store/load sequence before reaching free, and would have been caught by dereference
+     checks earlier in execution. Skipping explicit NULL handling for now. *)
   and exec_free_instr loc instr _actual actual_expr state =
     let open State in
-    (*
-    match expr_normalize actual_expr state with
-    | Const (Ptr 0) | Const (Int 0L) -> 
-        [state] (* free(NULL); *)
-    | _ -> begin *)
     match expr_base_and_offset actual_expr state with
     | Some (base_id, offset) ->
       free_block loc instr base_id offset state
@@ -593,84 +592,49 @@ module TransferFunctions2 = struct
     | _ ->
       [state]
 
-    (** Marks block stored in pointer with [id] and offset [off] as freed. Reports any issues using [loc] *)
-    and free_block loc instr id off state =
+    (** Checks whether freeing pointer [id] at [offset] is valid and adds Freed constraint.
+        Steps: 1) check double free, 2) find Base constraint, 3) compare offsets *)
+    and free_block loc instr id offset state =
       let open State in
-      let open Formula in
-      let open Expr in
-      match heap_pred_take_opt id state.current.spatial with
-      | Some (((BlockPointsTo (source, _)) as hp), rest) ->
-        begin match has_error_exec_free loc instr off false (* TODO FIX ME find Freed() constraint *) state with
-          Some error -> error
-        | None ->
-          let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
-          let pure =
-            Expr.UnOp (Expr.Freed, source) :: state.current.pure
-          in
-          [{ state with
-            current = { spatial; pure } }]
-        end
-      (* duplicate code caused by heap_pred not being a record *)
-      | Some (((UniformBlockPointsTo (source, _, _)) as hp), rest) ->
-        begin match has_error_exec_free loc instr off false (* TODO FIX ME find Freed() constraint *) state with
-          Some error -> error
-        | None ->
-          let spatial = hp :: rest in (* TODO FIX ME - we do not need to take the hp *)
-          let pure =
-            Expr.UnOp (Expr.Freed, source) :: state.current.pure
-          in
-          [{ state with
-            current = { spatial; pure } }]
-        end
-      | Some _
-        (* Error: missing memory block *)
-      | None ->
-        (* Error: missing heap predicate *)
-        let pure =
-          BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) :: state.current.pure
-        in
-        let err_state = { state with
-          current = { state.current with pure };
-          status = Error (None, loc, instr) }
-        in
-        (* add id -> { block with freed = false } to missing *)
-        let missing_spatial_part =
-          BlockPointsTo (Var id, Const (Int Int64.max_value))
-        in
-        (* add Base(id) == id & End(id) == id + size to missing *)
-        let missing_pure_base_part, missing_pure_end_part = (
-          BinOp (Peq, UnOp (Base, Var id), Var id),
-          BinOp (Peq, UnOp (End, Var id), BinOp (Pplus, Var id, Const (Int Int64.max_value)))
-        ) in
-        (* add id -> { block with freed = true } to current *)
-        let current_part =
-          BlockPointsTo(Var id, Const (Int Int64.max_value))
-        in
-        let missing_part = add_heap_pred missing_spatial_part state.missing in
-        let missing =
-          { missing_part with
-            pure = missing_pure_base_part :: missing_pure_end_part :: missing_part.pure }
-        in
-        let current = {
-          spatial = current_part :: state.current.spatial;
-          pure = (Expr.UnOp (Expr.Freed, Expr.Var id)) :: state.current.pure }
-        in
-        err_state :: [{ state with current; missing }]
-
-    and has_error_exec_free loc instr var_off is_freed_block state = 
-      let open State in
-      if not (Int64.equal var_off 0L) then
-        (* Error: freeing memory address not returned by malloc *)
-        Some [{ state with
-          status = Error (None, loc, instr) }]
+      (* Step 1: check if already freed *)
+      if state_is_freed_expr id state then
+        (* double free *)
+        [{ state with status = Error (None, loc, instr) }]
       else
-        if is_freed_block then
-          (* Error: double free *)
-          Some [{ state with
-            status = Error (None, loc, instr) }]
+      (* Step 2: find Base(Var id) == some_exp *)
+      match state_find_pure_unop_eq_expr id Expr.Base state with
+      | Some (base_exp, _is_current) ->
+        if Formula.is_zero_expr base_exp then
+          (* Base(id) == 0 means no memory allocated *)
+          [{ state with status = Error (None, loc, instr) }]
         else
-          (* Ok *)
-          None
+          let base_offset = expr_eval_offset base_exp id state in
+          if Int64.equal base_offset offset then
+            (* happy path: offset matches base, add Freed to current *)
+            let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+            [{ state with current = { state.current with pure } }]
+          else
+            (* free called with non-base pointer, hard error *)
+            [{ state with status = Error (None, loc, instr) }]
+      | None ->
+        (* missing resource: no Base constraint found *)
+        let err_state = { state with status = Error (None, loc, instr) } in
+        let missing_base = Expr.BinOp (
+          Peq,
+          UnOp (Base, Var id),
+          BinOp (Pplus, Var id, Const (Int offset)))
+        in
+        let missing = { state.missing with
+          pure = missing_base :: state.missing.pure }
+        in
+        let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+        let ok_state = { state with
+          current = { state.current with pure };
+          missing }
+        in
+        (* Note: unmatched base_exp patterns (not BinOp/Var/Const(0)) are not possible
+           at this stage but will need handling once symbolic offsets are introduced *)
+        [err_state; ok_state]
 
 end
 

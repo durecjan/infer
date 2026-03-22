@@ -253,24 +253,45 @@ module TransferFunctions2 = struct
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
     else begin
       if is_sil_address_assign lhs && is_pointer_type lhs_typ then begin
-        match base_and_offset_of_expr lhs_expr state with
-        | Some (lhs_id, off) ->
-          let lhs_canonical = canonical_expr state.subst lhs_id off in
-          let lhs_norm = normalize_expr (subst_expr_to_formula_expr lhs_canonical) state in
+        match direct_id_of_sil_lvar lhs state with
+        | Some lhs_direct_id ->
           let rhs_norm = normalize_expr rhs_expr state in
-          let state = clear_before_subst lhs_id state in
-          (* it must be ensured rhs contains a temp variable~! *)
-          [(subst_apply ~from_:rhs_norm ~to_:lhs_norm state)]
+          begin match base_and_offset_of_expr rhs_norm state with
+          | Some (rhs_base_id, rhs_offset) ->
+            let rhs_canonical = canonical_expr state.subst rhs_base_id rhs_offset in
+            let rhs_canon_base = match rhs_canonical with
+              | Var id -> id | Ptr { base; _ } -> base
+            in
+            let is_temp = match VarIdMap.find_opt rhs_canon_base state.vars with
+              | Some var -> not (Var.is_pvar var)
+              | None -> false
+            in
+            let state = clear_before_subst lhs_direct_id state in
+            if is_temp then
+              (* RHS is a temp variable (e.g. malloc retval) — rename it in the formula
+                 so that the temp's formula entries become owned by the LHS variable *)
+              let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
+              let lhs_norm = Expr.Var lhs_direct_id in
+              [(subst_apply ~from_:rhs_norm ~to_:lhs_norm state)]
+            else
+              (* RHS is a program variable or internal id — record the alias in subst
+                 without modifying the formula, preserving the RHS variable's identity *)
+              [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
+          | None ->
+            Logging.die InternalError
+              "[Error] address assign: failed to extract base pointer from RHS"
+          end
         | None ->
           Logging.die InternalError
-            "[Error] method is_sil_address_assign returned true but no base pointer variable found"
+            "[Error] address assign: failed to extract direct variable id from LHS Lvar"
       end else
-        let rhs_norm = normalize_expr rhs_expr state in
-        let lhs_norm = normalize_expr lhs_expr state in
-        match lhs_norm with
-        | Var id ->
-          assign_to_variable id rhs_norm state
-        | _ ->
+        match direct_id_of_sil_lvar lhs state with
+        | Some lhs_direct_id ->
+          let rhs_norm = normalize_expr rhs_expr state in
+          assign_to_variable lhs_direct_id rhs_norm state
+        | None ->
+          let rhs_norm = normalize_expr rhs_expr state in
+          let lhs_norm = normalize_expr lhs_expr state in
           let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
           let current =
             { state.current with pure = exp :: state.current.pure }

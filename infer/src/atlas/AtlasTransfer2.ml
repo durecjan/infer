@@ -258,6 +258,7 @@ module TransferFunctions2 = struct
           let lhs_canonical = canonical_expr state.subst lhs_id off in
           let lhs_norm = normalize_expr (subst_expr_to_formula_expr lhs_canonical) state in
           let rhs_norm = normalize_expr rhs_expr state in
+          let state = clear_before_subst lhs_id state in
           (* it must be ensured rhs contains a temp variable~! *)
           [(subst_apply ~from_:rhs_norm ~to_:lhs_norm state)]
         | None ->
@@ -542,8 +543,7 @@ module TransferFunctions2 = struct
   and exec_metadata_instr metadata state =
     let open Sil in
     match metadata with
-    | VariableLifetimeBegins { pvar; typ; loc = _; is_cpp_structured_binding = _}
-      when not (is_pointer_type typ) ->
+    | VariableLifetimeBegins { pvar; typ = _; loc = _; is_cpp_structured_binding = _} ->
         Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
         begin match
           lookup_variable_id (Var.of_pvar pvar) state.vars
@@ -557,9 +557,6 @@ module TransferFunctions2 = struct
         | None -> Logging.die InternalError
           "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
         end
-    | VariableLifetimeBegins { pvar = _; typ = _; loc = _; is_cpp_structured_binding = _} ->
-      Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
-      [state]
     | ExitScope (var_list, _loc) ->
       Format.print_string "[SIL_EXIT_SCOPE]\n";
       let state = List.fold var_list ~init:state

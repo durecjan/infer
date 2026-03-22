@@ -117,6 +117,39 @@ let subst_apply ~from_ ~to_ state =
     current = { pure = current_pure; spatial = current_spatial };
     missing = { pure = missing_pure; spatial = missing_spatial} }
 
+(** Prepares [state] for an address substitution targeting [id].
+    Must be called before [subst_apply] when [id] is being reassigned to a new address.
+    Two-step process:
+    1. Removes stale [Base(id)==0] and [End(id)==0] constraints from both current and
+       missing pure — these were set on declaration and are no longer true after assignment.
+       New Base/End constraints will be established by the subsequent substitution.
+    2. Replaces all remaining occurrences of [Var id] in the formula with a fresh placeholder
+       variable via [subst_apply]. This preserves references to the old value of [id]
+       (e.g. memory that was reachable through [id] but not yet freed) so the formula
+       stays satisfiable after [id] is rebound to a new address. *)
+let clear_before_subst id state =
+  let is_base_or_end_zero_expr = function
+    | Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L))
+      when Id.equal id id' -> true
+    | Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L))
+      when Id.equal id id' -> true
+    | _ -> false
+  in
+  let current_pure = List.filter
+    ~f:(fun exp -> not (is_base_or_end_zero_expr exp))
+    state.current.pure
+  in
+  let missing_pure = List.filter
+    ~f:(fun exp -> not (is_base_or_end_zero_expr exp))
+    state.missing.pure
+  in
+  let state = { state with
+    current = { state.current with pure = current_pure };
+    missing = { state.missing with pure = missing_pure } }
+  in
+  let placeholder = Id.fresh () in
+  subst_apply ~from_:(Expr.Var id) ~to_:(Expr.Var placeholder) state
+
 
 (* ==================== Exp.t helpers ==================== *)
 
@@ -387,7 +420,7 @@ let is_freed_expr id state =
 let rec store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lhs_id lhs_expr rhs_expr =
   let types = VarIdMap.add lhs_id lhs_typ state.types in
   if is_pointer_type lhs_typ then
-    store_dereference_address_assign { state with types } lhs_expr rhs_expr
+    store_dereference_address_assign { state with types } lhs_id lhs_expr rhs_expr
   else
     let pure_part =
       Expr.BinOp (Peq, lhs_expr, rhs_expr) ::
@@ -403,14 +436,17 @@ let rec store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lh
     else
       { state with types; current = { state.current with pure } }
 
-(** Handles pointer-typed store dereference by extracting the RHS base+offset,
-    canonicalizing it, and applying a substitution so the RHS expression points to the LHS *)
-and store_dereference_address_assign state lhs_expr rhs_expr =
+(** Handles pointer-typed store dereference. Extracts the RHS base+offset,
+    canonicalizes it, then calls [clear_before_subst] on [lhs_id] to remove stale
+    Base/End==0 constraints and preserve old references via a placeholder.
+    Finally applies the substitution so the RHS expression maps to the LHS *)
+and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
   match base_and_offset_of_expr rhs_expr state with
   | Some (rhs_id, rhs_offset) ->
     let rhs_canonical = canonical_expr state.subst rhs_id rhs_offset in
     let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
     let lhs_norm = normalize_expr lhs_expr state in
+    let state = clear_before_subst lhs_id state in
     subst_apply ~from_:rhs_norm ~to_:lhs_norm state
   | None ->
     Logging.die InternalError

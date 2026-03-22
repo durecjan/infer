@@ -413,11 +413,30 @@ let is_freed_expr id state =
   in
   curr_freed || miss_freed
 
+(** Result of [store_dereference_assign], distinguishing scalar vs pointer stores.
+    For pointer stores, the canonical RHS expression used in substitution is returned
+    so that callers can update separated heap predicates (those not present in the
+    formula during [subst_apply]) via [Formula.expr_replace].
+
+    This is necessary because block splitting separates the new [ExpPointsTo] from the
+    formula before [store_dereference_assign] runs — so [subst_apply] never reaches it.
+    In the self-referential case (e.g. [*p = p]), the separated predicate's source
+    contains the expression being substituted and must be fixed up manually *)
+type store_deref_assign_res =
+  | ValueStored of t
+      (** Scalar value stored. Pure equality constraints added, no substitution
+          performed — separated heap predicates need no fixup *)
+  | AddressStored of { state: t; canonical_rhs: Expr.t }
+      (** Pointer address stored. [state] has substitution applied via
+          [clear_before_subst] + [subst_apply]. [canonical_rhs] is the normalized
+          canonical RHS expression that was substituted — use as the [~old_] argument
+          to [Formula.expr_replace] when fixing up separated heap predicates *)
+
 (** Assigns [rhs_expr] to [lhs_expr] during store dereference.
     For non-pointer types: adds (lhs == rhs) equality and zero Base/End constraints to pure.
     For pointer types: delegates to [store_dereference_address_assign] which updates substitutions.
-    Targets current or missing formula based on [to_missing] *)
-let rec store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lhs_id lhs_expr rhs_expr =
+    Returns [store_deref_assign_res] so callers can handle separated heap predicates correctly *)
+let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr =
   let types = VarIdMap.add lhs_id lhs_typ state.types in
   if is_pointer_type lhs_typ then
     store_dereference_address_assign { state with types } lhs_id lhs_expr rhs_expr
@@ -427,19 +446,14 @@ let rec store_dereference_assign ?to_missing:(to_missing=false) state lhs_typ lh
       Expr.BinOp (Peq, UnOp (Base, Var lhs_id), Const (Int 0L)) ::
       [ Expr.BinOp (Peq, UnOp (End, Var lhs_id), Const (Int 0L)) ]
     in
-    let pure = List.append
-      pure_part
-      (if to_missing then state.missing.pure else state.current.pure)
-    in
-    if to_missing then
-      { state with types; missing = { state.missing with pure } }
-    else
-      { state with types; current = { state.current with pure } }
+    let pure = List.append pure_part state.current.pure in
+    ValueStored { state with types; current = { state.current with pure } }
 
 (** Handles pointer-typed store dereference. Extracts the RHS base+offset,
     canonicalizes it, then calls [clear_before_subst] on [lhs_id] to remove stale
     Base/End==0 constraints and preserve old references via a placeholder.
-    Finally applies the substitution so the RHS expression maps to the LHS *)
+    Finally applies the substitution so the RHS expression maps to the LHS.
+    Returns [AddressStored] with the canonical RHS used in substitution *)
 and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
   match base_and_offset_of_expr rhs_expr state with
   | Some (rhs_id, rhs_offset) ->
@@ -447,15 +461,17 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
     let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
     let lhs_norm = normalize_expr lhs_expr state in
     let state = clear_before_subst lhs_id state in
-    subst_apply ~from_:rhs_norm ~to_:lhs_norm state
+    AddressStored {
+      state = subst_apply ~from_:rhs_norm ~to_:lhs_norm state;
+      canonical_rhs = rhs_norm }
   | None ->
     Logging.die InternalError
-      "[Error] store_dereference_address_assign - failed to found base pointer variable"
+      "[Error] store_dereference_address_assign - failed to find base pointer variable"
 
 
 (* ==================== heap predicate helpers ==================== *)
 
-type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_dest_id: Id.t }
+type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_exp_points_to: heap_pred ; new_dest_id: Id.t }
 
 (** Intermediate result of block splitting *)
 type block_split_res =
@@ -476,11 +492,11 @@ type heap_match_res =
 let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
   let eval_exp_exact_match to_remove src size dest =
     let new_dest_id = Id.fresh () in
-    let to_add = 
-      [ ExpPointsTo (src, size, Expr.Var (new_dest_id)) ]
+    let new_exp_points_to = 
+      ExpPointsTo (src, size, Expr.Var (new_dest_id))
     in
     let block_split_args =
-      { to_remove; to_add; new_dest_id }
+      { to_remove; to_add = []; new_exp_points_to; new_dest_id }
     in 
     Some (ExpExactMatch { block_split_args; old_dest = dest })
   in
@@ -500,13 +516,13 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
   in
   let eval_block_exact_match to_remove =
     let new_dest_id = Id.fresh () in
-    let to_add = [
+    let new_exp_points_to =
       ExpPointsTo (
         Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
         Expr.Const (Int cell_size),
-        Expr.Var new_dest_id) ]
+        Expr.Var new_dest_id)
     in
-    Some (BlockExactMatch { to_remove; to_add; new_dest_id})
+    Some (BlockExactMatch { to_remove; to_add = []; new_exp_points_to; new_dest_id})
   in
   let try_block_exact_match hp src size =
     match src, size with
@@ -524,16 +540,18 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
   in
   let eval_block_left_edge_match to_remove fragment_size =
     let new_dest_id = Id.fresh () in
-    let to_add = [
+    let new_exp_points_to =
       ExpPointsTo (
         Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
         Expr.Const (Int cell_size),
-        Expr.Var new_dest_id) ;
+        Expr.Var new_dest_id)
+    in
+    let to_add = [
       BlockPointsTo (
         Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
         Expr.Const (Int (Stdlib.Int64.sub fragment_size cell_size))) ]
     in
-    Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
+    Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
   in
   let try_block_left_edge_match hp src size =
     match src, size with
@@ -551,7 +569,7 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
   in
   let eval_block_right_edge_or_middle_match to_remove fragment_size fragment_offset =
     let new_dest_id = Id.fresh () in
-    let to_add_new_cell = ExpPointsTo (
+    let new_exp_points_to = ExpPointsTo (
       Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
       Expr.Const (Int cell_size),
       Expr.Var new_dest_id)
@@ -565,16 +583,15 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
     in
     if (Int64.compare fragment_size lef_and_middle_size) > 0 then
       let to_add = [
-        to_add_new_cell;
         to_add_left_block;
         BlockPointsTo (
           Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset fragment_offset))),
           Expr.Const (Int (Stdlib.Int64.sub fragment_size lef_and_middle_size))) ]
       in
-      Some (BlockMiddleMatch { to_remove; to_add; new_dest_id })
+      Some (BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
     else
-      let to_add = [ to_add_new_cell; to_add_left_block ] in
-      Some (BlockEdgeMatch { to_remove; to_add; new_dest_id })
+      let to_add = [ to_add_left_block ] in
+      Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
   in
   let try_block_right_edge_or_middle_match hp src size =
     match src, size with

@@ -600,15 +600,15 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
       Expr.BinOp (Pplus, Var lhs_var_id, Const (Int fragment_offset)),
       Expr.Const (Int (Stdlib.Int64.sub lhs_offset fragment_offset)))
     in
-    let lef_and_middle_size =
+    let left_and_middle_size =
       Stdlib.Int64.add (Stdlib.Int64.sub lhs_offset fragment_offset) cell_size
     in
-    if (Int64.compare fragment_size lef_and_middle_size) > 0 then
+    if (Int64.compare fragment_size left_and_middle_size) > 0 then
       let to_add = [
         to_add_left_block;
         BlockPointsTo (
-          Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset fragment_offset))),
-          Expr.Const (Int (Stdlib.Int64.sub fragment_size lef_and_middle_size))) ]
+          Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+          Expr.Const (Int (Stdlib.Int64.sub fragment_size left_and_middle_size))) ]
       in
       Some (BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
     else

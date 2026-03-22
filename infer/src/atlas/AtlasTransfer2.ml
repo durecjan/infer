@@ -409,8 +409,8 @@ module TransferFunctions2 = struct
     let try_block_split hps =
       State.heap_try_block_split hps lhs_var_id lhs_offset cell_size
     in
-    let assign ?to_missing:(to_missing=false) state lhs_id lhs_expr =
-      store_dereference_assign ~to_missing:to_missing state lhs_typ lhs_id lhs_expr rhs_norm
+    let assign state lhs_id lhs_expr =
+      store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_norm
     in
     let transfor_spatial to_remove from to_add rest =
       let removed = Stdlib.List.filter
@@ -434,55 +434,64 @@ module TransferFunctions2 = struct
     Format.print_string (
       "[LHS] - typ=" ^ Typ.to_string lhs_typ ^ " ; id=" ^ Int.to_string lhs_var_id ^ " ; offset=" ^ Int64.to_string lhs_offset ^ "\n"
     );
+    (** Applies block split result: removes the matched predicate, adds split fragments,
+        runs [store_dereference_assign], then fixes up the separated [new_exp_points_to]
+        using [canonical_rhs] from [AddressStored] if a pointer was stored *)
+    let handle_block_split_res ?(to_missing=false) to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
+      let spatial = transfor_spatial to_remove part to_add rest in
+      let state =
+        if to_missing then
+          { state with missing = { state.missing with spatial } }
+        else
+          { state with current = { state.current with spatial } }
+      in
+      let lhs_expr = Expr.Var new_dest_id in
+      let assign_res = assign state new_dest_id lhs_expr in
+      let state, new_exp_points_to = match assign_res with
+        | ValueStored state ->
+          (state, new_exp_points_to)
+        | AddressStored { state; canonical_rhs } ->
+          (* address was stored — fix up the separated ExpPointsTo using
+             the canonical RHS that subst_apply actually substituted *)
+          let src, size = match new_exp_points_to with
+            | ExpPointsTo (src, size, _) -> (src, size)
+            | _ -> Logging.die InternalError
+                     "handle_block_split_res: expected ExpPointsTo for new cell"
+          in
+          (state, ExpPointsTo (
+            Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr src,
+            Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr size,
+            Expr.Var new_dest_id))
+      in
+      let spatial = new_exp_points_to ::
+        (if to_missing then state.missing.spatial else state.current.spatial)
+      in
+      if to_missing then
+        [ { state with missing = { state.missing with spatial } } ]
+      else
+        [ { state with current = { state.current with spatial } } ]
+    in
     match try_block_split curr_hps with
     | Some block_split_res ->
       begin match block_split_res with
-      | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest = _ } ->
+      | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest = _ } ->
         (* TODO - what to do with old_dest ?? *)
-        let spatial =
-          transfor_spatial to_remove curr_hps to_add curr_rest
-        in
-        let state =
-          { state with current = { state.current with spatial } }
-        in
-        let lhs_expr = Expr.Var new_dest_id in
-        [ assign state new_dest_id lhs_expr ]
-      | BlockExactMatch { to_remove; to_add; new_dest_id }
-      | BlockEdgeMatch { to_remove; to_add; new_dest_id }
-      | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
-        let spatial =
-          transfor_spatial to_remove curr_hps to_add curr_rest
-        in
-        let state =
-          { state with current = { state.current with spatial } }
-        in
-        let lhs_expr = Expr.Var new_dest_id in
-        [ assign state new_dest_id lhs_expr ]
+        handle_block_split_res to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
+      | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
+      | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
+      | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->
+        handle_block_split_res to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
       end
     | None ->
       begin match try_block_split miss_hps with
       | Some block_split_res ->
         begin match block_split_res with
-        | ExpExactMatch { block_split_args = { to_remove; to_add; new_dest_id }; old_dest = _ } ->
-          let spatial =
-            transfor_spatial to_remove miss_hps to_add miss_rest
-          in
-          let state = 
-            { state with missing = { state.missing with spatial } }
-          in
-          let lhs_expr = Expr.Var new_dest_id in
-          [ assign ~to_missing:true state new_dest_id lhs_expr ]
-        | BlockExactMatch { to_remove; to_add; new_dest_id }
-        | BlockEdgeMatch { to_remove; to_add; new_dest_id }
-        | BlockMiddleMatch { to_remove; to_add; new_dest_id } ->
-          let spatial =
-            transfor_spatial to_remove miss_hps to_add miss_rest
-          in
-          let state = 
-            { state with missing = { state.missing with spatial } }
-          in
-          let lhs_expr = Expr.Var new_dest_id in
-          [ assign ~to_missing:true state new_dest_id lhs_expr ]
+        | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest = _ } ->
+          handle_block_split_res ~to_missing:true to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
+        | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
+        | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
+        | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->
+          handle_block_split_res ~to_missing:true to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
       end
       | None ->
         (* missing resource *)
@@ -494,9 +503,25 @@ module TransferFunctions2 = struct
           Expr.Const (Int cell_size),
           lhs_expr)
         in
+        let assign_res = assign state cell_id lhs_expr in
+        let state, missing_spatial = match assign_res with
+          | ValueStored state ->
+            (state, missing_spatial)
+          | AddressStored { state; canonical_rhs } ->
+            (* self-referential fix: update source/size of the separated ExpPointsTo *)
+            let src, size = match missing_spatial with
+              | ExpPointsTo (src, size, _) -> (src, size)
+              | _ -> Logging.die InternalError
+                       "missing resource: expected ExpPointsTo"
+            in
+            (state, ExpPointsTo (
+              Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr src,
+              Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr size,
+              lhs_expr))
+        in
         let spatial = missing_spatial :: state.missing.spatial in
-        let state = { state with missing = { state.missing with spatial } } in
-        err_state :: [ assign ~to_missing:true state cell_id lhs_expr ]
+        let ok_state = { state with missing = { state.missing with spatial } } in
+        [ err_state; ok_state ]
       end
 
   and exec_malloc_instr lhs typ actual state =

@@ -187,6 +187,28 @@ let rec is_sil_address_assign exp =
   | _ ->
     false
 
+(** Extracts the direct atlas variable id from a SIL [Lvar] expression without
+    following the substitution chain. Used for Store LHS in the non-dereference
+    case where we need the target variable's identity, not its current canonical
+    value. Returns [None] if no [Lvar] is found in the expression *)
+let direct_id_of_sil_lvar exp state =
+  let rec extract_pvar e =
+    match Exp.ignore_cast e with
+    | Exp.Lvar pvar -> Some pvar
+    | Exp.Lfield ({ exp; _ }, _, _) -> extract_pvar exp
+    | Exp.Lindex (exp, _) -> extract_pvar exp
+    | Exp.UnOp (_, exp, _) -> extract_pvar exp
+    | Exp.BinOp (_, e1, e2) ->
+      begin match extract_pvar e1 with
+      | Some p -> Some p
+      | None -> extract_pvar e2
+      end
+    | _ -> None
+  in
+  match extract_pvar exp with
+  | Some pvar -> Formula.lookup_variable_id (Var.of_pvar pvar) state.vars
+  | None -> None
+
 (* ==================== Expr.t helpers ==================== *)
 
 (** Extracts the single pointer-typed variable id and its evaluated byte offset from [expr].

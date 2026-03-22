@@ -128,7 +128,7 @@ module TransferFunctions2 = struct
       types = VarIdMap.add lhs_id typ state.types }
     in
     if is_sil_dereference rhs then
-      match expr_base_and_offset rhs_expr state with
+      match base_and_offset_of_expr rhs_expr state with
       | Some (rhs_id, off) ->
           exec_load_deref_ loc instr tenv typ lhs_id rhs_id off state
       | None ->
@@ -136,7 +136,7 @@ module TransferFunctions2 = struct
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
     else begin
       if is_sil_address_assign rhs && is_pointer_type typ then
-        match expr_base_and_offset rhs_expr state with
+        match base_and_offset_of_expr rhs_expr state with
         | Some (rhs_id, off) ->
           let rhs_canonical = canonical_expr state.subst rhs_id off in
           [{ state with
@@ -145,7 +145,7 @@ module TransferFunctions2 = struct
           Logging.die InternalError
           "[Error] method is_sil_address_assign returned true but no base pointer variable found"
       else
-        let rhs_norm = expr_normalize rhs_expr state in
+        let rhs_norm = normalize_expr rhs_expr state in
         assign_to_variable lhs_id rhs_norm state
     end
 
@@ -161,7 +161,7 @@ module TransferFunctions2 = struct
       else
         [{ state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
     | _ ->
-      let exp = Expr.BinOp (Peq, Var lhs_id, expr_normalize rhs state) in
+      let exp = Expr.BinOp (Peq, Var lhs_id, normalize_expr rhs state) in
       let current =
         { state.current with pure = exp :: state.current.pure }
       in
@@ -182,10 +182,10 @@ module TransferFunctions2 = struct
 
   and load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size state =
     let curr_hps, curr_rest, miss_hps, miss_rest =
-      state_heap_find_block_fragments state rhs_var_id rhs_offset cell_size
+      State.heap_find_block_fragments state rhs_var_id rhs_offset cell_size
     in
     let try_match hps =
-      state_heap_try_match hps rhs_var_id rhs_offset cell_size
+      State.heap_try_match hps rhs_var_id rhs_offset cell_size
     in
     let transfor_spatial to_remove from to_add rest =
       let removed = Stdlib.List.filter
@@ -245,7 +245,7 @@ module TransferFunctions2 = struct
   and exec_store_instr loc instr tenv lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
     if is_sil_dereference lhs then
-      match expr_base_and_offset lhs_expr state with
+      match base_and_offset_of_expr lhs_expr state with
       | Some (lhs_id, off) ->
           exec_store_deref loc instr tenv lhs_typ lhs_id off rhs_expr state
       | None ->
@@ -253,19 +253,19 @@ module TransferFunctions2 = struct
           "[Error] method is_sil_dereference returned true but no base pointer variable found"
     else begin
       if is_sil_address_assign lhs && is_pointer_type lhs_typ then begin
-        match expr_base_and_offset lhs_expr state with
+        match base_and_offset_of_expr lhs_expr state with
         | Some (lhs_id, off) ->
           let lhs_canonical = canonical_expr state.subst lhs_id off in
-          let lhs_norm = expr_normalize (subst_expr_to_formula_expr lhs_canonical) state in
-          let rhs_norm = expr_normalize rhs_expr state in
+          let lhs_norm = normalize_expr (subst_expr_to_formula_expr lhs_canonical) state in
+          let rhs_norm = normalize_expr rhs_expr state in
           (* it must be ensured rhs contains a temp variable~! *)
           [(subst_apply ~from_:rhs_norm ~to_:lhs_norm state)]
         | None ->
           Logging.die InternalError
             "[Error] method is_sil_address_assign returned true but no base pointer variable found"
       end else
-        let rhs_norm = expr_normalize rhs_expr state in
-        let lhs_norm = expr_normalize lhs_expr state in
+        let rhs_norm = normalize_expr rhs_expr state in
+        let lhs_norm = normalize_expr lhs_expr state in
         match lhs_norm with
         | Var id ->
           assign_to_variable id rhs_norm state
@@ -297,14 +297,14 @@ module TransferFunctions2 = struct
     states
 
   and dereference_check_freed loc instr var_id state =
-    if state_is_freed_expr var_id state then begin
+    if State.is_freed_expr var_id state then begin
       Format.print_string "[Error]: exec_store failed with: memory block is freed\n";
       [{ state with status = Error (None, loc, instr)}]
       end
     else [state]
 
   and exec_deref_check_base loc instr var_id offset state =
-    match state_find_pure_unop_eq_expr var_id Expr.Base state with
+    match State.lookup_pure_unop_eq_expr var_id Expr.Base state with
     | Some (e, _) when Formula.is_zero_expr e ->
       (* Base() == 0 *)
       [{ state with
@@ -328,7 +328,7 @@ module TransferFunctions2 = struct
       [ err_state; ok_state ]
 
   and dereference_check_lower_bound loc instr base_exp is_current var_id offset state =
-    let base_offset = expr_eval_offset base_exp var_id state in
+    let base_offset = eval_expr_offset base_exp var_id state in
     if (Int64.compare offset base_offset) < 0 then begin
       if is_current then begin
         Format.print_string "[Error]: exec_store failed with: offset of expression is lesser than lower bound\n";
@@ -354,7 +354,7 @@ module TransferFunctions2 = struct
       [state]
 
   and exec_deref_check_end loc instr var_id offset cell_size state =
-    match state_find_pure_unop_eq_expr var_id Expr.End state with
+    match State.lookup_pure_unop_eq_expr var_id Expr.End state with
     | Some (e, _) when Formula.is_zero_expr e ->
       (* Base() == 0 *)
       [{ state with
@@ -378,7 +378,7 @@ module TransferFunctions2 = struct
       [ err_state; ok_state ]
 
   and dereference_check_upper_bound loc instr end_expr is_current var_id offset cell_size state =
-    let end_offset = expr_eval_offset end_expr var_id state in
+    let end_offset = eval_expr_offset end_expr var_id state in
     if (Int64.compare offset end_offset) > 0 then begin
       if is_current then begin
         (* offset out of bounds *)
@@ -404,9 +404,9 @@ module TransferFunctions2 = struct
       [state]
 
   and store_dereference_try_match_heap_predicates loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr state =
-    let rhs_norm = expr_normalize rhs_expr state in
+    let rhs_norm = normalize_expr rhs_expr state in
     let try_block_split hps =
-      state_heap_try_block_split hps lhs_var_id lhs_offset cell_size
+      State.heap_try_block_split hps lhs_var_id lhs_offset cell_size
     in
     let assign ?to_missing:(to_missing=false) state lhs_id lhs_expr =
       store_dereference_assign ~to_missing:to_missing state lhs_typ lhs_id lhs_expr rhs_norm
@@ -419,7 +419,7 @@ module TransferFunctions2 = struct
         List.append removed (List.append to_add rest)
     in
     let curr_hps, curr_rest, miss_hps, miss_rest =
-      state_heap_find_block_fragments state lhs_var_id lhs_offset cell_size
+      State.heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
     let curr_count = List.count curr_hps ~f:(fun _ -> true) in
     let miss_count = List.count miss_hps ~f:(fun _ -> true) in
@@ -509,9 +509,9 @@ module TransferFunctions2 = struct
     in
     let source = Expr.Var lhs_id in
     (* we assume expression denotes to some size_t since it passed compilation *)
-    let size = expr_normalize actual state in
+    let size = normalize_expr actual state in
     (* try to evaluate the size *)
-    let size = match eval_state_expr_to_int64_opt size state with
+    let size = match eval_expr_to_int64_opt size state with
       Some i -> Const (Int i)
     | None -> size
     in
@@ -532,7 +532,7 @@ module TransferFunctions2 = struct
      checks earlier in execution. Skipping explicit NULL handling for now. *)
   and exec_free_instr loc instr _actual actual_expr state =
     let open State in
-    match expr_base_and_offset actual_expr state with
+    match base_and_offset_of_expr actual_expr state with
     | Some (base_id, offset) ->
       free_block loc instr base_id offset state
     | None ->
@@ -597,18 +597,18 @@ module TransferFunctions2 = struct
     and free_block loc instr id offset state =
       let open State in
       (* Step 1: check if already freed *)
-      if state_is_freed_expr id state then
+      if State.is_freed_expr id state then
         (* double free *)
         [{ state with status = Error (None, loc, instr) }]
       else
       (* Step 2: find Base(Var id) == some_exp *)
-      match state_find_pure_unop_eq_expr id Expr.Base state with
+      match State.lookup_pure_unop_eq_expr id Expr.Base state with
       | Some (base_exp, _is_current) ->
         if Formula.is_zero_expr base_exp then
           (* Base(id) == 0 means no memory allocated *)
           [{ state with status = Error (None, loc, instr) }]
         else
-          let base_offset = expr_eval_offset base_exp id state in
+          let base_offset = eval_expr_offset base_exp id state in
           if Int64.equal base_offset offset then
             (* happy path: offset matches base, add Freed to current *)
             let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in

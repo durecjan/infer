@@ -401,7 +401,8 @@ module TransferFunctions2 = struct
 
   and dereference_check_upper_bound loc instr end_expr is_current var_id offset cell_size state =
     let end_offset = eval_expr_offset end_expr var_id state in
-    if (Int64.compare offset end_offset) > 0 then begin
+    let access_end = Stdlib.Int64.add offset cell_size in
+    if (Int64.compare access_end end_offset) > 0 then begin
       if is_current then begin
         (* offset out of bounds *)
         Format.print_string "[Error]: exec_store failed with: offset of expression is greater than upper bound \n";
@@ -416,8 +417,8 @@ module TransferFunctions2 = struct
         in
         let to_add = Expr.BinOp (
           Peq,
-          UnOp (Base, Var var_id),
-          BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))))
+          UnOp (End, Var var_id),
+          BinOp (Pplus, Var var_id, Const (Int access_end)))
         in
         [{ state with missing = {
           state.missing with pure = to_add :: missing_pure } }]

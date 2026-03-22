@@ -1,4 +1,9 @@
 
+(** Unique variable identifier module.
+    Uses OCaml 5 Domain-Local Storage (DLS) via [AnalysisGlobalState.make_dls]
+    for thread-safe fresh id generation — each analysis domain gets its own
+    counter, and the state is automatically saved/restored when ondemand
+    analysis suspends a procedure to analyze a dependency. *)
 module Id = struct
   type t = int [@@deriving compare, equal, hash]
 
@@ -6,40 +11,50 @@ module Id = struct
 
   let next_fresh = AnalysisGlobalState.make_dls ~init:(fun () -> initial_next_fresh)
 
+  (** Generates a fresh unique identifier, incrementing the domain-local counter *)
   let fresh () =
-  let l = DLS.get next_fresh in
-  DLS.set next_fresh (l + 1) ;
-  l
+    let l = DLS.get next_fresh in
+    DLS.set next_fresh (l + 1) ;
+    l
 
   let pp = Format.pp_print_int
 
 end
 
-(** Variable Id map *)
+(** Map keyed by variable [Id.t], used for vars, types, and substitutions in the abstract state *)
 module VarIdMap = Stdlib.Map.Make (Id)
 
+(** Set of variable [Id.t], used for cycle detection in pure constraint resolution *)
+module VarIdSet = Stdlib.Set.Make (Id)
+
+(** Looks up a variable by its [Id.t] in the variable map. Returns [Some Var.t] or [None] *)
 let lookup_variable id vars =
   VarIdMap.find_opt id vars
 
+(** Finds the [Id.t] of the first variable in [vars] that equals [v].
+    Performs a linear scan over all bindings, returning the first match *)
 let lookup_variable_id v vars =
   let rec find_var = function
     | [] -> None
-    | (a, b) :: l -> if Var.equal b v then Some a else find_var l 
+    | (a, b) :: l -> if Var.equal b v then Some a else find_var l
   in
   find_var (VarIdMap.bindings vars)
 
+(** Expression language for pure constraints and heap predicate arguments.
+    [Var] holds an [Id.t], [Base]/[End]/[Freed] are special unary operators
+    for memory block bounds and deallocation tracking *)
 module Expr = struct
   type t =
       Var of int
     | Const of const_val
     | UnOp of (unop * t)
     | BinOp of (binop * t * t)
-    | Undef
+    | Undef  (** Unknown or unresolvable expression *)
 
   and unop =
-    | Base
-    | End
-    | Freed
+    | Base   (** Lower bound of a memory block *)
+    | End    (** Upper bound (exclusive) of a memory block *)
+    | Freed  (** Marks a memory block as deallocated *)
     | BVnot  (** bitwise complement *)  
     | Lnot  (** logical not *)
     | Puminus  (** unary minus *)
@@ -69,6 +84,8 @@ module Expr = struct
 
   let one = Const (Int 1L)
   let zero = Const (Int 0L)
+
+  (** Return variable is always Id 0 *)
   let ret = Var 0
 
   let unop_equal op1 op2 =
@@ -173,15 +190,22 @@ module Expr = struct
 
 end
 
+(** Separation logic formula consisting of spatial (heap) and pure (constraint) parts.
+    The spatial part is a separating conjunction of heap predicates.
+    The pure part is a conjunction of expression constraints. *)
 type t = {
   spatial: spatial;
   pure: pure;
 }
 
+(** Heap predicates describing memory regions:
+    - [BlockPointsTo]: allocated block of [size] bytes at [source], contents unknown
+    - [ExpPointsTo]: single cell of [size] bytes at [source] with known [destination] value
+    - [UniformBlockPointsTo]: block of [size] bytes at [source], every byte has [value] *)
 and heap_pred =
-  | BlockPointsTo of Expr.t * Expr.t (* source, size *)
-  | ExpPointsTo of Expr.t * Expr.t * Expr.t (* source, size, destination *)
-  | UniformBlockPointsTo of Expr.t * Expr.t * Expr.t (* source, size, value of every byte *)
+  | BlockPointsTo of Expr.t * Expr.t
+  | ExpPointsTo of Expr.t * Expr.t * Expr.t
+  | UniformBlockPointsTo of Expr.t * Expr.t * Expr.t
 
 and spatial = heap_pred list
 
@@ -213,14 +237,19 @@ let rec spatial_to_string vars s =
 let to_string vars f =
   spatial_to_string vars f.spatial ^ "\n" ^ pure_to_string vars f.pure
 
-module IdSet = Stdlib.Set.Make (Id)
 
+(* ==================== pure constraint helpers ==================== *)
+
+(** Resolves a variable [id] through pure equality constraints to a constant expression.
+    Follows chains of (Var id == Var id') and (Var id == Const _) equalities,
+    checking both LHS and RHS positions. Uses [VarIdSet] to detect cycles.
+    Only resolves to [Const] values — returns [None] for non-constant results *)
 let lookup_pure_const_exp_of_id id pure =
   let rec resolve visited id =
-    if IdSet.mem id visited then
+    if VarIdSet.mem id visited then
       None
     else
-      let visited = IdSet.add id visited in
+      let visited = VarIdSet.add id visited in
       match
         Stdlib.List.find_opt
         (function
@@ -242,81 +271,41 @@ let lookup_pure_const_exp_of_id id pure =
       | Expr.Var id' -> resolve visited id'
       | _ -> None
     in
-    resolve IdSet.empty id
+    resolve VarIdSet.empty id
 
-let add_heap_pred p f =
-  let { spatial } = f in
-  { f with spatial = p :: spatial }
-
-(** Only takes PointsToBlock predicates. [id] must be a canonical identifier of a pointer typed variable. *)
-let rec heap_pred_take_opt id spatial =
-  let rec traverse acc = function
-    [] -> None
-  | (BlockPointsTo (src, _) as hp) :: l
-    when expr_contains_var_with_id id src ->
-      Some (hp, List.rev_append acc l)
-  | (UniformBlockPointsTo (src, _, _) as hp) :: l
-    when expr_contains_var_with_id id src ->
-      Some (hp, List.rev_append acc l)
-  | hp :: l ->
-    traverse (hp :: acc) l
-  in
-  traverse [] spatial
-
-and expr_base_var_find_opt e =
-  let open Expr in
-  match e with
-    (Var _) as v -> Some v
-  | UnOp (_, e) -> expr_base_var_find_opt e
-  | BinOp (_, e1, e2) ->
-    begin
-      match expr_base_var_find_opt e1 with
-        Some v -> Some v
-      | None -> expr_base_var_find_opt e2
-    end
-  | Const _ -> None
-  | Undef -> None
-
-and expr_contains_var_with_id id e =
-  let open Expr in
-  match expr_base_var_find_opt e with
-    Some (Var id') -> Id.equal id' id
-  | _ -> false
-
-(** Traverses pure constraints and looks for (Base(Var [id])==exp) *)
-let rec find_pure_base_expr id = function
+(** Looks up the first pure constraint matching (Base(Var [id]) == exp), returns [Some exp] *)
+let rec lookup_pure_base_expr id = function
   | [] -> None
   | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
     when Id.equal id id' -> Some exp
-  | _ :: rest -> find_pure_base_expr id rest
+  | _ :: rest -> lookup_pure_base_expr id rest
 
-(** Traverses pure constraints and looks for (End(Var [id])==exp) *)
-let rec find_pure_end_expr id = function
+(** Looks up the first pure constraint matching (End(Var [id]) == exp), returns [Some exp] *)
+let rec lookup_pure_end_expr id = function
   | [] -> None
   | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.End, Expr.Var id'), exp) :: _
     when Id.equal id id' -> Some exp
-  | _ :: rest -> find_pure_end_expr id rest
+  | _ :: rest -> lookup_pure_end_expr id rest
 
-(** Determines whether the given expression list contains (Freed(Var [id]) expression *)
+(** Checks whether the pure constraint list contains a (Freed(Var [id])) expression *)
 let rec has_freed_expr id = function
   | [] -> false
-  | Expr.UnOp (Freed, Var id') :: _ 
+  | Expr.UnOp (Freed, Var id') :: _
     when Id.equal id id' -> true
   | _ :: rest -> has_freed_expr id rest
 
-(** Evaluates [expr] to Int64 and compares it to 0L *)
-let rec is_zero_expr expr =
-  match eval_expr_to_int64 expr with
-  | Some i when Int64.equal i 0L ->
-    true
-  | _ ->
-    false
-
+(** Tries to evaluate [expr] to an Int64 value. Handles [Const (Int _)] and arithmetic
+    binary operations ([+], [-], [*], [/], [%], unary [-]). Returns [None] if the expression
+    contains variables or other non-evaluable subexpressions — no state access is available
+    at this level, so variable resolution must happen before calling this *)
 and eval_expr_to_int64 e =
   let open Expr in
   match e with
     Const (Int i) ->
       Some i
+  | UnOp (Puminus, e1) ->
+    Option.map (eval_expr_to_int64 e1) ~f:(fun v ->
+      Stdlib.Int64.neg v)
   | BinOp (Pplus, e1, e2) ->
     Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
     Option.map (eval_expr_to_int64 e2) ~f:(fun v2 ->
@@ -329,30 +318,119 @@ and eval_expr_to_int64 e =
     Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
     Option.map (eval_expr_to_int64 e2) ~f:(fun v2 ->
       Stdlib.Int64.mul v1 v2))
+  | BinOp (Pdiv, e1, e2) ->
+    Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
+    Option.bind (eval_expr_to_int64 e2) ~f:(fun v2 ->
+      if Int64.equal v2 0L then None
+      else Some (Stdlib.Int64.div v1 v2)))
+  | BinOp (Pmod, e1, e2) ->
+    Option.bind (eval_expr_to_int64 e1) ~f:(fun v1 ->
+    Option.bind (eval_expr_to_int64 e2) ~f:(fun v2 ->
+      if Int64.equal v2 0L then None
+      else Some (Stdlib.Int64.rem v1 v2)))
   | _ ->
       None
 
-(** Traverses heap predicates and looks for PointsToBlock (Var [id], size, dest) *)
-let rec heap_pred_find_block_points_to id = function
+(** Evaluates [expr] to Int64 and checks whether the result is zero.
+    Limited to constant arithmetic — expressions containing variables return false *)
+let is_zero_expr expr =
+  match eval_expr_to_int64 expr with
+  | Some i when Int64.equal i 0L -> true
+  | _ -> false
+
+
+(* ==================== heap predicate helpers ==================== *)
+
+(** Prepends heap predicate [p] to the spatial part of formula [f] *)
+let add_heap_pred p f =
+  { f with spatial = p :: f.spatial }
+
+(** Looks up the first [BlockPointsTo] with source [Var id] in the heap predicate list *)
+let rec lookup_heap_pred_block_points_to id = function
   | [] -> None
   | (BlockPointsTo (Expr.Var id', _)) as hp :: _
     when Id.equal id' id ->
       Some hp
   | _ :: rest ->
-    heap_pred_find_block_points_to id rest
+    lookup_heap_pred_block_points_to id rest
 
-(** Traverses heap predicates and looks for PointsToExp ([src], size, dest) *)
-let rec heap_pred_find_exp_points_to src = function
+(** Looks up the first [ExpPointsTo] whose source equals [src] in the heap predicate list *)
+let rec lookup_heap_pred_exp_points_to src = function
   | [] -> None
   | (ExpPointsTo (src', _, _)) as hp :: _
     when Expr.equal src' src ->
       Some hp
   | _ :: rest ->
-    heap_pred_find_exp_points_to src rest
+    lookup_heap_pred_exp_points_to src rest
 
-(** Replaces every occurence of [~old_] with [~new] within given [expr] *)
+(** Structural equality for heap predicates, comparing all fields via [Expr.equal] *)
+let heap_pred_equal a b =
+  match a, b with
+  | BlockPointsTo (src1, size1), BlockPointsTo (src2, size2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2
+  | ExpPointsTo (src1, size1, dest1), ExpPointsTo (src2, size2, dest2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal dest1 dest2
+  | UniformBlockPointsTo (src1, size1, value1), UniformBlockPointsTo (src2, size2, value2) ->
+    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal value1 value2
+  | _ -> false
+
+(** Partitions [spatial] into (matching, rest) where matching heap predicates have
+    source rooted at [Var var_id] with offset <= [var_offset] and size >= [cell_size].
+    Used to find candidate fragments for block splitting during dereference *)
+let heap_find_block_fragments spatial var_id var_offset cell_size =
+  let is_block_fragment src size =
+    match src, size with
+    | Expr.BinOp (Pplus, Var id, Const (Int off)),
+      Expr.Const (Int size) ->
+        Id.equal id var_id &&
+        (Int64.compare off var_offset) <= 0 &&
+        (Int64.compare size cell_size) >= 0
+    | Expr.Var id,
+      Expr.Const (Int size) ->
+        Id.equal id var_id &&
+        (Int64.compare 0L var_offset) <= 0 &&
+        (Int64.compare size cell_size) >= 0
+    | _ -> false
+  in
+  Stdlib.List.partition
+    (fun hp ->
+      match hp with
+      | ExpPointsTo (src, size, _)
+        when is_block_fragment src size -> true
+      | BlockPointsTo (src, size)
+        when is_block_fragment src size -> true
+      | UniformBlockPointsTo (src, size, _)
+        when is_block_fragment src size -> true
+      | _ -> false)
+    spatial
+
+(** Sorts heap predicates by source offset in descending order.
+    Expects source to be [BinOp (Pplus, Var _, Const (Int offset))] or [Var _] (offset 0).
+    Raises [InternalError] if source does not match either pattern *)
+let rec sort_heap_preds_by_offset_desc hps =
+  hps
+  |> List.map ~f:(fun hp -> (points_to_src_offset hp, hp))
+  |> List.sort ~compare:(fun (o1, _) (o2, _) -> Int64.compare o2 o1)
+  |> List.map ~f:snd
+
+and points_to_src_offset hp =
+  let src =
+    match hp with
+    | BlockPointsTo (src, _)
+    | ExpPointsTo (src, _, _)
+    | UniformBlockPointsTo (src, _, _) -> src
+  in
+  match src with
+  | Expr.BinOp (Pplus, Var _, Const (Int i)) -> i
+  | Expr.Var _ -> 0L
+  | _ -> Logging.die InternalError "unexpected src format"
+
+
+(* ==================== expression substitution ==================== *)
+
+(** Replaces every occurrence of [~old_] with [~new_] within [expr], using [Expr.equal] for matching *)
 let expr_replace ~old_ ~new_ expr =
-  let rec replace e = 
+  let rec replace e =
     if Expr.equal e old_ then new_
     else
       match e with
@@ -366,7 +444,7 @@ let expr_replace ~old_ ~new_ expr =
   in
   replace expr
 
-(** Applies substitution [~from_] [~to_] over a list of pure constraints [pure] *)
+(** Applies substitution [~from_] -> [~to_] over every pure constraint in the list *)
 let subst_apply_to_pure ~from_ ~to_ pure =
   let rec apply acc = function
     | [] -> acc
@@ -376,7 +454,8 @@ let subst_apply_to_pure ~from_ ~to_ pure =
   in
   apply [] pure
 
-(** Applies substitution [~from_] [~to_] over a list of heap predicates [spatial] *)
+(** Applies substitution [~from_] -> [~to_] over every heap predicate in the list,
+    replacing within all fields (source, size, and destination/value where applicable) *)
 let subst_apply_to_spatial ~from_ ~to_ spatial =
   let rec apply acc = function
   | [] -> acc
@@ -400,67 +479,3 @@ let subst_apply_to_spatial ~from_ ~to_ spatial =
         expr_replace ~old_:from_ ~new_:to_ dest) in
       apply (subst :: acc) rest
   in apply [] spatial
-
-(** Traverses given heap predicate list [spatial], looking for:
-    ExpPointsTo (src, size, _) | BlockPointsTo (src, size) | UniformBlockPointsTo (src, size, _)
-    where src = (Var [var_id] + (num <= [var_offset])) and size >= [cell_size].*)
-let heap_find_block_fragments spatial var_id var_offset cell_size =
-  let is_block_fragment src size = 
-    match src, size with
-    | Expr.BinOp (Pplus, Var id, Const (Int off)),
-      Expr.Const (Int size) ->
-        Id.equal id var_id && 
-        (Int64.compare off var_offset) <= 0 &&
-        (Int64.compare size cell_size) >= 0
-    | Expr.Var id,
-      Expr.Const (Int size) ->
-        Id.equal id var_id &&
-        (Int64.compare 0L var_offset) <= 0 &&
-        (Int64.compare size cell_size) >= 0
-    | _ -> false
-  in
-  Stdlib.List.partition
-    (fun hp ->
-      match hp with
-      | ExpPointsTo (src, size, _)
-        when is_block_fragment src size ->
-          true
-      | BlockPointsTo (src, size)
-        when is_block_fragment src size ->
-          true
-      | UniformBlockPointsTo (src, size, _)
-        when is_block_fragment src size ->
-          true
-      | _ -> false)
-    spatial
-
-(** Sorts given heap predicates [hps] by their source offset, i.e. src = [Expr.BinOp (Pplus, Var _, Const (Int offset))].
-    If any given heap predicate does not match this pattern, exception is raised *)
-let rec sort_heap_preds_by_offset_desc hps =
-  hps
-  |> List.map ~f:(fun hp -> (points_to_src_offset hp, hp))
-  |> List.sort ~compare:(fun (o1, _) (o2, _) -> Int64.compare o2 o1)
-  |> List.map ~f:snd
-
-and points_to_src_offset hp =
-  let src =
-    match hp with
-    | BlockPointsTo (src, _)
-    | ExpPointsTo (src, _, _)
-    | UniformBlockPointsTo (src, _, _) -> src
-  in
-  match src with
-  | Expr.BinOp (Pplus, Var _, Const (Int i)) -> i
-  | Expr.Var _ -> 0L
-  | _ -> Logging.die InternalError "unexpected src format"
-
-(** Determines whether heap predicates are equal using [Expr.equal] *)
-let heap_pred_equal a b =
-  match a, b with
-  | BlockPointsTo (src1, size1), BlockPointsTo (src2, size2) ->
-    Expr.equal src1 src2 && Expr.equal size1 size2
-  | ExpPointsTo (src1, size1, dest1), ExpPointsTo (src2, size2, dest2) ->
-    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal dest1 dest2
-  | UniformBlockPointsTo (src1, size1, value1), UniformBlockPointsTo (src2, size2, value2) ->
-    Expr.equal src1 src2 && Expr.equal size1 size2 && Expr.equal value1 value2
-  | _ -> false

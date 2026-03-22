@@ -415,19 +415,19 @@ let eval_state_expr_to_int64_opt expr state = (* atp i have a milion eval_to_int
 let state_find_pure_unop_eq_expr id unop state =
   match unop with
   | Expr.Base ->
-    begin match Formula.find_pure_base_expr id state.current.pure with
+    begin match Formula.lookup_pure_base_expr id state.current.pure with
     | Some b -> Some (b, true)
     | None ->
-      begin match Formula.find_pure_base_expr id state.missing.pure with
+      begin match Formula.lookup_pure_base_expr id state.missing.pure with
       | Some b -> Some (b, false)
       | None -> None
       end
     end
   | Expr.End ->
-    begin match Formula.find_pure_end_expr id state.current.pure with
+    begin match Formula.lookup_pure_end_expr id state.current.pure with
     | Some b -> Some (b, true)
     | None ->
-      begin match Formula.find_pure_end_expr id state.missing.pure with
+      begin match Formula.lookup_pure_end_expr id state.missing.pure with
       | Some b -> Some (b, false)
       | None -> None
       end
@@ -682,10 +682,10 @@ let state_heap_find_block_fragments state var_id var_offset cell_size =
   sorted_current, current_rest, sorted_missing, missing_rest
 
 (** Traverses both current and missing heap predicates of [state], looking for PointsToBlock (Var [id], size, dest) *)
-let state_heap_pred_find_block_points_to id state =
+let state_lookup_heap_pred_block_points_to id state =
   let curr_hp, miss_hp =
-    Formula.heap_pred_find_block_points_to id state.current.spatial,
-    Formula.heap_pred_find_block_points_to id state.missing.spatial
+    Formula.lookup_heap_pred_block_points_to id state.current.spatial,
+    Formula.lookup_heap_pred_block_points_to id state.missing.spatial
   in
   match curr_hp, miss_hp with
   | Some hp, None | None, Some hp ->
@@ -694,10 +694,10 @@ let state_heap_pred_find_block_points_to id state =
     None
 
 (** Traverses both current and missing heap predicates of [state], looking for PointsToExp ([src], size, dest) *)
-let state_heap_pred_find_exp_points_to src state =
+let state_lookup_heap_pred_exp_points_to src state =
   let curr_hp, miss_hp =
-    Formula.heap_pred_find_exp_points_to src state.current.spatial,
-    Formula.heap_pred_find_exp_points_to src state.missing.spatial
+    Formula.lookup_heap_pred_exp_points_to src state.current.spatial,
+    Formula.lookup_heap_pred_exp_points_to src state.missing.spatial
   in
   match curr_hp, miss_hp with
   | Some hp, None | None, Some hp ->

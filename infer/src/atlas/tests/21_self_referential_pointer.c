@@ -12,12 +12,10 @@ void self_referential_pointer() {
     int *q = *p;
     free(p);
 }
+	
+// BUG: subst_apply seems to gobble up the reference, however here, we expect p -(8)-> Var(7) and subst p=Var(7)
 
-/*	
-   BUG
-   subst_apply seems to gobble up the reference, however here, we expect p -(8)-> Var(7) and subst p=Var(7)
-
-   TRACE
+/* TRACE:
 
 OK
 Current:

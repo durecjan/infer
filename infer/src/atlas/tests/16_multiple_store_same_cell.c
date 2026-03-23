@@ -12,7 +12,4 @@ void multiple_store_same_cell() {
     free(p);
 }
 
-/*
-	note:
-	(Var(6)==10) stays in the state, but is no longer reachable via any program variable
-*/
+// note: (Var(6)==10) stays in the state, but is no longer reachable via any program variable

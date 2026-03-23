@@ -14,8 +14,5 @@ void formal_struct_field(struct pair *p) {
     p->second = 2;
 }
 
-/*
-	note: again, too many error contracts i think
-*/
-
+// note: again, too many error contracts
 // TODO if formal is struct * then add Base, End constraints to state on initialization (using Tenv)

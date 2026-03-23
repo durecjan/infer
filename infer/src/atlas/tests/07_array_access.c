@@ -12,9 +12,3 @@ void array_access() {
     int y = arr[2];
     free(arr);
 }
-
-/*
-	BUG
-	currently converts arr[2] = 300; as Sil.Store with lhs expr = (arr+(2*8))
-	expected behavior - should convert as (arr+(2*4))
-*/

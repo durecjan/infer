@@ -5,8 +5,8 @@
 
 #include <stdlib.h>
 
-void pointer_offset_deref(char* buf) {
-    //char *buf = (char *)malloc(16);
+void pointer_offset_deref() {
+    char *buf = (char *)malloc(16);
     char *mid = buf + 8;
     *mid = 'A';
     char c = *mid;

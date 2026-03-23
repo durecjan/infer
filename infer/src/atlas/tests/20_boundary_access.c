@@ -12,14 +12,3 @@ void boundary_access() {
     int last = arr[3];
     free(arr);
 }
-
-/*	
-   BUG
-   again we mistakenly convert the size of type in the Lindex case
-
-   [SIL_INSTR_LHS]: Lindex(Var(n$6), Const(Cint(3)))
-   converted to
-   [LHS_EXPR]: (arr+(3*8))
-
-   expected behavior: convert to (arr+(3*4))
-*/

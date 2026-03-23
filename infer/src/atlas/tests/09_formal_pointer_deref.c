@@ -10,9 +10,5 @@ void formal_pointer_deref(int *p) {
     int x = *p;
 }
 
-/*
-	note:
-	we generate error contract for every error - missing base, end constraints and pointsTo predicate
-*/
-
+// note: we generate too many error contracts
 // TODO Base(p) <= p ; End(p) >= p + 4 -- modify Base End constraints and checks to handle this

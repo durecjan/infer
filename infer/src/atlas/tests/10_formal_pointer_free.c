@@ -7,8 +7,6 @@
 void formal_pointer_free(int *p) {
     free(p);
 }
-/*
-	note:
-	here we generate only one error contract - missing base constraint
-	we could add a check for missing end constraint, also for heap predicate source
-*/
+
+// note: here we generate only one error contract - missing base constraint
+// we could add a check for missing end constraint, also for heap predicate source

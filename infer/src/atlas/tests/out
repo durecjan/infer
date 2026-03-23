@@ -1,0 +1,295 @@
+
+[SIL_VARIABLE_LIFETIME_BEGINS]
+OK
+Current:
+
+(Base(p)==0) & (End(p)==0)
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) 
+================
+[SIL_MALLOC]
+[SIL_ACTUAL]: Sizeof(int*, Some(8), None)
+[ACTUAL_EXPR]: 8
+OK
+Current:
+n$6 -(8)-> block
+(Base(n$6)==n$6) & (End(n$6)==(n$6+8)) & (Base(p)==0) & (End(p)==0)
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$6;3) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (void*;3) 
+================
+[SIL_STORE]
+[SIL_INSTR_LHS]: Lvar(p)
+[SIL_INSTR_RHS]: Var(n$6)
+[LHS_EXPR]: p
+[RHS_EXPR]: n$6
+OK
+Current:
+p -(8)-> block
+(Base(p)==p) & (End(p)==(p+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$6;3) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (void*;3) 
+================
+[SIL_EXIT_SCOPE]
+OK
+Current:
+p -(8)-> block
+(Base(p)==p) & (End(p)==(p+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) 
+================
+[SIL_LOAD]
+[SIL_INSTR_RHS]: Lvar(p)
+[RHS_EXPR]: p
+OK
+Current:
+p -(8)-> block
+(Base(p)==p) & (End(p)==(p+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$5;5) 
+----------------
+Substitutions:
+{n$5==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;5) 
+================
+[SIL_LOAD]
+[SIL_INSTR_RHS]: Lvar(p)
+[RHS_EXPR]: p
+OK
+Current:
+p -(8)-> block
+(Base(p)==p) & (End(p)==(p+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$5;5) (n$4;6) 
+----------------
+Substitutions:
+{n$5==p;n$4==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;5) (int**;6) 
+================
+[SIL_STORE]
+[SIL_INSTR_LHS]: Var(n$4)
+[SIL_INSTR_RHS]: Cast(int*, Var(n$5))
+[LHS_EXPR]: p
+[RHS_EXPR]: p
+[Block_fragments] - found 1 in state.current ; found 0 in state.missing
+[LHS] - typ=int* ; id=2 ; offset=0
+OK
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$5;5) (n$4;6) 
+----------------
+Substitutions:
+{n$5==p;n$4==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;5) (int**;6) (int*;7) 
+================
+[SIL_EXIT_SCOPE]
+OK
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) 
+================
+[SIL_VARIABLE_LIFETIME_BEGINS]
+OK
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) 
+----------------
+Substitutions:
+{}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) 
+================
+[SIL_LOAD]
+[SIL_INSTR_RHS]: Lvar(p)
+[RHS_EXPR]: p
+OK
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$2;9) 
+----------------
+Substitutions:
+{n$2==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) (int**;9) 
+================
+[SIL_LOAD]
+[SIL_INSTR_RHS]: Var(n$2)
+[RHS_EXPR]: p
+ERROR
+ISSUE=
+LOCATION=[line 12; column 14]
+SIL_INSTR=n$3=*n$2:int* [line 12, column 14]
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$2;9) (n$3;10) 
+----------------
+Substitutions:
+{n$2==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) (int**;9) (int*;10) 
+================ERROR
+ISSUE=
+LOCATION=[line 12; column 14]
+SIL_INSTR=n$3=*n$2:int* [line 12, column 14]
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+(Base(p)==(p+0))
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$2;9) (n$3;10) 
+----------------
+Substitutions:
+{n$2==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) (int**;9) (int*;10) 
+================ERROR
+ISSUE=
+LOCATION=[line 12; column 14]
+SIL_INSTR=n$3=*n$2:int* [line 12, column 14]
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+
+(End(p)==(p+8)) & (Base(p)==(p+0))
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$2;9) (n$3;10) 
+----------------
+Substitutions:
+{n$2==p;}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) (int**;9) (int*;10) 
+================OK
+Current:
+(Var(7)+0) -(8)-> Var(7)
+(Base(q)==0) & (End(q)==0) & (Base(Var(7))==Var(7)) & (End(Var(7))==(Var(7)+8))
+----------------
+Missing:
+(p+0) -(8)-> Var(11)
+(End(p)==(p+8)) & (Base(p)==(p+0))
+----------------
+Vars:
+(return;0) (q;1) (p;2) (n$2;9) (n$3;10) 
+----------------
+Substitutions:
+{n$2==p;n$3==Var(11);}
+----------------
+Types:
+(void;0) (int*;1) (int**;2) (int*;7) (int**;9) (int*;10) 
+================
+[SIL_STORE]
+[SIL_INSTR_LHS]: Lvar(q)
+[SIL_INSTR_RHS]: Var(n$3)
+[LHS_EXPR]: q
+[RHS_EXPR]: Var(11)

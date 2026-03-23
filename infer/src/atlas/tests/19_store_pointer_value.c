@@ -13,15 +13,10 @@ void store_pointer_value() {
     free(q);
     free(pp);
 }
-
-
-/*
 	
-   BUG
-   we seem to gobble up the reference q PointsToBlock when connecting the PointsTo predicates
+//BUG: we seem to gobble up the reference q PointsToBlock when connecting the PointsTo predicates
 
-   TRACE:
-
+/* TRACE:
 ================
 [SIL_LOAD]
 [SIL_INSTR_RHS]: Lvar(q)

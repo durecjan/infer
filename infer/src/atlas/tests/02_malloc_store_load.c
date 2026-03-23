@@ -15,4 +15,4 @@ void malloc_store_load() {
 //
 // note: (p+0) -()-> Var(6) -- if we execute the same code within if else branches, then we get different cell ids
 //
-// note: postprocessing final state, clear locals, keep formals
+// TODO postprocessing final state, clear locals, keep formals

@@ -815,8 +815,13 @@ and sil_array_offset_bytes base index tenv s =
   | [id] ->
     begin match VarIdMap.find_opt id s.types with
     | Some t ->
-      let size_of_t = typ_size_of tenv t in
-      Expr.BinOp (Expr.Pmult, index, Const (Int size_of_t))
+      (* dereference the pointer type to get the element type — for [int *arr],
+         the array offset should be [index * sizeof(int)] *)
+      let elem_size = match t.Typ.desc with
+        | Typ.Tptr (elem_typ, _) -> typ_size_of tenv elem_typ
+        | _ -> typ_size_of tenv t
+      in
+      Expr.BinOp (Expr.Pmult, index, Const (Int elem_size))
     | None -> index
     end
   | _ -> index  (* TODO maybe not the best fallback *)

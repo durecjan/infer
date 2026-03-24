@@ -53,15 +53,34 @@ let rec empty analysis =
     vars = VarIdMap.add 0 (Var.of_pvar ret_var) with_formals.vars;
     types = VarIdMap.add 0 ret_typ with_formals.types }
 
-(** Adds variable [v] with type [t] into state [s]. If [id] is present, it is used, otherwise a fresh id is generated *)
+(** Adds variable [v] with type [t] into state [s]. If [id] is present, it is used,
+    otherwise a fresh id is generated. For pointer-typed variables, adds [Base(Var id)==0]
+    and [End(Var id)==0] constraints to [current.pure] so that unallocated pointers are
+    always detectable, regardless of whether [VariableLifetimeBegins] metadata fires *)
 and add_variable ?id v t s =
   let id' = match id with
   | Some id -> id
   | None -> Id.fresh ()
   in
-  { s with 
+  let s = { s with
     vars = VarIdMap.add id' (Var.of_pvar v) s.vars;
     types = VarIdMap.add id' t s.types }
+  in
+  if is_pointer_type t then
+    let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L)) in
+    let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L)) in
+    { s with current = { s.current with
+        pure = base_constr :: end_constr :: s.current.pure } }
+  else
+    s
+
+(** Determines whether provided type [t] is a C pointer *)
+and is_pointer_type t =
+  let open Typ in
+  match t.desc with
+  | Typ.Tptr _ -> true
+  | Typ.Tarray { elt } -> is_pointer_type elt
+  | _ -> false
 
 
 (* ==================== equality substitution helpers ==================== *)
@@ -227,14 +246,6 @@ let rec base_and_offset_of_expr expr state =
     Some (base, eval_expr_offset expr base state)
   | _ ->
     None
-
-(** Determines whether provided type [t] is a C pointer *)
-and is_pointer_type t =
-  let open Typ in
-  match t.desc with
-  | Typ.Tptr _ -> true
-  | Typ.Tarray { elt } -> is_pointer_type elt
-  | _ -> false
 
 (** Extracts all variable ids from given [expr] *)
 and variable_ids_of_expr expr =

@@ -84,8 +84,7 @@ module TransferFunctions = struct
       | Some (rhs_id, off) ->
           exec_load_deref_ loc instr tenv typ lhs_id rhs_id off state
       | None ->
-        Logging.die InternalError
-          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+        [{ state with status = Error (None, loc, instr) }]
     else begin
       if is_sil_address_assign rhs && is_pointer_type typ then
         match base_and_offset_of_expr rhs_expr state with
@@ -94,8 +93,7 @@ module TransferFunctions = struct
           [{ state with
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
-          Logging.die InternalError
-          "[Error] method is_sil_address_assign returned true but no base pointer variable found"
+          [{ state with status = Error (None, loc, instr) }]
       else
         let rhs_norm = normalize_expr rhs_expr state in
         assign_to_variable lhs_id rhs_norm state
@@ -201,8 +199,7 @@ module TransferFunctions = struct
       | Some (lhs_id, off) ->
           exec_store_deref loc instr tenv lhs_typ lhs_id off rhs_expr state
       | None ->
-        Logging.die InternalError
-          "[Error] method is_sil_dereference returned true but no base pointer variable found"
+        [{ state with status = Error (None, loc, instr) }]
     else begin
       if is_sil_address_assign lhs && is_pointer_type lhs_typ then begin
         match direct_id_of_sil_lvar lhs state with
@@ -230,12 +227,10 @@ module TransferFunctions = struct
                  without modifying the formula, preserving the RHS variable's identity *)
               [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
           | None ->
-            Logging.die InternalError
-              "[Error] address assign: failed to extract base pointer from RHS"
+            [{ state with status = Error (None, loc, instr) }]
           end
         | None ->
-          Logging.die InternalError
-            "[Error] address assign: failed to extract direct variable id from LHS Lvar"
+          [{ state with status = Error (None, loc, instr) }]
       end else
         match direct_id_of_sil_lvar lhs state with
         | Some lhs_direct_id ->
@@ -542,20 +537,11 @@ module TransferFunctions = struct
   and exec_metadata_instr metadata state =
     let open Sil in
     match metadata with
-    | VariableLifetimeBegins { pvar; typ = _; loc = _; is_cpp_structured_binding = _} ->
+    | VariableLifetimeBegins _ ->
+        (* Base/End==0 constraints for pointer-typed variables are now added
+           during state initialization in [add_variable] *)
         Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
-        begin match
-          lookup_variable_id (Var.of_pvar pvar) state.vars
-        with
-        | Some id ->
-          let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id), Const (Int 0L)) in
-          let end_constr = Expr.BinOp (Peq, UnOp (End, Var id), Const (Int 0L)) in
-          let current = { state.current with
-            pure = base_constr :: end_constr :: state.current.pure } in
-          [{ state with current }]
-        | None -> Logging.die InternalError
-          "[Error]: VariableLifetimeBegins instruction was triggered but no matching variable was found in our state"
-        end
+        [state]
     | ExitScope (var_list, _loc) ->
       Format.print_string "[SIL_EXIT_SCOPE]\n";
       let state = List.fold var_list ~init:state
@@ -584,6 +570,10 @@ module TransferFunctions = struct
       [state]
     | LoopEntry _ ->
       Format.print_string "[SIL_LOOP_ENTRY]\n";
+      [state]
+    | Abstract _ ->
+      Format.print_string "[SIL_APPLY_ABSTRACTION]";
+      (* TODO good place to clean up final state *)
       [state]
     | _ ->
       [state]

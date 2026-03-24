@@ -9,6 +9,3 @@ void unallocated_deref() {
     int *p;
     *p = 42;
 }
-
-// BUG: there is no VariableLifetimeBegins sil instruction, hence we do not catch this
-// note: rethink adding constraints of local variables somewhere else (state initialization)

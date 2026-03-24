@@ -11,8 +11,6 @@ void malloc_store_load() {
     free(p);
 }
 
-// TODO for non pointer types, there is no need for Base, End constraints
-//
 // note: (p+0) -()-> Var(6) -- if we execute the same code within if else branches, then we get different cell ids
 //
 // TODO postprocessing final state, clear locals, keep formals

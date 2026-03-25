@@ -405,11 +405,12 @@ module TransferFunctions = struct
       let lhs_expr = Expr.Var new_dest_id in
       let assign_res = assign state new_dest_id lhs_expr in
       let state, new_exp_points_to = match assign_res with
-        | ValueStored state ->
+        | ValueStored state | AliasStored state ->
+          (* no formula-wide substitution — separated predicate needs no fixup *)
           (state, new_exp_points_to)
         | AddressStored { state; canonical_rhs } ->
-          (* address was stored — fix up the separated ExpPointsTo using
-             the canonical RHS that subst_apply actually substituted *)
+          (* address was stored via subst_apply — fix up the separated ExpPointsTo
+             using the canonical RHS that subst_apply actually substituted *)
           let src, size = match new_exp_points_to with
             | ExpPointsTo (src, size, _) -> (src, size)
             | _ -> Logging.die InternalError
@@ -461,7 +462,7 @@ module TransferFunctions = struct
         in
         let assign_res = assign state cell_id lhs_expr in
         let state, missing_spatial = match assign_res with
-          | ValueStored state ->
+          | ValueStored state | AliasStored state ->
             (state, missing_spatial)
           | AddressStored { state; canonical_rhs } ->
             (* self-referential fix: update source/size of the separated ExpPointsTo *)

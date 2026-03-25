@@ -481,10 +481,14 @@ type store_deref_assign_res =
       (** Scalar value stored. Pure equality constraints added, no substitution
           performed — separated heap predicates need no fixup *)
   | AddressStored of { state: t; canonical_rhs: Expr.t }
-      (** Pointer address stored. [state] has substitution applied via
+      (** Pointer address stored via [subst_apply]. [state] has substitution applied via
           [clear_before_subst] + [subst_apply]. [canonical_rhs] is the normalized
           canonical RHS expression that was substituted — use as the [~old_] argument
           to [Formula.expr_replace] when fixing up separated heap predicates *)
+  | AliasStored of t
+      (** Pointer address stored via substitution entry (RHS is a program variable).
+          Only a subst map entry was added — no formula-wide substitution was applied,
+          so separated heap predicates need no fixup *)
 
 (** Assigns [rhs_expr] to [lhs_expr] during store dereference.
     For non-pointer types: adds (lhs == rhs) equality and zero Base/End constraints to pure.
@@ -533,10 +537,7 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
     else
       (* RHS is a program variable — record the alias in subst without
          modifying the formula, preserving the RHS variable's identity *)
-      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
-      AddressStored {
-        state = { state with subst = VarIdMap.add lhs_id rhs_canonical state.subst };
-        canonical_rhs = rhs_norm }
+      AliasStored { state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }
   | None ->
     Logging.die InternalError
       "[Error] store_dereference_address_assign - failed to find base pointer variable"

@@ -84,7 +84,7 @@ module TransferFunctions = struct
       | Some (rhs_id, off) ->
           exec_load_deref_ loc instr tenv typ lhs_id rhs_id off state
       | None ->
-        [{ state with status = Error (None, loc, instr) }]
+        [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
     else begin
       if is_sil_address_assign rhs && is_pointer_type typ then
         match base_and_offset_of_expr rhs_expr state with
@@ -93,7 +93,7 @@ module TransferFunctions = struct
           [{ state with
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
-          [{ state with status = Error (None, loc, instr) }]
+          [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
       else
         let rhs_norm = normalize_expr rhs_expr state in
         assign_to_variable lhs_id rhs_norm state
@@ -179,7 +179,7 @@ module TransferFunctions = struct
         handle_match_result match_res miss_hps miss_rest ~is_missing:true state
       | None ->
         (* missing resource *)
-        let err_state = { state with status = Error (None, loc, instr) } in
+        let err_state = { state with status = Error (err_load_deref_missing_cell, loc, instr) } in
         let cell_id = Id.fresh () in
         let missing_spatial = ExpPointsTo (
           Expr.BinOp (Pplus, Var rhs_var_id, Const (Int rhs_offset)),
@@ -199,7 +199,7 @@ module TransferFunctions = struct
       | Some (lhs_id, off) ->
           exec_store_deref loc instr tenv lhs_typ lhs_id off rhs_expr state
       | None ->
-        [{ state with status = Error (None, loc, instr) }]
+        [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
     else begin
       if is_sil_address_assign lhs && is_pointer_type lhs_typ then begin
         match direct_id_of_sil_lvar lhs state with
@@ -227,10 +227,10 @@ module TransferFunctions = struct
                  without modifying the formula, preserving the RHS variable's identity *)
               [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
           | None ->
-            [{ state with status = Error (None, loc, instr) }]
+            [{ state with status = Error (err_store_assign_no_rhs_base, loc, instr) }]
           end
         | None ->
-          [{ state with status = Error (None, loc, instr) }]
+          [{ state with status = Error (err_store_assign_no_lhs, loc, instr) }]
       end else
         match direct_id_of_sil_lvar lhs state with
         | Some lhs_direct_id ->
@@ -266,24 +266,20 @@ module TransferFunctions = struct
     states
 
   and dereference_check_freed loc instr var_id state =
-    if State.is_freed_expr var_id state then begin
-      Format.print_string "[Error]: exec_store failed with: memory block is freed\n";
-      [{ state with status = Error (None, loc, instr)}]
-      end
+    if State.is_freed_expr var_id state then
+      [{ state with status = Error (err_deref_use_after_free, loc, instr)}]
     else [state]
 
   and exec_deref_check_base loc instr var_id offset state =
     match State.lookup_pure_unop_eq_expr var_id Expr.Base state with
     | Some (e, _) when Formula.is_zero_expr e ->
-      (* Base() == 0 *)
       [{ state with
-        status = Error (None, loc, instr) }]
+        status = Error (err_deref_null_base, loc, instr) }]
     | Some (e, is_current) ->
       dereference_check_lower_bound loc instr e is_current var_id offset state
     | None ->
-      (* missing resource *)
       let err_state = { state with
-        status = Error (None, loc, instr) }
+        status = Error (err_deref_missing_base, loc, instr) }
       in
       let missing_part = Expr.BinOp (
         Peq,
@@ -299,11 +295,8 @@ module TransferFunctions = struct
   and dereference_check_lower_bound loc instr base_exp is_current var_id offset state =
     let base_offset = eval_expr_offset base_exp var_id state in
     if (Int64.compare offset base_offset) < 0 then begin
-      if is_current then begin
-        Format.print_string "[Error]: exec_store failed with: offset of expression is lesser than lower bound\n";
-        (* offset out of bounds *)
-        [{ state with status = Error (None, loc, instr) }]
-        end
+      if is_current then
+        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
       else
         (* missing resource - we can lower the bound *)
         let to_remove = Expr.BinOp (Peq, UnOp (Base, Var var_id), base_exp) in
@@ -325,15 +318,13 @@ module TransferFunctions = struct
   and exec_deref_check_end loc instr var_id offset cell_size state =
     match State.lookup_pure_unop_eq_expr var_id Expr.End state with
     | Some (e, _) when Formula.is_zero_expr e ->
-      (* Base() == 0 *)
       [{ state with
-        status = Error (None, loc, instr) }]
+        status = Error (err_deref_null_end, loc, instr) }]
     | Some (e, is_current) ->
       dereference_check_upper_bound loc instr e is_current var_id offset cell_size state
     | None ->
-      (* missing resource *)
       let err_state = { state with
-        status = Error (None, loc, instr) }
+        status = Error (err_deref_missing_end, loc, instr) }
       in
       let missing_part = Expr.BinOp (
         Peq,
@@ -350,11 +341,8 @@ module TransferFunctions = struct
     let end_offset = eval_expr_offset end_expr var_id state in
     let access_end = Stdlib.Int64.add offset cell_size in
     if (Int64.compare access_end end_offset) > 0 then begin
-      if is_current then begin
-        (* offset out of bounds *)
-        Format.print_string "[Error]: exec_store failed with: offset of expression is greater than upper bound \n";
-        [{ state with status = Error (None, loc, instr) }]
-        end
+      if is_current then
+        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
       else
         (* missing resource - we can increase the bound *)
         let to_remove = Expr.BinOp (Peq, UnOp (End, Var var_id), end_expr) in
@@ -463,8 +451,7 @@ module TransferFunctions = struct
           handle_block_split_res ~to_missing:true to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
       end
       | None ->
-        (* missing resource *)
-        let err_state = { state with status = Error (None, loc, instr) } in
+        let err_state = { state with status = Error (err_store_deref_missing_cell, loc, instr) } in
         let cell_id = Id.fresh () in
         let lhs_expr = Expr.Var cell_id in
         let missing_spatial = ExpPointsTo (
@@ -532,7 +519,7 @@ module TransferFunctions = struct
       free_block loc instr base_id offset state
     | None ->
       [{ state with
-        status = Error (None, loc, instr) }]
+        status = Error (err_free_no_base_pointer, loc, instr) }]
 
   and exec_metadata_instr metadata state =
     let open Sil in
@@ -584,15 +571,13 @@ module TransferFunctions = struct
       let open State in
       (* Step 1: check if already freed *)
       if State.is_freed_expr id state then
-        (* double free *)
-        [{ state with status = Error (None, loc, instr) }]
+        [{ state with status = Error (err_free_double_free, loc, instr) }]
       else
       (* Step 2: find Base(Var id) == some_exp *)
       match State.lookup_pure_unop_eq_expr id Expr.Base state with
       | Some (base_exp, _is_current) ->
         if Formula.is_zero_expr base_exp then
-          (* Base(id) == 0 means no memory allocated *)
-          [{ state with status = Error (None, loc, instr) }]
+          [{ state with status = Error (err_free_unallocated, loc, instr) }]
         else
           let base_offset = eval_expr_offset base_exp id state in
           if Int64.equal base_offset offset then
@@ -600,11 +585,9 @@ module TransferFunctions = struct
             let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
             [{ state with current = { state.current with pure } }]
           else
-            (* free called with non-base pointer, hard error *)
-            [{ state with status = Error (None, loc, instr) }]
+            [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
       | None ->
-        (* missing resource: no Base constraint found *)
-        let err_state = { state with status = Error (None, loc, instr) } in
+        let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
         let missing_base = Expr.BinOp (
           Peq,
           UnOp (Base, Var id),

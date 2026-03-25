@@ -58,17 +58,32 @@ module TransferFunctions = struct
 
           exec_free_instr loc instr actual actual_expr state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
-      [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
+      begin
+        Format.print_string "[SIL_PRUNE]\n";
+        [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
+      end
+    | Sil.Call ( _, procname_exp, _, _, _ ) ->
+      let procname = match procname_exp with
+        | Exp.Const (Const.Cfun name) ->
+          (Procname.to_string name) ^ "\n"
+        | _ -> ""
+      in
+      Format.print_string ("[SIL_CALL]\n" ^ procname);
+      [state]
     | Sil.Metadata metadata ->
       exec_metadata_instr metadata state
-    | Sil.Call _ ->
-      [state]
     in
 
-    Format.print_string (String.concat (
-      List.map
-        ~f:(fun state -> State.to_string state)
-        states));
+    let is_modified_state = match instr with
+      | Sil.Load _ | Sil.Store _ | Sil.Call _
+      | Sil.Metadata (Sil.ExitScope _) -> true
+      | _ -> false
+    in
+    if is_modified_state then
+      Format.print_string (String.concat (
+        List.map
+          ~f:(fun state -> State.to_string state)
+          states));
 
     states
 
@@ -560,7 +575,7 @@ module TransferFunctions = struct
       Format.print_string "[SIL_LOOP_ENTRY]\n";
       [state]
     | Abstract _ ->
-      Format.print_string "[SIL_APPLY_ABSTRACTION]";
+      Format.print_string "[SIL_APPLY_ABSTRACTION]\n";
       (* TODO good place to clean up final state *)
       [state]
     | _ ->

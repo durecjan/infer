@@ -108,6 +108,8 @@ module TransferFunctions = struct
           [{ state with
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
+          (* Const(Cint(null)) cannot appear here — SIL only places heap addresses
+             on the RHS of Load address assigns, and null is not a heap address *)
           [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
       else
         let rhs_norm = normalize_expr rhs_expr state in
@@ -241,6 +243,17 @@ module TransferFunctions = struct
               (* RHS is a program variable or internal id — record the alias in subst
                  without modifying the formula, preserving the RHS variable's identity *)
               [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
+          | None when Formula.is_null_expr rhs_norm ->
+            (* RHS is null — reset LHS to unallocated state *)
+            let state = clear_before_subst lhs_direct_id state in
+            let lhs_var = Expr.Var lhs_direct_id in
+            let pure =
+              Expr.BinOp (Peq, lhs_var, Expr.null) ::
+              Expr.BinOp (Peq, UnOp (Base, lhs_var), Expr.null) ::
+              Expr.BinOp (Peq, UnOp (End, lhs_var), Expr.null) ::
+              state.current.pure
+            in
+            [{ state with current = { state.current with pure } }]
           | None ->
             [{ state with status = Error (err_store_assign_no_rhs_base, loc, instr) }]
           end
@@ -538,18 +551,27 @@ module TransferFunctions = struct
     } in
     [ ok_state; null_state ]
 
-  (* Note: free(NULL) is translated by SIL as Metadata.Skip, so we do not handle it here.
-     A NULL value stored in a variable (e.g. void* x = NULL; free(x);) would go through
-     the store/load sequence before reaching free, and would have been caught by dereference
-     checks earlier in execution. Skipping explicit NULL handling for now. *)
+  (** free(NULL) is a no-op per the C standard. We check for null both as a literal
+      constant and as a variable whose value resolves to null *)
   and exec_free_instr loc instr _actual actual_expr state =
     let open State in
-    match base_and_offset_of_expr actual_expr state with
-    | Some (base_id, offset) ->
-      free_block loc instr base_id offset state
-    | None ->
-      [{ state with
-        status = Error (err_free_no_base_pointer, loc, instr) }]
+    let is_null_var_expr id =
+      match Formula.lookup_pure_const_exp_of_id id state.current.pure with
+      | Some e -> Formula.is_null_expr e
+      | None -> false
+    in
+    if Formula.is_null_expr actual_expr then
+      [state]
+    else
+      match base_and_offset_of_expr actual_expr state with
+      | Some (base_id, offset) ->
+        if is_null_var_expr base_id then
+          [state]
+        else
+          free_block loc instr base_id offset state
+      | None ->
+        [{ state with
+          status = Error (err_free_no_base_pointer, loc, instr) }]
 
   and exec_metadata_instr metadata state =
     let open Sil in

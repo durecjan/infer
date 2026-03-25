@@ -491,7 +491,8 @@ type store_deref_assign_res =
           so separated heap predicates need no fixup *)
 
 (** Assigns [rhs_expr] to [lhs_expr] during store dereference.
-    For non-pointer types: adds (lhs == rhs) equality and zero Base/End constraints to pure.
+    For non-pointer types: if RHS is a variable, adds a substitution; otherwise adds
+    a pure equality constraint (mirrors [assign_to_variable] in AtlasTransfer).
     For pointer types: delegates to [store_dereference_address_assign] which updates substitutions.
     Returns [store_deref_assign_res] so callers can handle separated heap predicates correctly *)
 let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr =
@@ -499,13 +500,17 @@ let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr =
   if is_pointer_type lhs_typ then
     store_dereference_address_assign { state with types } lhs_id lhs_expr rhs_expr
   else
-    let pure_part =
-      Expr.BinOp (Peq, lhs_expr, rhs_expr) ::
-      Expr.BinOp (Peq, UnOp (Base, Var lhs_id), Const (Int 0L)) ::
-      [ Expr.BinOp (Peq, UnOp (End, Var lhs_id), Const (Int 0L)) ]
-    in
-    let pure = List.append pure_part state.current.pure in
-    ValueStored { state with types; current = { state.current with pure } }
+    let state = { state with types } in
+    match rhs_expr with
+    | Expr.Var rhs_id ->
+      if Id.equal lhs_id rhs_id then
+        ValueStored state
+      else
+        ValueStored { state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }
+    | _ ->
+      let exp = Expr.BinOp (Peq, lhs_expr, normalize_expr rhs_expr state) in
+      let pure = exp :: state.current.pure in
+      ValueStored { state with current = { state.current with pure } }
 
 (** Handles pointer-typed store dereference. Extracts the RHS base+offset,
     canonicalizes it, then calls [clear_before_subst] on [lhs_id] to remove stale

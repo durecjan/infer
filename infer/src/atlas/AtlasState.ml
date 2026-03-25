@@ -546,6 +546,17 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
       (* RHS is a program variable — record the alias in subst without
          modifying the formula, preserving the RHS variable's identity *)
       AliasStored { state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }
+  | None when Formula.is_null_expr rhs_expr ->
+    (* RHS is null — reset LHS to unallocated state *)
+    let state = clear_before_subst lhs_id state in
+    let lhs_var = Expr.Var lhs_id in
+    let pure =
+      Expr.BinOp (Peq, lhs_var, Expr.null) ::
+      Expr.BinOp (Peq, UnOp (Base, lhs_var), Expr.null) ::
+      Expr.BinOp (Peq, UnOp (End, lhs_var), Expr.null) ::
+      state.current.pure
+    in
+    ValueStored { state with current = { state.current with pure } }
   | None ->
     Logging.die InternalError
       "[Error] store_dereference_address_assign - failed to find base pointer variable"

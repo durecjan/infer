@@ -64,21 +64,22 @@ let rec empty analysis =
   let with_locals = List.fold ~init:s locals
     ~f:(fun state var -> 
       let pvar = Pvar.mk var.name proc_name in
-      add_variable pvar var.typ state)
+      add_variable ~is_local:true state pvar var.typ)
   in
   let with_formals = List.fold ~init:with_locals formals
     ~f:(fun state (pvar, typ) ->
-      add_variable pvar typ state)
+      add_variable state pvar typ)
   in
   { with_formals with 
     vars = VarIdMap.add 0 (Var.of_pvar ret_var) with_formals.vars;
     types = VarIdMap.add 0 ret_typ with_formals.types }
 
 (** Adds variable [v] with type [t] into state [s]. If [id] is present, it is used,
-    otherwise a fresh id is generated. For pointer-typed variables, adds [Base(Var id)==0]
-    and [End(Var id)==0] constraints to [current.pure] so that unallocated pointers are
-    always detectable, regardless of whether [VariableLifetimeBegins] metadata fires *)
-and add_variable ?id v t s =
+    otherwise a fresh id is generated. For pointer-typed local variables, adds
+    [Base(Var id)==0] and [End(Var id)==0] constraints to [current.pure] so that
+    unallocated pointers are always detectable, regardless of whether
+    [VariableLifetimeBegins] metadata fires *)
+and add_variable ?id ?is_local:(is_local=false) s v t =
   let id' = match id with
   | Some id -> id
   | None -> Id.fresh ()
@@ -87,7 +88,7 @@ and add_variable ?id v t s =
     vars = VarIdMap.add id' (Var.of_pvar v) s.vars;
     types = VarIdMap.add id' t s.types }
   in
-  if is_pointer_type t then
+  if is_pointer_type t  && is_local then
     let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L)) in
     let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L)) in
     { s with current = { s.current with

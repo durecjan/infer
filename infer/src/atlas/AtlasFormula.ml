@@ -79,11 +79,13 @@ module Expr = struct
   
   and const_val =
     | Int of Int64.t
+    | Null  (** Null pointer constant — distinct from integer zero *)
     | String of string
     | Float of float
 
   let one = Const (Int 1L)
   let zero = Const (Int 0L)
+  let null = Const Null
 
   (** Return variable is always Id 0 *)
   let ret = Var 0
@@ -123,6 +125,7 @@ module Expr = struct
       Id.equal id1 id2
     | Const (Int i1), Const (Int i2) ->
       Int64.equal i1 i2
+    | Const Null, Const Null -> true
     | Const (String s1), Const (String s2) ->
       String.equal s1 s2
     | Const (Float f1), Const (Float f2) ->
@@ -149,6 +152,7 @@ module Expr = struct
   let const_to_string c =
     match c with
     | Int i -> Int64.to_string i
+    | Null -> "null"
     | String s -> "\"" ^ String.escaped s ^ "\""
     | Float f -> Float.to_string f
 
@@ -303,6 +307,8 @@ and eval_expr_to_int64 e =
   match e with
     Const (Int i) ->
       Some i
+  | Const Null ->
+      Some 0L
   | UnOp (Puminus, e1) ->
     Option.map (eval_expr_to_int64 e1) ~f:(fun v ->
       Stdlib.Int64.neg v)
@@ -336,6 +342,11 @@ and eval_expr_to_int64 e =
 let is_zero_expr expr =
   match eval_expr_to_int64 expr with
   | Some i when Int64.equal i 0L -> true
+  | _ -> false
+
+(** Checks whether [expr] is a null pointer constant *)
+let is_null_expr = function
+  | Expr.Const Null -> true
   | _ -> false
 
 

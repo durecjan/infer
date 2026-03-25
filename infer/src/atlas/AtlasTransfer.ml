@@ -287,7 +287,7 @@ module TransferFunctions = struct
 
   and exec_deref_check_base loc instr var_id offset state =
     match State.lookup_pure_unop_eq_expr var_id Expr.Base state with
-    | Some (e, _) when Formula.is_zero_expr e ->
+    | Some (e, _) when Formula.is_null_expr e ->
       [{ state with
         status = Error (err_deref_null_base, loc, instr) }]
     | Some (e, is_current) ->
@@ -332,7 +332,7 @@ module TransferFunctions = struct
 
   and exec_deref_check_end loc instr var_id offset cell_size state =
     match State.lookup_pure_unop_eq_expr var_id Expr.End state with
-    | Some (e, _) when Formula.is_zero_expr e ->
+    | Some (e, _) when Formula.is_null_expr e ->
       [{ state with
         status = Error (err_deref_null_end, loc, instr) }]
     | Some (e, is_current) ->
@@ -513,7 +513,9 @@ module TransferFunctions = struct
       Some i -> Const (Int i)
     | None -> size
     in
-    let { current } = state in [{
+    let { current } = state in
+    (* success state: block allocated with Base/End constraints *)
+    let ok_state = {
       state with
       current = {
         spatial = BlockPointsTo (source, size) :: current.spatial;
@@ -522,7 +524,19 @@ module TransferFunctions = struct
           BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
           current.pure
       };
-    }]
+    } in
+    (* failure state: malloc returned NULL *)
+    let null_state = {
+      state with
+      current = {
+        current with pure =
+          BinOp (Peq, source, Expr.null) ::
+          BinOp (Peq, UnOp (Base, source), Expr.null) ::
+          BinOp (Peq, UnOp (End, source), Expr.null) ::
+          current.pure
+      };
+    } in
+    [ ok_state; null_state ]
 
   (* Note: free(NULL) is translated by SIL as Metadata.Skip, so we do not handle it here.
      A NULL value stored in a variable (e.g. void* x = NULL; free(x);) would go through
@@ -592,7 +606,7 @@ module TransferFunctions = struct
       (* Step 2: find Base(Var id) == some_exp *)
       match State.lookup_pure_unop_eq_expr id Expr.Base state with
       | Some (base_exp, _is_current) ->
-        if Formula.is_zero_expr base_exp then
+        if Formula.is_null_expr base_exp then
           [{ state with status = Error (err_free_unallocated, loc, instr) }]
         else
           let base_offset = eval_expr_offset base_exp id state in

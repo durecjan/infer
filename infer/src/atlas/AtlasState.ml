@@ -506,18 +506,37 @@ let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr =
 (** Handles pointer-typed store dereference. Extracts the RHS base+offset,
     canonicalizes it, then calls [clear_before_subst] on [lhs_id] to remove stale
     Base/End==0 constraints and preserve old references via a placeholder.
-    Finally applies the substitution so the RHS expression maps to the LHS.
+    If the RHS canonical base maps to a temp variable, applies [subst_apply] to rename
+    the temp in the formula. If it maps to a program variable, records an alias via
+    substitution entry to preserve the RHS variable's identity.
     Returns [AddressStored] with the canonical RHS used in substitution *)
 and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
   match base_and_offset_of_expr rhs_expr state with
   | Some (rhs_id, rhs_offset) ->
     let rhs_canonical = canonical_expr state.subst rhs_id rhs_offset in
-    let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
-    let lhs_norm = normalize_expr lhs_expr state in
+    let rhs_canon_base = match rhs_canonical with
+      | Var id -> id | Ptr { base; _ } -> base
+    in
+    let is_temp = match VarIdMap.find_opt rhs_canon_base state.vars with
+      | Some var -> not (Var.is_pvar var)
+      | None -> false
+    in
     let state = clear_before_subst lhs_id state in
-    AddressStored {
-      state = subst_apply ~from_:rhs_norm ~to_:lhs_norm state;
-      canonical_rhs = rhs_norm }
+    if is_temp then
+      (* RHS is a temp variable — rename it in the formula so that
+         the temp's formula entries become owned by the LHS variable *)
+      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
+      let lhs_norm = normalize_expr lhs_expr state in
+      AddressStored {
+        state = subst_apply ~from_:rhs_norm ~to_:lhs_norm state;
+        canonical_rhs = rhs_norm }
+    else
+      (* RHS is a program variable — record the alias in subst without
+         modifying the formula, preserving the RHS variable's identity *)
+      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
+      AddressStored {
+        state = { state with subst = VarIdMap.add lhs_id rhs_canonical state.subst };
+        canonical_rhs = rhs_norm }
   | None ->
     Logging.die InternalError
       "[Error] store_dereference_address_assign - failed to find base pointer variable"

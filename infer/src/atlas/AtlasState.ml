@@ -8,7 +8,28 @@ open !Formula
 type subst_expr = Var of Id.t | Ptr of { base: Id.t ; offset: Int64.t }
 
 (** State status *)
-type status = Ok | Error of IssueType.t option * Location.t * Sil.instr
+type status = Ok | Error of string * Location.t * Sil.instr
+
+(** Error status messages *)
+let err_load_deref_no_base       = "load deref: no base pointer variable found"
+let err_load_assign_no_base      = "load address assign: no base pointer variable found"
+let err_store_deref_no_base      = "store deref: no base pointer variable found"
+let err_store_assign_no_lhs      = "store address assign: no direct variable id on LHS"
+let err_store_assign_no_rhs_base = "store address assign: no base pointer in RHS"
+let err_deref_use_after_free     = "dereference of freed memory block"
+let err_deref_null_base          = "dereference of unallocated pointer (Base==0)"
+let err_deref_null_end           = "dereference of unallocated pointer (End==0)"
+let err_deref_below_lower_bound  = "dereference offset below lower bound"
+let err_deref_above_upper_bound  = "dereference offset above upper bound"
+let err_deref_missing_base       = "dereference: missing Base constraint"
+let err_deref_missing_end        = "dereference: missing End constraint"
+let err_load_deref_missing_cell  = "load deref: missing heap cell (no match)"
+let err_store_deref_missing_cell = "store deref: missing heap cell (no match)"
+let err_free_no_base_pointer     = "free: no base pointer variable found"
+let err_free_double_free         = "free: memory block already freed"
+let err_free_unallocated         = "free: pointer not allocated (Base==0)"
+let err_free_non_base_offset     = "free: offset does not match base"
+let err_free_missing_base        = "free: missing Base constraint"
 
 (** Abstract state *)
 type t = {
@@ -938,13 +959,9 @@ and status_to_string s =
   match s with
     Ok ->
       "OK\n"
-  | Error (Some issue, loc, instr) ->
+  | Error (msg, loc, instr) ->
     "ERROR\n" ^
-    "ISSUE=" ^ issue.unique_id ^ "\n" ^
-    "LOCATION=" ^ loc_to_string loc ^ "\n" ^
-    "SIL_INSTR=" ^ sil_instr_to_string instr ^ "\n"
-  | Error (None, loc, instr) ->
-    "ERROR\nISSUE=\n" ^
+    "MESSAGE=" ^ msg ^ "\n" ^
     "LOCATION=" ^ loc_to_string loc ^ "\n" ^
     "SIL_INSTR=" ^ sil_instr_to_string instr ^ "\n"
 

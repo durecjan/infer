@@ -89,8 +89,8 @@ and add_variable ?id ?is_local:(is_local=false) s v t =
     types = VarIdMap.add id' t s.types }
   in
   if is_pointer_type t  && is_local then
-    let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L)) in
-    let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L)) in
+    let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Expr.null) in
+    let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Expr.null) in
     { s with current = { s.current with
         pure = base_constr :: end_constr :: s.current.pure } }
   else
@@ -169,19 +169,21 @@ let subst_apply ~from_ ~to_ state =
        (e.g. memory that was reachable through [id] but not yet freed) so the formula
        stays satisfiable after [id] is rebound to a new address. *)
 let clear_before_subst id state =
-  let is_base_or_end_zero_expr = function
-    | Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L))
+  let is_stale_constraint = function
+    | Expr.BinOp (Peq, UnOp (Base, Var id'), Const Null)
       when Id.equal id id' -> true
-    | Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L))
+    | Expr.BinOp (Peq, UnOp (End, Var id'), Const Null)
+      when Id.equal id id' -> true
+    | Expr.UnOp (Freed, Var id')
       when Id.equal id id' -> true
     | _ -> false
   in
   let current_pure = List.filter
-    ~f:(fun exp -> not (is_base_or_end_zero_expr exp))
+    ~f:(fun exp -> not (is_stale_constraint exp))
     state.current.pure
   in
   let missing_pure = List.filter
-    ~f:(fun exp -> not (is_base_or_end_zero_expr exp))
+    ~f:(fun exp -> not (is_stale_constraint exp))
     state.missing.pure
   in
   let state = { state with
@@ -822,7 +824,8 @@ let rec sil_exp_to_expr ?typ e tenv s =
 
 and sil_const_exp_to_expr c =
   match c with
-    Const.Cint i -> Expr.Const (Int (Z.to_int64 (IntLit.to_big_int i)))
+    Const.Cint i when IntLit.isnull i -> Expr.null
+  | Const.Cint i -> Expr.Const (Int (Z.to_int64 (IntLit.to_big_int i)))
   | Const.Cstr str -> Expr.Const (String str)
   | Const.Cfloat f -> Expr.Const (Float f)
   | Const.Cfun _ | Const.Cclass _ -> Expr.Undef

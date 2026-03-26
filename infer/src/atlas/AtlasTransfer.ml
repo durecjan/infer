@@ -632,7 +632,8 @@ module TransferFunctions = struct
         else
           let base_offset = eval_expr_offset base_exp id state in
           if Int64.equal base_offset offset then
-            (* happy path: offset matches base, add Freed to current *)
+            (* happy path: offset matches base, cleanup and add Freed to current *)
+            let state = State.cleanup_after_free id state in
             let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
             [{ state with current = { state.current with pure } }]
           else

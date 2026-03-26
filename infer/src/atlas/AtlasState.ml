@@ -514,6 +514,84 @@ let cleanup_after_free var_id state =
       pure = List.filter state.current.pure
         ~f:(fun e -> not (is_base_or_end_constraint e)) } }
 
+
+(* ==================== prune condition evaluation ==================== *)
+
+(** Result of evaluating a prune condition against a state *)
+type prune_result = Sat | Unsat | Unknown
+
+let negate_prune = function
+  | Sat -> Unsat
+  | Unsat -> Sat
+  | Unknown -> Unknown
+
+(** Checks whether a pointer variable [id] is known to be null or non-null.
+    Scans current then missing pure constraints in a single pass each, looking for:
+    - [Var id == Null] or [Null == Var id] → [Some true] (null)
+    - [Base(Var id) == exp] or [exp == Base(Var id)] → [Some true] if exp is null, [Some false] otherwise
+    - [Base(Var id) <= exp] or [exp <= Base(Var id)] → [Some false] (has an inequality bound, so allocated)
+    Returns [None] if no relevant constraint is found *)
+let is_var_null id state =
+  let rec scan = function
+    | [] -> None
+    | Expr.BinOp (Peq, Var id', Const Null) :: _
+      when Id.equal id id' -> Some true
+    | Expr.BinOp (Peq, Const Null, Var id') :: _
+      when Id.equal id id' -> Some true
+    | Expr.BinOp (Peq, UnOp (Base, Var id'), exp) :: _
+      when Id.equal id id' ->
+        Some (Formula.is_zero_expr exp)
+    | Expr.BinOp (Peq, exp, UnOp (Base, Var id')) :: _
+      when Id.equal id id' ->
+        Some (Formula.is_zero_expr exp)
+    | Expr.BinOp (Plesseq, UnOp (Base, Var id'), _) :: _
+      when Id.equal id id' -> Some false
+    | Expr.BinOp (Plesseq, _, UnOp (Base, Var id')) :: _
+      when Id.equal id id' -> Some false
+    | _ :: rest -> scan rest
+  in
+  match scan state.current.pure with
+  | Some _ as res -> res
+  | None -> scan state.missing.pure
+
+(** Evaluates whether two expressions are equal in the given state.
+    Handles concrete values via [eval_expr_to_int64_opt] and null checks
+    for pointer variables via Base constraints *)
+let eval_eq e1 e2 state =
+  let e1 = normalize_expr e1 state in
+  let e2 = normalize_expr e2 state in
+  if Expr.equal e1 e2 then Sat
+  else
+    match eval_expr_to_int64_opt e1 state, eval_expr_to_int64_opt e2 state with
+    | Some v1, Some v2 ->
+      if Int64.equal v1 v2 then Sat else Unsat
+    | _ ->
+      (* null check: one side is null, other is a pointer variable *)
+      match e1, e2 with
+      | Expr.Const Null, Expr.Var id
+      | Expr.Var id, Expr.Const Null ->
+        begin match is_var_null id state with
+        | Some true -> Sat
+        | Some false -> Unsat
+        | None -> Unknown
+        end
+      | _ -> Unknown
+
+(** Evaluates a prune condition expression against a state.
+    Returns [Sat] if the condition is satisfiable (keep state),
+    [Unsat] if contradicted (filter out state), [Unknown] if
+    undetermined (keep conservatively).
+    Handles: equality, inequality, logical not, and nested combinations *)
+let rec eval_prune_condition expr state =
+  match expr with
+  | Expr.BinOp (Peq, e1, e2) ->
+    eval_eq e1 e2 state
+  | Expr.BinOp (Pneq, e1, e2) ->
+    negate_prune (eval_eq e1 e2 state)
+  | Expr.UnOp (Lnot, inner) ->
+    negate_prune (eval_prune_condition inner state)
+  | _ -> Unknown
+
 (** Result of [store_dereference_assign], distinguishing scalar vs pointer stores.
     For pointer stores, the canonical RHS expression used in substitution is returned
     so that callers can update separated heap predicates (those not present in the

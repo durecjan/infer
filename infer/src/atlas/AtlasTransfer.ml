@@ -52,7 +52,11 @@ module TransferFunctions = struct
         let cond = sil_exp_to_expr exp tenv state in
         match State.eval_prune_condition cond state with
         | State.Unsat -> []
-        | State.Sat | State.Unknown -> [state]
+        | State.Sat -> [state]
+        | State.Unknown ->
+          (* condition depends on external input — record as precondition *)
+          let missing_pure = cond :: state.missing.pure in
+          [{ state with missing = { state.missing with pure = missing_pure } }]
       end
     | Sil.Call _ ->
       Format.print_string (

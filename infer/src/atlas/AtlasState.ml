@@ -977,7 +977,7 @@ let rec to_string state =
   ^ subst_to_string state.vars state.subst
   ^ "\n----------------\nTypes:\n"
   ^ types_to_string state.types
-  ^ "\n================"
+  ^ "\n================\n"
 
 and subst_to_string vars subst =
   let traversal =

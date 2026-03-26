@@ -473,11 +473,13 @@ let is_freed_expr id state =
   curr_freed || miss_freed
 
 (** Removes heap predicates and Base/End pure constraints associated with [var_id]
-    from both current and missing parts of the state. Used after a successful free
-    to clean up now-dead constraints — Freed is checked first during dereference,
-    so these serve no purpose after deallocation.
-    Spatial: removes any predicate whose source references [var_id].
-    Pure: removes any constraint involving [Base(Var var_id)] or [End(Var var_id)] *)
+    from the current part of the state only. Used after a successful free to clean up
+    now-dead constraints — Freed is checked first during dereference, so these serve
+    no purpose after deallocation.
+    Missing is intentionally left untouched: it represents caller preconditions
+    (e.g. "this pointer must be allocated"), which remain valid regardless of free.
+    Spatial: removes any current predicate whose source references [var_id].
+    Pure: removes any current constraint involving [Base(Var var_id)] or [End(Var var_id)] *)
 let cleanup_after_free var_id state =
   let has_var_in_source id expr =
     match expr with
@@ -505,15 +507,12 @@ let cleanup_after_free var_id state =
       when Id.equal var_id id' -> true
     | _ -> false
   in
-  let filter_spatial = List.filter ~f:(fun hp -> not (source_references_var hp)) in
-  let filter_pure = List.filter ~f:(fun e -> not (is_base_or_end_constraint e)) in
   { state with
     current = {
-      spatial = filter_spatial state.current.spatial;
-      pure = filter_pure state.current.pure };
-    missing = {
-      spatial = filter_spatial state.missing.spatial;
-      pure = filter_pure state.missing.pure } }
+      spatial = List.filter state.current.spatial
+        ~f:(fun hp -> not (source_references_var hp));
+      pure = List.filter state.current.pure
+        ~f:(fun e -> not (is_base_or_end_constraint e)) } }
 
 (** Result of [store_dereference_assign], distinguishing scalar vs pointer stores.
     For pointer stores, the canonical RHS expression used in substitution is returned

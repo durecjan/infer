@@ -277,17 +277,21 @@ let lookup_pure_const_exp_of_id id pure =
     in
     resolve VarIdSet.empty id
 
-(** Looks up the first pure constraint matching (Base(Var [id]) == exp), returns [Some exp] *)
+(** Looks up the first pure constraint matching [Base(Var id) == exp] or
+    [Base(Var id) <= exp], returns [Some exp] *)
 let rec lookup_pure_base_expr id = function
   | [] -> None
-  | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
+  | Expr.BinOp ((Expr.Peq | Expr.Plesseq), Expr.UnOp (Expr.Base, Expr.Var id'), exp) :: _
     when Id.equal id id' -> Some exp
   | _ :: rest -> lookup_pure_base_expr id rest
 
-(** Looks up the first pure constraint matching (End(Var [id]) == exp), returns [Some exp] *)
+(** Looks up the first pure constraint matching [End(Var id) == exp] or
+    [exp <= End(Var id)], returns [Some exp] *)
 let rec lookup_pure_end_expr id = function
   | [] -> None
   | Expr.BinOp (Expr.Peq, Expr.UnOp (Expr.End, Expr.Var id'), exp) :: _
+    when Id.equal id id' -> Some exp
+  | Expr.BinOp (Expr.Plesseq, exp, Expr.UnOp (Expr.End, Expr.Var id')) :: _
     when Id.equal id id' -> Some exp
   | _ :: rest -> lookup_pure_end_expr id rest
 

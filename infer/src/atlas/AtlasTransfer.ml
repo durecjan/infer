@@ -297,8 +297,8 @@ module TransferFunctions = struct
         status = Error (err_deref_missing_base, loc, instr) }
       in
       let missing_part = Expr.BinOp (
-        Peq,
-        Expr.UnOp (Base, Var var_id), 
+        Plesseq,
+        Expr.UnOp (Base, Var var_id),
         Expr.BinOp (Pplus, Var var_id, Const (Int (Int64.min 0L offset))))
       in
       let ok_state = { state with
@@ -314,13 +314,13 @@ module TransferFunctions = struct
         [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
       else
         (* missing resource - we can lower the bound *)
-        let to_remove = Expr.BinOp (Peq, UnOp (Base, Var var_id), base_exp) in
+        let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var var_id), base_exp) in
         let missing_pure = Stdlib.List.filter
           (fun e -> not (Expr.equal e to_remove))
           state.missing.pure
         in
         let to_add = Expr.BinOp (
-          Peq,
+          Plesseq,
           UnOp (Base, Var var_id),
           BinOp (Pplus, Var var_id, Const (Int offset)))
         in
@@ -342,9 +342,9 @@ module TransferFunctions = struct
         status = Error (err_deref_missing_end, loc, instr) }
       in
       let missing_part = Expr.BinOp (
-        Peq,
-        Expr.UnOp (End, Var var_id),
-        Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))))
+        Plesseq,
+        Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
+        Expr.UnOp (End, Var var_id))
       in
       let ok_state = { state with
         missing = { state.missing with
@@ -360,15 +360,15 @@ module TransferFunctions = struct
         [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
       else
         (* missing resource - we can increase the bound *)
-        let to_remove = Expr.BinOp (Peq, UnOp (End, Var var_id), end_expr) in
+        let to_remove = Expr.BinOp (Plesseq, end_expr, UnOp (End, Var var_id)) in
         let missing_pure = Stdlib.List.filter
           (fun e -> not (Expr.equal e to_remove))
           state.missing.pure
         in
         let to_add = Expr.BinOp (
-          Peq,
-          UnOp (End, Var var_id),
-          BinOp (Pplus, Var var_id, Const (Int access_end)))
+          Plesseq,
+          BinOp (Pplus, Var var_id, Const (Int access_end)),
+          UnOp (End, Var var_id))
         in
         [{ state with missing = {
           state.missing with pure = to_add :: missing_pure } }]
@@ -598,7 +598,7 @@ module TransferFunctions = struct
       | None ->
         let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
         let missing_base = Expr.BinOp (
-          Peq,
+          Plesseq,
           UnOp (Base, Var id),
           BinOp (Pplus, Var id, Const (Int offset)))
         in

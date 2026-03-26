@@ -45,11 +45,14 @@ module TransferFunctions = struct
             "[SIL_FREE]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr actual tenv state in
           exec_free_instr loc instr actual actual_expr state
-    | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
+    | Sil.Prune (exp, _loc, _is_then_branch, _if_kind) ->
       begin
         Format.print_string (
           "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
-        [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
+        let cond = sil_exp_to_expr exp tenv state in
+        match State.eval_prune_condition cond state with
+        | State.Unsat -> []
+        | State.Sat | State.Unknown -> [state]
       end
     | Sil.Call _ ->
       Format.print_string (

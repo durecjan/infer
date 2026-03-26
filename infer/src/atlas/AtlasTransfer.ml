@@ -65,8 +65,7 @@ module TransferFunctions = struct
     in
 
     let is_modified_state = match instr with
-      | Sil.Load _ | Sil.Store _ | Sil.Call _
-      | Sil.Metadata (Sil.ExitScope _) -> true
+      | Sil.Load _ | Sil.Store _ | Sil.Call _ | Sil.Prune _ | Sil.Metadata (Sil.ExitScope _) -> true
       | _ -> false
     in
     if is_modified_state then
@@ -135,9 +134,9 @@ module TransferFunctions = struct
     |> concat_map_ok_states
       (exec_deref_check_end loc instr rhs_var_id rhs_offset cell_size)
     |> concat_map_ok_states
-      (load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size)
+      (load_dereference_try_match_heap_predicates loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size)
 
-  and load_dereference_try_match_heap_predicates loc instr lhs_id rhs_var_id rhs_offset cell_size state =
+  and load_dereference_try_match_heap_predicates loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state =
     let curr_hps, curr_rest, miss_hps, miss_rest =
       State.heap_find_block_fragments state rhs_var_id rhs_offset cell_size
     in
@@ -175,7 +174,8 @@ module TransferFunctions = struct
             { state with current = { state.current with spatial } }
         in
         let subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst in
-        [{ state with subst }]
+        let types = VarIdMap.add new_dest_id rhs_typ state.types in
+        [{ state with subst; types }]
     in
     match try_match curr_hps with
     | Some match_res ->
@@ -196,7 +196,8 @@ module TransferFunctions = struct
         let spatial = missing_spatial :: state.missing.spatial in
         let state = { state with missing = { state.missing with spatial } } in
         let subst = VarIdMap.add lhs_id (Var cell_id) state.subst in
-        [err_state; { state with subst }]
+        let types = VarIdMap.add cell_id rhs_typ state.types in
+        [err_state; { state with subst; types }]
       end
 
   and exec_store_instr loc instr tenv lhs_typ lhs lhs_expr rhs_expr state =

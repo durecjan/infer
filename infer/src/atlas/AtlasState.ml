@@ -89,8 +89,8 @@ and add_variable ?id ?is_local:(is_local=false) s v t =
     types = VarIdMap.add id' t s.types }
   in
   if is_pointer_type t  && is_local then
-    let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Expr.null) in
-    let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Expr.null) in
+    let base_constr = Expr.BinOp (Peq, UnOp (Base, Var id'), Expr.zero) in
+    let end_constr = Expr.BinOp (Peq, UnOp (End, Var id'), Expr.zero) in
     { s with current = { s.current with
         pure = base_constr :: end_constr :: s.current.pure } }
   else
@@ -170,9 +170,9 @@ let subst_apply ~from_ ~to_ state =
        stays satisfiable after [id] is rebound to a new address. *)
 let clear_before_subst id state =
   let is_stale_constraint = function
-    | Expr.BinOp (Peq, UnOp (Base, Var id'), Const Null)
+    | Expr.BinOp (Peq, UnOp (Base, Var id'), Const (Int 0L))
       when Id.equal id id' -> true
-    | Expr.BinOp (Peq, UnOp (End, Var id'), Const Null)
+    | Expr.BinOp (Peq, UnOp (End, Var id'), Const (Int 0L))
       when Id.equal id id' -> true
     | Expr.UnOp (Freed, Var id')
       when Id.equal id id' -> true
@@ -552,8 +552,8 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
     let lhs_var = Expr.Var lhs_id in
     let pure =
       Expr.BinOp (Peq, lhs_var, Expr.null) ::
-      Expr.BinOp (Peq, UnOp (Base, lhs_var), Expr.null) ::
-      Expr.BinOp (Peq, UnOp (End, lhs_var), Expr.null) ::
+      Expr.BinOp (Peq, UnOp (Base, lhs_var), Expr.zero) ::
+      Expr.BinOp (Peq, UnOp (End, lhs_var), Expr.zero) ::
       state.current.pure
     in
     ValueStored { state with current = { state.current with pure } }

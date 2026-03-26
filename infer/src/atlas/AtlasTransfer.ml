@@ -12,64 +12,52 @@ module TransferFunctions = struct
 
   type instr = Sil.instr
 
-  let rec exec_instr _node analysis_data state instr =
-    Format.fprintf Format.err_formatter "@[<h>%a;@]@;" (Sil.pp_instr ~print_types:true Pp.text) instr;
+  let sil_instr_to_string = Format.asprintf "%a" (Sil.pp_instr ~print_types:true Pp.text)
+  let sil_metadata_to_string = Format.asprintf "%a" (Sil.pp_instr_metadata Pp.text)
 
+  let rec exec_instr _node analysis_data state instr =
     let open IntraproceduralAnalysis in
     let open State in
     let tenv = analysis_data.tenv in
     let states = match instr with
     | Sil.Load { id; e; typ; loc } ->
-      let rhs_expr = sil_exp_to_expr ~typ:typ e tenv state in
-
       Format.print_string (
-        "[SIL_LOAD]\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
-
+        "[SIL_LOAD]: " ^ sil_instr_to_string instr ^ "\n");
+      let rhs_expr = sil_exp_to_expr ~typ:typ e tenv state in
       exec_load_instr loc instr id tenv typ e rhs_expr state
     | Sil.Store {e1; typ; e2; loc} ->
-
       Format.print_string (
-        "[SIL_STORE]\n[SIL_INSTR_LHS]: " ^ sil_exp_to_string e1 ^ "\n[SIL_INSTR_RHS]: " ^ sil_exp_to_string e2) ;
-
+        "[SIL_STORE]: " ^ sil_instr_to_string instr ^ "\n");
       let lhs_expr = sil_exp_to_expr ~typ:typ e1 tenv state in
       let rhs_expr = sil_exp_to_expr e2 tenv state in
-
-      Format.print_string (
-        "\n[LHS_EXPR]: " ^ Expr.to_string state.vars lhs_expr ^ "\n[RHS_EXPR]: " ^ Expr.to_string state.vars rhs_expr ^ "\n");
-
       exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr state
     | Sil.Call
-      ( (ident, typ), Exp.Const (Const.Cfun procname), (actual, actual_typ) :: _, _loc, _ )
+      ( (ident, typ), Exp.Const (Const.Cfun procname), ((actual, actual_typ) :: _), _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-          let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
-
           Format.print_string (
-            "[SIL_MALLOC]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
-
+            "[SIL_MALLOC]: " ^ sil_instr_to_string instr ^ "\n");
+          let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
           exec_malloc_instr ident typ actual_expr state
     | Sil.Call
-      ( _, Exp.Const (Const.Cfun procname), (actual, _) :: _, loc, _ )
+      ( _, Exp.Const (Const.Cfun procname), ((actual, _) :: _), loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
-          let actual_expr = sil_exp_to_expr actual tenv state in
-
           Format.print_string (
-            "[SIL_FREE]\n[SIL_ACTUAL]: " ^ sil_exp_to_string actual ^ "\n[ACTUAL_EXPR]: " ^ Expr.to_string state.vars actual_expr ^ "\n");
-
+            "[SIL_FREE]: " ^ sil_instr_to_string instr ^ "\n");
+          let actual_expr = sil_exp_to_expr actual tenv state in
           exec_free_instr loc instr actual actual_expr state
     | Sil.Prune (_exp, _loc, _is_then_branch, _if_kind) ->
       begin
-        Format.print_string "[SIL_PRUNE]\n";
+        Format.print_string (
+          "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
         [state] (* TODO - for starters, kill unsat states, in other words implement eval_cond *)
       end
-    | Sil.Call ( _, procname_exp, _, _, _ ) ->
-      let procname = match procname_exp with
-        | Exp.Const (Const.Cfun name) ->
-          (Procname.to_string name) ^ "\n"
-        | _ -> ""
-      in
-      Format.print_string ("[SIL_CALL]\n" ^ procname);
+    | Sil.Call _ ->
+      Format.print_string (
+        "[SIL_CALL]: " ^ sil_instr_to_string instr ^ "\n");
       [state]
     | Sil.Metadata metadata ->
+      Format.print_string (
+        "[SIL_METADATA]: " ^ sil_metadata_to_string metadata ^ "\n");
       exec_metadata_instr metadata state
     in
 
@@ -406,18 +394,6 @@ module TransferFunctions = struct
     let curr_hps, curr_rest, miss_hps, miss_rest =
       State.heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
-    let curr_count = List.count curr_hps ~f:(fun _ -> true) in
-    let miss_count = List.count miss_hps ~f:(fun _ -> true) in
-    Format.print_string (
-      "[Block_fragments] - found " ^
-      Int.to_string curr_count ^
-      " in state.current ; found " ^
-      Int.to_string miss_count ^
-      " in state.missing\n"
-    );
-    Format.print_string (
-      "[LHS] - typ=" ^ Typ.to_string lhs_typ ^ " ; id=" ^ Int.to_string lhs_var_id ^ " ; offset=" ^ Int64.to_string lhs_offset ^ "\n"
-    );
     (** Applies block split result: removes the matched predicate, adds split fragments,
         runs [store_dereference_assign], then fixes up the separated [new_exp_points_to]
         using [canonical_rhs] from [AddressStored] if a pointer was stored *)
@@ -575,13 +551,7 @@ module TransferFunctions = struct
   and exec_metadata_instr metadata state =
     let open Sil in
     match metadata with
-    | VariableLifetimeBegins _ ->
-        (* Base/End==0 constraints for pointer-typed variables are now added
-           during state initialization in [add_variable] *)
-        Format.print_string "[SIL_VARIABLE_LIFETIME_BEGINS]\n";
-        [state]
     | ExitScope (var_list, _loc) ->
-      Format.print_string "[SIL_EXIT_SCOPE]\n";
       let state = List.fold var_list ~init:state
         ~f:(fun state var ->
           match var with
@@ -597,20 +567,7 @@ module TransferFunctions = struct
           | _ -> state)
       in
       [state]
-    | Nullify (_pvar, _loc) ->
-      Format.print_string "[SIL_NULLIFY]\n";
-      [state]
-    | Skip ->
-      Format.print_string "[SIL_SKIP]\n";
-      [state]
-    | LoopBackEdge _ ->
-      Format.print_string "[SIL_LOOPBACK_EDGE]\n";
-      [state]
-    | LoopEntry _ ->
-      Format.print_string "[SIL_LOOP_ENTRY]\n";
-      [state]
     | Abstract _ ->
-      Format.print_string "[SIL_APPLY_ABSTRACTION]\n";
       (* TODO good place to clean up final state *)
       [state]
     | _ ->

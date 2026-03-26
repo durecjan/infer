@@ -472,6 +472,49 @@ let is_freed_expr id state =
   in
   curr_freed || miss_freed
 
+(** Removes heap predicates and Base/End pure constraints associated with [var_id]
+    from both current and missing parts of the state. Used after a successful free
+    to clean up now-dead constraints — Freed is checked first during dereference,
+    so these serve no purpose after deallocation.
+    Spatial: removes any predicate whose source references [var_id].
+    Pure: removes any constraint involving [Base(Var var_id)] or [End(Var var_id)] *)
+let cleanup_after_free var_id state =
+  let has_var_in_source id expr =
+    match expr with
+    | Expr.Var id' when Id.equal id id' -> true
+    | Expr.BinOp (_, Expr.Var id', _) when Id.equal id id' -> true
+    | Expr.BinOp (_, _, Expr.Var id') when Id.equal id id' -> true
+    | _ -> false
+  in
+  let source_references_var hp =
+    let source = match hp with
+      | Formula.BlockPointsTo (src, _)
+      | Formula.ExpPointsTo (src, _, _)
+      | Formula.UniformBlockPointsTo (src, _, _) -> src
+    in
+    has_var_in_source var_id source
+  in
+  let is_base_or_end_constraint = function
+    | Expr.BinOp (_, UnOp (Base, Var id'), _)
+      when Id.equal var_id id' -> true
+    | Expr.BinOp (_, _, UnOp (Base, Var id'))
+      when Id.equal var_id id' -> true
+    | Expr.BinOp (_, UnOp (End, Var id'), _)
+      when Id.equal var_id id' -> true
+    | Expr.BinOp (_, _, UnOp (End, Var id'))
+      when Id.equal var_id id' -> true
+    | _ -> false
+  in
+  let filter_spatial = List.filter ~f:(fun hp -> not (source_references_var hp)) in
+  let filter_pure = List.filter ~f:(fun e -> not (is_base_or_end_constraint e)) in
+  { state with
+    current = {
+      spatial = filter_spatial state.current.spatial;
+      pure = filter_pure state.current.pure };
+    missing = {
+      spatial = filter_spatial state.missing.spatial;
+      pure = filter_pure state.missing.pure } }
+
 (** Result of [store_dereference_assign], distinguishing scalar vs pointer stores.
     For pointer stores, the canonical RHS expression used in substitution is returned
     so that callers can update separated heap predicates (those not present in the

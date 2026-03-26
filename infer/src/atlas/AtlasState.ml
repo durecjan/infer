@@ -300,6 +300,7 @@ and eval_expr_offset expr skip_id state =
       | None -> off
       end
     | Expr.Const (Int i) -> Stdlib.Int64.add off i
+    | Expr.Const (Null) -> off
     | Expr.Const _ -> off
     | Expr.UnOp (op, e) ->
       let inner = eval 0L e in
@@ -402,6 +403,7 @@ let eval_expr_to_int64_opt expr state =
   in
   let rec eval = function
     | Expr.Const (Int i) -> Some i
+    | Expr.Const (Null) -> Some 0L
     | Expr.Var id ->
       begin match lookup_pure id with
       | Some e -> eval (normalize_expr e state)

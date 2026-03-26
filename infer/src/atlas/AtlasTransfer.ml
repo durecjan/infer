@@ -14,7 +14,6 @@ module TransferFunctions = struct
 
   let rec exec_instr _node analysis_data state instr =
     Format.fprintf Format.err_formatter "@[<h>%a;@]@;" (Sil.pp_instr ~print_types:true Pp.text) instr;
-    Format.print_newline ();
 
     let open IntraproceduralAnalysis in
     let open State in
@@ -703,11 +702,15 @@ end
           outgoing
       in
       error_states := new_errors @ !error_states;
-      ok_states := ok_states' @ !ok_states;
-      if not (List.is_empty ok_states') then
-        Node.get_succs node
-        |> List.iter ~f:(fun succ ->
-          add_states succ outgoing;
-          Stdlib.Queue.add succ worklist)
+      if not (List.is_empty ok_states') then begin
+        let succs = Node.get_succs node in
+        if List.is_empty succs then
+          (* terminal node — these are the final ok states *)
+          ok_states := ok_states' @ !ok_states
+        else
+          List.iter succs ~f:(fun succ ->
+            add_states succ ok_states';
+            Stdlib.Queue.add succ worklist)
+      end
     done;
     (!ok_states, !error_states)

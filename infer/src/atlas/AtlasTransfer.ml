@@ -9,13 +9,17 @@ open !State
 
 module TransferFunctions = struct
   module CFG = ProcCfg.Normal
+  module Domain = AtlasDomain.Domain
 
-  type instr = Sil.instr
+  type analysis_data = IntraproceduralAnalysis.t
 
   let sil_instr_to_string = Format.asprintf "%a" (Sil.pp_instr ~print_types:true Pp.text)
   let sil_metadata_to_string = Format.asprintf "%a" (Sil.pp_instr_metadata Pp.text)
 
-  let rec exec_instr _node analysis_data state instr =
+  let pp_session_name _node fmt = Format.pp_print_string fmt "Atlas"
+
+  (** Transfer function for a single state — returns a list of successor states *)
+  let rec exec_instr_single _node analysis_data state instr =
     let open IntraproceduralAnalysis in
     let open State in
     let tenv = analysis_data.tenv in
@@ -622,61 +626,12 @@ module TransferFunctions = struct
            at this stage but will need handling once symbolic offsets are introduced *)
         [err_state; ok_state]
 
-end
+  (** Transfer function for the AbstractInterpreter — maps over all states in the domain,
+      skipping error states (they are carried through unchanged) *)
+  let exec_instr (astate : Domain.t) (analysis_data : analysis_data) (node : CFG.Node.t) (_idx : ProcCfg.InstrNode.instr_index) (instr : Sil.instr) : Domain.t =
+    List.concat_map astate ~f:(fun state ->
+      match state.State.status with
+      | State.Error _ -> [state]
+      | State.Ok -> exec_instr_single node analysis_data state instr)
 
-  let run (analysis_data : IntraproceduralAnalysis.t) (init_state : State.t) =
-    let open Procdesc in
-    let open TransferFunctions in
-    let open State in
-    let proc_desc = analysis_data.proc_desc in
-    let start_node = get_start_node proc_desc in
-    let states_at = ref IdMap.empty in
-    let error_states = ref [] in
-    let ok_states = ref [] in
-    let add_states node new_states = 
-      let old = IdMap.find_opt (Node.get_id node) !states_at
-        |> Option.value ~default:[] in
-      let combined = old @ new_states in
-      states_at :=
-        IdMap.add (Node.get_id node) combined !states_at
-    in
-    let worklist = Stdlib.Queue.create () in
-    add_states start_node [init_state];
-    Stdlib.Queue.add start_node worklist;
-    while not (Stdlib.Queue.is_empty worklist) do
-      let node = Stdlib.Queue.take worklist in
-      let incoming =
-        IdMap.find (Node.get_id node) !states_at
-      in
-      let instrs = Node.get_instrs node in
-      let outgoing = 
-        Instrs.fold ~init:incoming
-          ~f:(fun states instr ->
-            List.concat_map ~f:(fun state ->
-              match state.status with
-                Error _ -> [state]
-              | Ok ->
-                exec_instr node analysis_data state instr
-              ) states
-            ) instrs
-      in
-      let ok_states', new_errors =
-        Stdlib.List.partition (fun s ->
-          match s.status with
-            Ok -> true
-          | Error _ -> false)
-          outgoing
-      in
-      error_states := new_errors @ !error_states;
-      if not (List.is_empty ok_states') then begin
-        let succs = Node.get_succs node in
-        if List.is_empty succs then
-          (* terminal node — these are the final ok states *)
-          ok_states := ok_states' @ !ok_states
-        else
-          List.iter succs ~f:(fun succ ->
-            add_states succ ok_states';
-            Stdlib.Queue.add succ worklist)
-      end
-    done;
-    (!ok_states, !error_states)
+end

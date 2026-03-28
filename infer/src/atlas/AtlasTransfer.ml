@@ -201,8 +201,10 @@ module TransferFunctions = struct
           Expr.Const (Int cell_size),
           Expr.Var cell_id)
         in
-        let spatial = missing_spatial :: state.missing.spatial in
-        let state = { state with missing = { state.missing with spatial } } in
+        let state = { state with
+          missing = { state.missing with spatial = missing_spatial :: state.missing.spatial };
+          (* mirror to current — subsequent accesses will find and modify the current copy *)
+          current = { state.current with spatial = missing_spatial :: state.current.spatial } } in
         let subst = VarIdMap.add lhs_id (Var cell_id) state.subst in
         let types = VarIdMap.add cell_id rhs_typ state.types in
         [err_state; { state with subst; types }]
@@ -491,8 +493,10 @@ module TransferFunctions = struct
               Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr size,
               lhs_expr))
         in
-        let spatial = missing_spatial :: state.missing.spatial in
-        let ok_state = { state with missing = { state.missing with spatial } } in
+        let ok_state = { state with
+          missing = { state.missing with spatial = missing_spatial :: state.missing.spatial };
+          (* mirror to current — subsequent accesses will find and modify the current copy *)
+          current = { state.current with spatial = missing_spatial :: state.current.spatial } } in
         [ err_state; ok_state ]
       end
 

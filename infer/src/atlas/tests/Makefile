@@ -12,4 +12,5 @@ debug:
 clean:
 	rm -f out
 	rm -f *.o
+	rm -f *.c.ast.sh
 	rm -rf infer-out

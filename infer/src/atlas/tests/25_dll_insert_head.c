@@ -14,9 +14,6 @@ void dll_insert_head(struct dlist *dl, int val) {
     dl->head = n;
 }
 
-// TODO: there should not be a return variable
-// TODO: currently, we add (Base(x)<=x+0) instead of (Base(x)<=x+4) on line 12
-
 /*
  * CASE if(n == NULL)
  * Expected precondition:

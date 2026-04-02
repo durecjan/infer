@@ -313,7 +313,7 @@ module TransferFunctions = struct
       let missing_part = Expr.BinOp (
         Plesseq,
         Expr.UnOp (Base, Var var_id),
-        Expr.BinOp (Pplus, Var var_id, Const (Int (Int64.min 0L offset))))
+        Expr.BinOp (Pplus, Var var_id, Const (Int  offset)))
       in
       let ok_state = { state with
         missing = { state.missing with

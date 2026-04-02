@@ -33,7 +33,7 @@ module TransferFunctions = struct
       Format.print_string (
         "[SIL_STORE]: " ^ sil_instr_to_string instr ^ "\n");
       let lhs_expr = sil_exp_to_expr ~typ:typ e1 tenv state in
-      let rhs_expr = sil_exp_to_expr e2 tenv state in
+      let rhs_expr = sil_exp_to_expr ~typ:typ e2 tenv state in
       exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr state
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), ((actual, actual_typ) :: _), _loc, _ )

@@ -43,12 +43,14 @@ module TransferFunctions = struct
           let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
           exec_malloc_instr ident typ actual_expr state
     | Sil.Call
-      ( _, Exp.Const (Const.Cfun procname), ((actual, _) :: _), loc, _ )
+      ( _, Exp.Const (Const.Cfun procname), ((actual, _actual_typ) :: _), loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
+          (* Note: _actual_typ is always void* in SIL — the original type is on
+             the preceding Sil.Load instruction. We recover it from state.types. *)
           Format.print_string (
             "[SIL_FREE]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr actual tenv state in
-          exec_free_instr loc instr actual actual_expr state
+          exec_free_instr loc instr tenv actual_expr state
     | Sil.Prune (exp, _loc, _is_then_branch, _if_kind) ->
       begin
         Format.print_string (
@@ -544,7 +546,7 @@ module TransferFunctions = struct
 
   (** free(NULL) is a no-op per the C standard. We check for null both as a literal
       constant and as a variable whose value resolves to null *)
-  and exec_free_instr loc instr _actual actual_expr state =
+  and exec_free_instr loc instr tenv actual_expr state =
     let open State in
     let is_null_var_expr id =
       match Formula.lookup_pure_const_exp_of_id id state.current.pure with
@@ -558,8 +560,23 @@ module TransferFunctions = struct
       | Some (base_id, offset) ->
         if is_null_var_expr base_id then
           [state]
-        else
-          free_block loc instr base_id offset state
+        else begin
+          (* Recover the original type from the preceding Load instruction's type info.
+             SIL always passes void* to free, but the variable retains its original type. *)
+          let element_size =
+            match VarIdMap.find_opt base_id state.types with
+            | Some typ ->
+              begin match typ_size_of_element_opt tenv typ with
+              | Some 0L -> 1L (* void pointer — no size info *)
+              | Some size -> size
+              | None -> 1L
+              end
+            | None -> 1L
+          in
+          (* offset from base_and_offset_of_expr is in element units, scale to bytes *)
+          let offset_bytes = Stdlib.Int64.mul offset element_size in
+          free_block loc instr base_id offset_bytes element_size state
+        end
       | None ->
         [{ state with
           status = Error (err_free_no_base_pointer, loc, instr) }]
@@ -591,7 +608,7 @@ module TransferFunctions = struct
 
     (** Checks whether freeing pointer [id] at [offset] is valid and adds Freed constraint.
         Steps: 1) check double free, 2) find Base constraint, 3) compare offsets *)
-    and free_block loc instr id offset state =
+    and free_block loc instr id offset cell_size state =
       let open State in
       (* Step 1: check if already freed *)
       if State.is_freed_expr id state then
@@ -618,8 +635,19 @@ module TransferFunctions = struct
           UnOp (Base, Var id),
           BinOp (Pplus, Var id, Const (Int offset)))
         in
-        let missing = { state.missing with
-          pure = missing_base :: state.missing.pure }
+        (* also implies missing End, PointsTo *)
+        let missing_end = Expr.BinOp (
+          Plesseq,
+          BinOp (Pplus, Var id, Const (Int (Stdlib.Int64.add offset cell_size))),
+          UnOp (End, Var id))
+        in
+        let missing_heap_pred = BlockPointsTo (
+          Expr.Var id,
+          Expr.Const (Int cell_size))
+        in
+        let missing = {
+          spatial = missing_heap_pred :: state.missing.spatial;
+          pure = missing_base :: missing_end :: state.missing.pure }
         in
         let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
         let ok_state = { state with

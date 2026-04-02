@@ -941,6 +941,55 @@ let heap_find_block_fragments state var_id var_offset cell_size =
   sorted_current, current_rest, sorted_missing, missing_rest
 
 
+(* ==================== Typ.t -> byte offset conversion ==================== *)
+
+let rec typ_size_of_element_opt tenv typ =
+  let open Typ in
+  match typ.desc with
+  | Tptr (element, _) -> Some (typ_size_of tenv element)
+  | Tarray {elt; length = _; stride = _} -> Some (typ_size_of tenv elt)
+  | _ -> None
+
+and typ_size_of tenv typ =
+  let open Typ in
+  let open Struct in
+  match typ.desc with
+  (* for now assume 64bit architecture *)
+  (* TODO wire up to infer's runtime info -- i did not find any *)
+  | Tint ikind ->
+      begin match ikind with
+      | IChar | ISChar | IUChar | IBool -> 1L
+      | IInt | IUInt -> 4L
+      | IShort | IUShort -> 2L
+      | ILong | IULong | ILongLong | IULongLong -> 8L
+      | I128 | IU128 -> 16L
+      end
+  | Tfloat fkind ->
+    begin match fkind with
+    | FFloat -> 4L
+    | FDouble | FLongDouble -> 8L
+    end
+  | Tvoid -> 0L
+  | Tfun _ -> 8L
+  | Tptr (_, _) -> 8L
+  | Tstruct name ->
+    begin match Tenv.lookup tenv name with
+    | Some { fields } ->
+      let rec sum acc = function
+        | [] -> acc
+        | { name = _; typ } :: rest ->
+          let size = typ_size_of tenv typ in
+          sum (Stdlib.Int64.add acc size) rest
+      in
+      sum 0L fields
+    | _ ->
+      0L
+    end
+  | Tarray {elt; length = _; stride = _} ->
+    typ_size_of tenv elt
+  | TVar _ -> 0L (* C++ template variables *)
+
+
 (* ==================== Exp.t -> Expr.t conversion ==================== *)
 
 (** Converts SIL Exp.t [e] to custom Expr.t interpretation.
@@ -1064,45 +1113,6 @@ and sil_array_offset_bytes base index tenv s =
     | None -> index
     end
   | _ -> index  (* TODO maybe not the best fallback *)
-
-and typ_size_of tenv typ =
-  let open Typ in
-  let open Struct in
-  match typ.desc with
-  (* for now assume 64bit architecture *)
-  (* TODO wire up to infer's runtime info -- i did not find any *)
-  | Tint ikind ->
-      begin match ikind with
-      | IChar | ISChar | IUChar | IBool -> 1L
-      | IInt | IUInt -> 4L
-      | IShort | IUShort -> 2L
-      | ILong | IULong | ILongLong | IULongLong -> 8L
-      | I128 | IU128 -> 16L
-      end
-  | Tfloat fkind ->
-    begin match fkind with
-    | FFloat -> 4L
-    | FDouble | FLongDouble -> 8L
-    end
-  | Tvoid -> 0L
-  | Tfun _ -> 8L
-  | Tptr (_, _) -> 8L
-  | Tstruct name ->
-    begin match Tenv.lookup tenv name with
-    | Some { fields } ->
-      let rec sum acc = function
-        | [] -> acc
-        | { name = _; typ } :: rest ->
-          let size = typ_size_of tenv typ in
-          sum (Stdlib.Int64.add acc size) rest
-      in
-      sum 0L fields
-    | _ ->
-      0L
-    end
-  | Tarray {elt; length = _; stride = _} ->
-    typ_size_of tenv elt
-  | TVar _ -> 0L (* C++ template variables *)
 
 and sil_unop_exp_to_expr op =
   match op with

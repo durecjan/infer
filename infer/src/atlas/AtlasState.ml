@@ -59,7 +59,6 @@ let rec empty analysis =
   let proc_name = Procdesc.get_proc_name analysis.proc_desc in
   let locals = Procdesc.get_locals analysis.proc_desc in
   let formals = Procdesc.get_pvar_formals analysis.proc_desc in
-  let ret_var = Procdesc.get_ret_var analysis.proc_desc in
   let ret_typ = Procdesc.get_ret_type analysis.proc_desc in
   let with_locals = List.fold ~init:s locals
     ~f:(fun state var -> 
@@ -70,9 +69,13 @@ let rec empty analysis =
     ~f:(fun state (pvar, typ) ->
       add_variable state pvar typ)
   in
-  { with_formals with 
-    vars = VarIdMap.add 0 (Var.of_pvar ret_var) with_formals.vars;
-    types = VarIdMap.add 0 ret_typ with_formals.types }
+  if is_void_type ret_typ then
+    with_formals
+  else
+    let ret_var = Procdesc.get_ret_var analysis.proc_desc in
+    { with_formals with 
+      vars = VarIdMap.add 0 (Var.of_pvar ret_var) with_formals.vars;
+      types = VarIdMap.add 0 ret_typ with_formals.types }
 
 (** Adds variable [v] with type [t] into state [s]. If [id] is present, it is used,
     otherwise a fresh id is generated. For pointer-typed local variables, adds
@@ -102,6 +105,13 @@ and is_pointer_type t =
   match t.desc with
   | Typ.Tptr _ -> true
   | Typ.Tarray { elt } -> is_pointer_type elt
+  | _ -> false
+
+(** Determines whether provided type [t] is void *)
+and is_void_type t =
+  let open Typ in
+  match t.desc with
+  | Typ.Tvoid -> true
   | _ -> false
 
 

@@ -238,6 +238,76 @@ let clear_before_subst id state =
   let placeholder = Id.fresh () in
   subst_apply ~from_:(Expr.Var id) ~to_:(Expr.Var placeholder) state
 
+(** Returns [true] if [constraint_] is a comparison (Peq, Pneq, Pless, Plesseq)
+    that directly references [Var id] as an operand — i.e. asserts something about
+    the value of [id], not a block property like Base/End/Freed *)
+let is_direct_value_constraint id constraint_ =
+  let is_direct_var_ref = function
+    | Expr.Var id' -> Id.equal id id'
+    | _ -> false
+  in
+  let is_block_property = function
+    | Expr.UnOp ((Base | End), _) -> true
+    | _ -> false
+  in
+  match constraint_ with
+  | Expr.BinOp ((Peq | Pneq | Pless | Plesseq), lhs, rhs)
+    when not (is_block_property lhs) && not (is_block_property rhs) ->
+    is_direct_var_ref lhs || is_direct_var_ref rhs
+  | _ -> false
+
+(** Prepares [state] for a value reassignment of [lhs_id].
+    Removes stale value constraints (Peq, Pneq, Pless, Plesseq where [Var lhs_id]
+    is a direct operand) from [current.pure]. Also cleans up substitution:
+    - Removes forward entry [subst\[lhs_id\]]
+    - Finds reverse entries [subst\[yi\] = Var lhs_id], picks one as canonical
+      representative for the old value, rewrites the stale constraints under it,
+      and redirects remaining reverse entries to it *)
+let clear_stale_value_constraints lhs_id state =
+  (* Partition current.pure into stale value constraints and the rest *)
+  let stale, kept = List.partition_tf state.current.pure
+    ~f:(is_direct_value_constraint lhs_id)
+  in
+  (* Find all reverse subst dependencies: yi where subst[yi] = Var lhs_id *)
+  let reverse_deps = VarIdMap.fold
+    (fun yi expr acc ->
+      match expr with
+      | Var id' when Id.equal id' lhs_id -> yi :: acc
+      | _ -> acc)
+    state.subst []
+  in
+  (* Remove forward subst entry for lhs_id *)
+  let subst = VarIdMap.remove lhs_id state.subst in
+  match reverse_deps with
+  | [] ->
+    (* No reverse deps — stale constraints are simply dropped *)
+    { state with
+      current = { state.current with pure = kept };
+      subst }
+  | canonical :: rest ->
+    (* Pick first reverse dep as canonical for the old value.
+       Rewrite stale constraints: Var lhs_id → Var canonical *)
+    let rewrite_expr e =
+      match e with
+      | Expr.Var id' when Id.equal id' lhs_id -> Expr.Var canonical
+      | _ -> e
+    in
+    let rewritten = List.map stale ~f:(fun c ->
+      match c with
+      | Expr.BinOp (op, lhs, rhs) ->
+        Expr.BinOp (op, rewrite_expr lhs, rewrite_expr rhs)
+      | other -> other)
+    in
+    (* Remove canonical's subst entry (it is now the root),
+       redirect remaining reverse deps to canonical *)
+    let subst = VarIdMap.remove canonical subst in
+    let subst = List.fold rest ~init:subst ~f:(fun acc yi ->
+      VarIdMap.add yi (Var canonical) acc)
+    in
+    { state with
+      current = { state.current with pure = List.append rewritten kept };
+      subst }
+
 
 (* ==================== Exp.t helpers ==================== *)
 

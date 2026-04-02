@@ -115,10 +115,12 @@ module TransferFunctions = struct
         assign_to_variable lhs_id rhs_norm state
     end
 
-  (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constaitn (Var ([lhs_id]) == [rhs]) to [state] *)
+  (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constraint (Var ([lhs_id]) == [rhs]) to [state].
+      Clears stale value constraints and subst entries for [lhs_id] before the assignment *)
   and assign_to_variable lhs_id rhs state =
     let open Expr in
     let open State in
+    let state = State.clear_stale_value_constraints lhs_id state in
     match rhs with
     | Expr.Var rhs_id ->
       (* Both Ids already canonical *)
@@ -270,6 +272,10 @@ module TransferFunctions = struct
         | None ->
           let rhs_norm = normalize_expr rhs_expr state in
           let lhs_norm = normalize_expr lhs_expr state in
+          let state = match lhs_norm with
+            | Expr.Var id -> State.clear_stale_value_constraints id state (* maybe unecessary *)
+            | _ -> state
+          in
           let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
           let current =
             { state.current with pure = exp :: state.current.pure }
@@ -413,7 +419,7 @@ module TransferFunctions = struct
     (** Applies block split result: removes the matched predicate, adds split fragments,
         runs [store_dereference_assign], then fixes up the separated [new_exp_points_to]
         using [canonical_rhs] from [AddressStored] if a pointer was stored *)
-    let handle_block_split_res ?(to_missing=false) to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
+    let handle_block_split_res ?(to_missing=false) state to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
       let spatial = transfor_spatial to_remove part to_add rest in
       let state =
         if to_missing then
@@ -451,24 +457,32 @@ module TransferFunctions = struct
     match try_block_split curr_hps with
     | Some block_split_res ->
       begin match block_split_res with
-      | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest = _ } ->
-        (* TODO - what to do with old_dest ?? *)
-        handle_block_split_res to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
+      | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest } ->
+        (* Clear stale value constraints for the old destination being overwritten *)
+        let state = match old_dest with
+          | Expr.Var id -> State.clear_stale_value_constraints id state
+          | _ -> state
+        in
+        handle_block_split_res state to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
       | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
       | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
       | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->
-        handle_block_split_res to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
+        handle_block_split_res state to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
       end
     | None ->
       begin match try_block_split miss_hps with
       | Some block_split_res ->
         begin match block_split_res with
-        | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest = _ } ->
-          handle_block_split_res ~to_missing:true to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
+        | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest } ->
+          let state = match old_dest with
+            | Expr.Var id -> State.clear_stale_value_constraints id state
+            | _ -> state
+          in
+          handle_block_split_res ~to_missing:true state to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
         | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
         | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
         | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->
-          handle_block_split_res ~to_missing:true to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
+          handle_block_split_res ~to_missing:true state to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
       end
       | None ->
         let err_state = { state with status = Error (err_store_deref_missing_cell, loc, instr) } in

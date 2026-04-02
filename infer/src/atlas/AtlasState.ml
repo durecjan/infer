@@ -557,27 +557,21 @@ let eval_expr_to_int64_opt expr state =
 
 (** Traverses both current and missing pure constraints of [state], looking for ([unop](Var [id])==exp)
     Returns (Some exp, is_current) | None *)
-let lookup_pure_unop_eq_expr id unop state =
+(** Looks up a Base or End bound for [Var id] in both current and missing pure constraints.
+    Returns [(found_in_current, found_in_missing)] — each is [Some expr] if the bound
+    was found in that part of the formula, [None] otherwise.
+    Searches for both equalities (Peq) and inequalities (Plesseq) *)
+let lookup_pure_bound_expr id unop state =
   match unop with
   | Expr.Base ->
-    begin match Formula.lookup_pure_base_expr id state.current.pure with
-    | Some b -> Some (b, true)
-    | None ->
-      begin match Formula.lookup_pure_base_expr id state.missing.pure with
-      | Some b -> Some (b, false)
-      | None -> None
-      end
-    end
+    let in_curr = Formula.lookup_pure_base_expr id state.current.pure in
+    let in_miss = Formula.lookup_pure_base_expr id state.missing.pure in
+    (in_curr, in_miss)
   | Expr.End ->
-    begin match Formula.lookup_pure_end_expr id state.current.pure with
-    | Some b -> Some (b, true)
-    | None ->
-      begin match Formula.lookup_pure_end_expr id state.missing.pure with
-      | Some b -> Some (b, false)
-      | None -> None
-      end
-    end
-  | _ -> None
+    let in_curr = Formula.lookup_pure_end_expr id state.current.pure in
+    let in_miss = Formula.lookup_pure_end_expr id state.missing.pure in
+    (in_curr, in_miss)
+  | _ -> (None, None)
 
 (** Traverses both current and missing pure constraints of [state], looking for (Freed(Var [id])) *)
 let is_freed_expr id state =

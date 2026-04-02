@@ -60,9 +60,11 @@ module TransferFunctions = struct
         | State.Unsat -> []
         | State.Sat -> [state]
         | State.Unknown ->
-          (* condition depends on external input — record as precondition *)
-          let missing_pure = cond :: state.missing.pure in
-          [{ state with missing = { state.missing with pure = missing_pure } }]
+          (* condition depends on external input — record as precondition
+             and mirror to current (the branch was taken, so it holds as postcondition too) *)
+          [{ state with
+            missing = { state.missing with pure = cond :: state.missing.pure };
+            current = { state.current with pure = cond :: state.current.pure } }]
       end
     | Sil.Call _ ->
       Format.print_string (
@@ -308,93 +310,96 @@ module TransferFunctions = struct
     else [state]
 
   and exec_deref_check_base loc instr var_id offset state =
-    match State.lookup_pure_unop_eq_expr var_id Expr.Base state with
-    | Some (e, _) when Formula.is_zero_expr e ->
-      [{ state with
-        status = Error (err_deref_null_base, loc, instr) }]
-    | Some (e, is_current) ->
-      dereference_check_lower_bound loc instr e is_current var_id offset state
-    | None ->
-      let err_state = { state with
-        status = Error (err_deref_missing_base, loc, instr) }
-      in
-      let missing_part = Expr.BinOp (
-        Plesseq,
+    match State.lookup_pure_bound_expr var_id Expr.Base state with
+    (* Zero base in either → unallocated pointer *)
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_base, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_base, loc, instr) }]
+    (* Found in missing → precondition inequality, can lower if needed *)
+    | (_, Some e) ->
+      dereference_lower_base_bound e var_id offset state
+    (* Found only in current → allocation equality, strict check *)
+    | (Some e, None) ->
+      let base_offset = eval_expr_offset e var_id state in
+      if Int64.compare offset base_offset < 0 then
+        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
+      else
+        [state]
+    (* Not found → create missing Base and mirror to current *)
+    | (None, None) ->
+      let err_state = { state with status = Error (err_deref_missing_base, loc, instr) } in
+      let bound = Expr.BinOp (Plesseq,
         Expr.UnOp (Base, Var var_id),
-        Expr.BinOp (Pplus, Var var_id, Const (Int  offset)))
+        Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
       in
       let ok_state = { state with
-        missing = { state.missing with
-          pure = missing_part :: state.missing.pure } }
+        missing = { state.missing with pure = bound :: state.missing.pure };
+        current = { state.current with pure = bound :: state.current.pure } }
       in
       [ err_state; ok_state ]
 
-  and dereference_check_lower_bound loc instr base_exp is_current var_id offset state =
+  (** Lowers the Base bound in both missing and current when access offset is below it *)
+  and dereference_lower_base_bound base_exp var_id offset state =
     let base_offset = eval_expr_offset base_exp var_id state in
-    if (Int64.compare offset base_offset) < 0 then begin
-      if is_current then
-        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
-      else
-        (* missing resource - we can lower the bound *)
-        let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var var_id), base_exp) in
-        let missing_pure = Stdlib.List.filter
-          (fun e -> not (Expr.equal e to_remove))
-          state.missing.pure
-        in
-        let to_add = Expr.BinOp (
-          Plesseq,
-          UnOp (Base, Var var_id),
-          BinOp (Pplus, Var var_id, Const (Int offset)))
-        in
-        [{ state with missing = {
-          state.missing with pure = to_add :: missing_pure } }]
-      end
+    if Int64.compare offset base_offset < 0 then
+      let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var var_id), base_exp) in
+      let to_add = Expr.BinOp (Plesseq,
+        UnOp (Base, Var var_id),
+        BinOp (Pplus, Var var_id, Const (Int offset)))
+      in
+      let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
+      [{ state with
+        missing = { state.missing with pure = to_add :: filter state.missing.pure };
+        current = { state.current with pure = to_add :: filter state.current.pure } }]
     else
       [state]
 
   and exec_deref_check_end loc instr var_id offset cell_size state =
-    match State.lookup_pure_unop_eq_expr var_id Expr.End state with
-    | Some (e, _) when Formula.is_zero_expr e ->
-      [{ state with
-        status = Error (err_deref_null_end, loc, instr) }]
-    | Some (e, is_current) ->
-      dereference_check_upper_bound loc instr e is_current var_id offset cell_size state
-    | None ->
-      let err_state = { state with
-        status = Error (err_deref_missing_end, loc, instr) }
-      in
-      let missing_part = Expr.BinOp (
-        Plesseq,
+    match State.lookup_pure_bound_expr var_id Expr.End state with
+    (* Zero end in either → unallocated pointer *)
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_end, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_end, loc, instr) }]
+    (* Found in missing → precondition inequality, can increase if needed *)
+    | (_, Some e) ->
+      dereference_raise_end_bound e var_id offset cell_size state
+    (* Found only in current → allocation equality, strict check *)
+    | (Some e, None) ->
+      let end_offset = eval_expr_offset e var_id state in
+      let access_end = Stdlib.Int64.add offset cell_size in
+      if Int64.compare access_end end_offset > 0 then
+        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
+      else
+        [state]
+    (* Not found → create missing End and mirror to current *)
+    | (None, None) ->
+      let err_state = { state with status = Error (err_deref_missing_end, loc, instr) } in
+      let bound = Expr.BinOp (Plesseq,
         Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
         Expr.UnOp (End, Var var_id))
       in
       let ok_state = { state with
-        missing = { state.missing with
-          pure = missing_part :: state.missing.pure } }
+        missing = { state.missing with pure = bound :: state.missing.pure };
+        current = { state.current with pure = bound :: state.current.pure } }
       in
       [ err_state; ok_state ]
 
-  and dereference_check_upper_bound loc instr end_expr is_current var_id offset cell_size state =
-    let end_offset = eval_expr_offset end_expr var_id state in
+  (** Raises the End bound in both missing and current when access exceeds it *)
+  and dereference_raise_end_bound end_exp var_id offset cell_size state =
+    let end_offset = eval_expr_offset end_exp var_id state in
     let access_end = Stdlib.Int64.add offset cell_size in
-    if (Int64.compare access_end end_offset) > 0 then begin
-      if is_current then
-        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
-      else
-        (* missing resource - we can increase the bound *)
-        let to_remove = Expr.BinOp (Plesseq, end_expr, UnOp (End, Var var_id)) in
-        let missing_pure = Stdlib.List.filter
-          (fun e -> not (Expr.equal e to_remove))
-          state.missing.pure
-        in
-        let to_add = Expr.BinOp (
-          Plesseq,
-          BinOp (Pplus, Var var_id, Const (Int access_end)),
-          UnOp (End, Var var_id))
-        in
-        [{ state with missing = {
-          state.missing with pure = to_add :: missing_pure } }]
-      end
+    if Int64.compare access_end end_offset > 0 then
+      let to_remove = Expr.BinOp (Plesseq, end_exp, UnOp (End, Var var_id)) in
+      let to_add = Expr.BinOp (Plesseq,
+        BinOp (Pplus, Var var_id, Const (Int access_end)),
+        UnOp (End, Var var_id))
+      in
+      let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
+      [{ state with
+        missing = { state.missing with pure = to_add :: filter state.missing.pure };
+        current = { state.current with pure = to_add :: filter state.current.pure } }]
     else
       [state]
 
@@ -446,13 +451,14 @@ module TransferFunctions = struct
             Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr size,
             Expr.Var new_dest_id))
       in
-      let spatial = new_exp_points_to ::
-        (if to_missing then state.missing.spatial else state.current.spatial)
-      in
       if to_missing then
-        [ { state with missing = { state.missing with spatial } } ]
+        (* mirror new ExpPointsTo to current — subsequent accesses find the current copy *)
+        [ { state with
+          missing = { state.missing with spatial = new_exp_points_to :: state.missing.spatial };
+          current = { state.current with spatial = new_exp_points_to :: state.current.spatial } } ]
       else
-        [ { state with current = { state.current with spatial } } ]
+        [ { state with current = { state.current with
+          spatial = new_exp_points_to :: state.current.spatial } } ]
     in
     match try_block_split curr_hps with
     | Some block_split_res ->
@@ -621,16 +627,17 @@ module TransferFunctions = struct
       [state]
 
     (** Checks whether freeing pointer [id] at [offset] is valid and adds Freed constraint.
-        Steps: 1) check double free, 2) find Base constraint, 3) compare offsets *)
+        Steps: 1) check double free, 2) find Base in current, 3) check missing, 4) create missing.
+        Missing resources are NOT mirrored to current — Base/End + Freed in current is contradictory *)
     and free_block loc instr id offset cell_size state =
       let open State in
       (* Step 1: check if already freed *)
       if State.is_freed_expr id state then
         [{ state with status = Error (err_free_double_free, loc, instr) }]
       else
-      (* Step 2: find Base(Var id) == some_exp *)
-      match State.lookup_pure_unop_eq_expr id Expr.Base state with
-      | Some (base_exp, _is_current) ->
+      (* Step 2: find Base(Var id) in current *)
+      match Formula.lookup_pure_base_expr id state.current.pure with
+      | Some base_exp ->
         if Formula.is_zero_expr base_exp then
           [{ state with status = Error (err_free_unallocated, loc, instr) }]
         else
@@ -640,36 +647,50 @@ module TransferFunctions = struct
             let state = State.cleanup_after_free id state in
             let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
             [{ state with current = { state.current with pure } }]
-          else
-            [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+          else begin
+            if Int64.compare offset base_offset < 0 then begin
+              (* Step 3: check missing — may need to lower bound in precondition only *)
+              match Formula.lookup_pure_base_expr id state.missing.pure with
+              | Some base_exp ->
+                (* Found in missing — lower bound in precondition if needed, then free.
+                TODO: generate error contract for the lowering case (caller might not
+                satisfy the lowered precondition — needs NonBasePointerFree error state) *)
+                let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var id), base_exp) in
+                let to_add = Expr.BinOp (Plesseq,
+                  UnOp (Base, Var id),
+                  BinOp (Pplus, Var id, Const (Int offset))) in
+                let missing_pure = Stdlib.List.filter
+                  (fun e -> not (Expr.equal e to_remove)) state.missing.pure in
+                let state = { state with missing =
+                  { state.missing with pure = to_add :: missing_pure } }
+                in
+                let state = State.cleanup_after_free id state in
+                let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+                [{ state with current = { state.current with pure } }]
+              | None ->
+                [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+            end else
+              [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+          end
       | None ->
+          (* Step 4: not found anywhere — create missing resources (missing only) *)
         let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
-        let missing_base = Expr.BinOp (
-          Plesseq,
+        let missing_base = Expr.BinOp (Plesseq,
           UnOp (Base, Var id),
-          BinOp (Pplus, Var id, Const (Int offset)))
-        in
-        (* also implies missing End, PointsTo *)
-        let missing_end = Expr.BinOp (
-          Plesseq,
+          BinOp (Pplus, Var id, Const (Int offset))) in
+        let missing_end = Expr.BinOp (Plesseq,
           BinOp (Pplus, Var id, Const (Int (Stdlib.Int64.add offset cell_size))),
-          UnOp (End, Var id))
-        in
+          UnOp (End, Var id)) in
         let missing_heap_pred = BlockPointsTo (
           Expr.Var id,
-          Expr.Const (Int cell_size))
-        in
+          Expr.Const (Int cell_size)) in
         let missing = {
           spatial = missing_heap_pred :: state.missing.spatial;
-          pure = missing_base :: missing_end :: state.missing.pure }
-        in
+          pure = missing_base :: missing_end :: state.missing.pure } in
         let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
         let ok_state = { state with
           current = { state.current with pure };
-          missing }
-        in
-        (* Note: unmatched base_exp patterns (not BinOp/Var/Const(0)) are not possible
-           at this stage but will need handling once symbolic offsets are introduced *)
+          missing } in
         [err_state; ok_state]
 
   (** Transfer function for the AbstractInterpreter — maps over all states in the domain,

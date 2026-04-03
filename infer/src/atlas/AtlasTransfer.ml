@@ -9,7 +9,8 @@ open !State
 
 module TransferFunctions = struct
   module CFG = ProcCfg.Normal
-  module Domain = AtlasDomain.Domain
+  module DisjDomain = AtlasDomain.DisjDomain
+  module NonDisjDomain = AtlasDomain.NonDisjDomain
 
   type analysis_data = IntraproceduralAnalysis.t
 
@@ -693,12 +694,23 @@ module TransferFunctions = struct
           missing } in
         [err_state; ok_state]
 
-  (** Transfer function for the AbstractInterpreter — maps over all states in the domain,
-      skipping error states (they are carried through unchanged) *)
-  let exec_instr (astate : Domain.t) (analysis_data : analysis_data) (node : CFG.Node.t) (_idx : ProcCfg.InstrNode.instr_index) (instr : Sil.instr) : Domain.t =
-    List.concat_map astate ~f:(fun state ->
-      match state.State.status with
-      | State.Error _ -> [state]
-      | State.Ok -> exec_instr_single node analysis_data state instr)
+  (** Transfer function for a single disjunct — the interpreter manages the disjunction.
+      Error states are passed through unchanged *)
+  let exec_instr ~limit:_ (astate, non_disj) (analysis_data : analysis_data) (node : CFG.Node.t) (instr : Sil.instr) =
+    let results = match astate.State.status with
+      | State.Error _ -> [astate]
+      | State.Ok -> exec_instr_single node analysis_data astate instr
+    in
+    (results, non_disj)
+
+  let exec_instr_non_disj non_disj _analysis_data _node _instr = non_disj
+
+  let remember_dropped_disjuncts _ non_disj = non_disj
+
+  let widen_list _ next ~num_iters:_ = next
+
+  let pp_disjunct _pp_kind = DisjDomain.pp
+
+  let pp_non_disj _pp_kind = NonDisjDomain.pp
 
 end

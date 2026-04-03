@@ -1,13 +1,19 @@
 open! IStd
 
-module Analyzer = AbstractInterpreter.MakeRPO (AtlasTransfer.TransferFunctions)
+module Analyzer =
+  AbstractInterpreter.MakeDisjunctive
+    (AtlasTransfer.TransferFunctions)
+    (struct
+      let join_policy = TransferFunctions.UnderApproximateAfter 64
+      let widen_policy = TransferFunctions.UnderApproximateAfterNumIterations 5
+    end)
 
 let checker (analysis_data : IntraproceduralAnalysis.t) : unit =
   let init_state = AtlasState.empty analysis_data in
-  let initial = [init_state] in
+  let initial = ([init_state], AtlasDomain.NonDisjDomain.bottom) in
   let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
   match Analyzer.compute_post analysis_data ~initial analysis_data.proc_desc with
-  | Some final_domain ->
+  | Some (final_domain, _non_disj) ->
     let final_states, err_states =
       List.partition_tf final_domain ~f:(fun s ->
         match s.AtlasState.status with

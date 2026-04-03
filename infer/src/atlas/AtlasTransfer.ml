@@ -89,135 +89,210 @@ module TransferFunctions = struct
 
     states
 
+  (** Dispatches a SIL Load instruction to the appropriate handler based on the RHS form:
+      - Dereference (RHS contains a temp): resolve base+offset, delegate to [exec_load_deref]
+      - Address assign (RHS is an address expression on a pointer type): record subst alias
+      - Value load (everything else): normalize and assign via [assign_to_variable] *)
   and exec_load_instr loc instr lhs tenv typ rhs rhs_expr state =
-    let open State in
     let lhs_id = Id.fresh () in
     let state = { state with
       vars = VarIdMap.add lhs_id (Var.of_id lhs) state.vars;
       types = VarIdMap.add lhs_id typ state.types }
     in
-    if is_sil_dereference rhs then
-      match base_and_offset_of_expr rhs_expr state with
+    if State.is_sil_dereference rhs then
+      match State.base_and_offset_of_expr rhs_expr state with
       | Some (rhs_id, off) ->
-          exec_load_deref_ loc instr tenv typ lhs_id rhs_id off state
+        exec_load_deref loc instr tenv typ lhs_id rhs_id off state
       | None ->
-        [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
+        [{ state with status = Error (State.err_load_deref_no_base, loc, instr) }]
     else begin
-      if is_sil_address_assign rhs && is_pointer_type typ then
-        match base_and_offset_of_expr rhs_expr state with
+      if State.is_sil_address_assign rhs && State.is_pointer_type typ then
+        match State.base_and_offset_of_expr rhs_expr state with
         | Some (rhs_id, off) ->
-          let rhs_canonical = canonical_expr state.subst rhs_id off in
+          let rhs_canonical = State.canonical_expr state.subst rhs_id off in
           [{ state with
             subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
         | None ->
           (* Const(Cint(null)) cannot appear here — SIL only places heap addresses
              on the RHS of Load address assigns, and null is not a heap address *)
-          [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
+          [{ state with status = Error (State.err_load_assign_no_base, loc, instr) }]
       else
-        let rhs_norm = normalize_expr rhs_expr state in
+        let rhs_norm = State.normalize_expr rhs_expr state in
         assign_to_variable lhs_id rhs_norm state
     end
 
-  (** If [rhs] is (Var id) then adds substitution, otherwise adds pure constraint (Var ([lhs_id]) == [rhs]) to [state].
-      Clears stale value constraints and subst entries for [lhs_id] before the assignment *)
+  (** Assigns [rhs] to [lhs_id]: substitution if RHS is a variable, pure equality otherwise.
+      Clears stale value constraints and subst entries for [lhs_id] before the assignment.
+      Note: when called from load, [lhs_id] is always a fresh temp so the cleanup is a no-op,
+      but the call is kept for correctness when called from store paths *)
   and assign_to_variable lhs_id rhs state =
-    let open Expr in
-    let open State in
     let state, rewrite_spatial = State.clear_stale_value_constraints lhs_id state in
     let state = { state with current = { state.current with
       spatial = rewrite_spatial state.current.spatial } } in
     match rhs with
     | Expr.Var rhs_id ->
-      (* Both Ids already canonical *)
       if Id.equal lhs_id rhs_id then
         [state]
       else
-        [{ state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
+        [{ state with subst = VarIdMap.add lhs_id (State.Var rhs_id) state.subst }]
     | _ ->
-      let exp = Expr.BinOp (Peq, Var lhs_id, normalize_expr rhs state) in
-      let current =
-        { state.current with pure = exp :: state.current.pure }
-      in
-      [{ state with current }]
-  
-  and exec_load_deref_ loc instr tenv rhs_typ lhs_id rhs_var_id rhs_offset state =
-    (* TODO rethink - can it be something else than 8L (pointer) ? *)
-    let cell_size = typ_size_of tenv rhs_typ in
+      let exp = Expr.BinOp (Peq, Expr.Var lhs_id, State.normalize_expr rhs state) in
+      [{ state with current = { state.current with pure = exp :: state.current.pure } }]
+
+  (** Load dereference pipeline: checks freed → base bounds → end bounds → heap match *)
+  and exec_load_deref loc instr tenv rhs_typ lhs_id rhs_var_id rhs_offset state =
+    let cell_size = State.typ_size_of tenv rhs_typ in
     [state]
     |> concat_map_ok_states
       (dereference_check_freed loc instr rhs_var_id)
     |> concat_map_ok_states
-      (exec_deref_check_base loc instr rhs_var_id rhs_offset)
+      (load_check_base loc instr rhs_var_id rhs_offset)
     |> concat_map_ok_states
-      (exec_deref_check_end loc instr rhs_var_id rhs_offset cell_size)
+      (load_check_end loc instr rhs_var_id rhs_offset cell_size)
     |> concat_map_ok_states
-      (load_dereference_try_match_heap_predicates loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size)
+      (load_match_heap loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size)
 
-  and load_dereference_try_match_heap_predicates loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state =
+  (** Checks Base bound for load dereference. Dispatches to lowering, strict check,
+      or missing resource generation depending on where the bound is found *)
+  and load_check_base loc instr var_id offset state =
+    match State.lookup_pure_bound_expr var_id Expr.Base state with
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = State.Error (State.err_deref_null_base, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = State.Error (State.err_deref_null_base, loc, instr) }]
+    | (_, Some e) ->
+      dereference_lower_base_bound e var_id offset state
+    | (Some e, None) ->
+      let base_offset = State.eval_expr_offset e var_id state in
+      if Int64.compare offset base_offset < 0 then
+        [{ state with status = State.Error (State.err_deref_below_lower_bound, loc, instr) }]
+      else
+        [state]
+    | (None, None) ->
+      load_create_missing_base loc instr var_id offset state
+
+  (** Creates missing Base constraint when not found in current or missing.
+      Returns error contract + ok contract with bound mirrored to both *)
+  and load_create_missing_base loc instr var_id offset state =
+    let err_state = { state with status = State.Error (State.err_deref_missing_base, loc, instr) } in
+    let bound = Expr.BinOp (Plesseq,
+      Expr.UnOp (Base, Var var_id),
+      Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
+    in
+    let ok_state = { state with
+      missing = { state.missing with pure = bound :: state.missing.pure };
+      current = { state.current with pure = bound :: state.current.pure } }
+    in
+    [err_state; ok_state]
+
+  (** Checks End bound for load dereference. Dispatches to raising, strict check,
+      or missing resource generation depending on where the bound is found *)
+  and load_check_end loc instr var_id offset cell_size state =
+    match State.lookup_pure_bound_expr var_id Expr.End state with
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = State.Error (State.err_deref_null_end, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = State.Error (State.err_deref_null_end, loc, instr) }]
+    | (_, Some e) ->
+      dereference_raise_end_bound e var_id offset cell_size state
+    | (Some e, None) ->
+      let end_offset = State.eval_expr_offset e var_id state in
+      let access_end = Stdlib.Int64.add offset cell_size in
+      if Int64.compare access_end end_offset > 0 then
+        [{ state with status = State.Error (State.err_deref_above_upper_bound, loc, instr) }]
+      else
+        [state]
+    | (None, None) ->
+      load_create_missing_end loc instr var_id offset cell_size state
+
+  (** Creates missing End constraint when not found in current or missing.
+      Returns error contract + ok contract with bound mirrored to both *)
+  and load_create_missing_end loc instr var_id offset cell_size state =
+    let err_state = { state with status = State.Error (State.err_deref_missing_end, loc, instr) } in
+    let bound = Expr.BinOp (Plesseq,
+      Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
+      Expr.UnOp (End, Var var_id))
+    in
+    let ok_state = { state with
+      missing = { state.missing with pure = bound :: state.missing.pure };
+      current = { state.current with pure = bound :: state.current.pure } }
+    in
+    [err_state; ok_state]
+
+  (** Attempts to match heap predicates for load dereference. Tries current first,
+      then missing, then creates missing resources if nothing matches *)
+  and load_match_heap loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state =
     let curr_hps, curr_rest, miss_hps, miss_rest =
       State.heap_find_block_fragments state rhs_var_id rhs_offset cell_size
     in
-    let try_match hps =
-      State.heap_try_match hps rhs_var_id rhs_offset cell_size
-    in
-    let transfor_spatial to_remove from to_add rest =
-      let removed = Stdlib.List.filter
-        (fun hp -> not (heap_pred_equal hp to_remove))
-        from
-      in
-      List.append removed (List.append to_add rest)
-    in
-    let handle_match_result match_res hps rest ~is_missing state =
-      match match_res with
-      | MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
-        let subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst in
-        [{ state with subst }]
-      | MatchExpExact { matched = _; dest } ->
-        let exp = Expr.BinOp (Peq, Var lhs_id, dest) in
-        let current = { state.current with pure = exp :: state.current.pure } in
-        [{ state with current }]
-      | MatchBlockSplit block_split_res ->
-        let { to_remove; to_add; new_dest_id } = match block_split_res with
-          | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
-          | BlockExactMatch args
-          | BlockEdgeMatch args
-          | BlockMiddleMatch args -> args
-        in
-        let spatial = transfor_spatial to_remove hps to_add rest in
-        let state =
-          if is_missing then
-            { state with missing = { state.missing with spatial } }
-          else
-            { state with current = { state.current with spatial } }
-        in
-        let subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst in
-        let types = VarIdMap.add new_dest_id rhs_typ state.types in
-        [{ state with subst; types }]
-    in
-    match try_match curr_hps with
+    match State.heap_try_match curr_hps rhs_var_id rhs_offset cell_size with
     | Some match_res ->
-      handle_match_result match_res curr_hps curr_rest ~is_missing:false state
+      load_match_in_current lhs_id rhs_typ match_res curr_hps curr_rest state
     | None ->
-      begin match try_match miss_hps with
+      begin match State.heap_try_match miss_hps rhs_var_id rhs_offset cell_size with
       | Some match_res ->
-        handle_match_result match_res miss_hps miss_rest ~is_missing:true state
+        load_match_in_missing lhs_id rhs_typ match_res miss_hps miss_rest state
       | None ->
-        (* missing resource *)
-        let err_state = { state with status = Error (err_load_deref_missing_cell, loc, instr) } in
-        let cell_id = Id.fresh () in
-        let missing_spatial = ExpPointsTo (
-          Expr.BinOp (Pplus, Var rhs_var_id, Const (Int rhs_offset)),
-          Expr.Const (Int cell_size),
-          Expr.Var cell_id)
-        in
-        let state = { state with
-          missing = { state.missing with spatial = missing_spatial :: state.missing.spatial };
-          (* mirror to current — subsequent accesses will find and modify the current copy *)
-          current = { state.current with spatial = missing_spatial :: state.current.spatial } } in
-        let subst = VarIdMap.add lhs_id (Var cell_id) state.subst in
-        let types = VarIdMap.add cell_id rhs_typ state.types in
-        [err_state; { state with subst; types }]
+        load_create_missing_cell loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state
       end
+
+  (** Handles a heap match found in current: exact match adds subst/pure eq,
+      block split transforms current spatial and records the new cell *)
+  and load_match_in_current lhs_id rhs_typ match_res hps rest state =
+    match match_res with
+    | State.MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
+      [{ state with subst = VarIdMap.add lhs_id (State.Var id_of_dest) state.subst }]
+    | State.MatchExpExact { matched = _; dest } ->
+      let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
+      [{ state with current = { state.current with pure = exp :: state.current.pure } }]
+    | State.MatchBlockSplit block_split_res ->
+      let { State.to_remove; to_add; new_dest_id } = match block_split_res with
+        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
+        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args
+      in
+      let spatial = transform_spatial to_remove hps to_add rest in
+      let state = { state with current = { state.current with spatial } } in
+      [{ state with
+        subst = VarIdMap.add lhs_id (State.Var new_dest_id) state.subst;
+        types = VarIdMap.add new_dest_id rhs_typ state.types }]
+
+  (** Handles a heap match found in missing: same logic as current match
+      but transforms missing spatial instead *)
+  and load_match_in_missing lhs_id rhs_typ match_res hps rest state =
+    match match_res with
+    | State.MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
+      [{ state with subst = VarIdMap.add lhs_id (State.Var id_of_dest) state.subst }]
+    | State.MatchExpExact { matched = _; dest } ->
+      let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
+      [{ state with current = { state.current with pure = exp :: state.current.pure } }]
+    | State.MatchBlockSplit block_split_res ->
+      let { State.to_remove; to_add; new_dest_id } = match block_split_res with
+        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
+        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args
+      in
+      let spatial = transform_spatial to_remove hps to_add rest in
+      let state = { state with missing = { state.missing with spatial } } in
+      [{ state with
+        subst = VarIdMap.add lhs_id (State.Var new_dest_id) state.subst;
+        types = VarIdMap.add new_dest_id rhs_typ state.types }]
+
+  (** Creates missing ExpPointsTo when no heap predicate matches. Mirrors to current
+      so subsequent accesses find the cell. Returns error + ok contract *)
+  and load_create_missing_cell loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state =
+    let err_state = { state with status = State.Error (State.err_load_deref_missing_cell, loc, instr) } in
+    let cell_id = Id.fresh () in
+    let missing_spatial = ExpPointsTo (
+      Expr.BinOp (Pplus, Var rhs_var_id, Const (Int rhs_offset)),
+      Expr.Const (Int cell_size),
+      Expr.Var cell_id)
+    in
+    let ok_state = { state with
+      missing = { state.missing with spatial = missing_spatial :: state.missing.spatial };
+      current = { state.current with spatial = missing_spatial :: state.current.spatial };
+      subst = VarIdMap.add lhs_id (State.Var cell_id) state.subst;
+      types = VarIdMap.add cell_id rhs_typ state.types }
+    in
+    [err_state; ok_state]
 
   and exec_store_instr loc instr tenv lhs_typ lhs lhs_expr rhs_expr state =
     let open State in
@@ -309,6 +384,15 @@ module TransferFunctions = struct
       | Ok -> f s
       | Error _ -> [s])
     states
+
+  (** Replaces [to_remove] in [from] with [to_add], then appends [rest].
+      Used after block split to reconstruct the spatial predicate list *)
+  and transform_spatial to_remove from to_add rest =
+    let removed = Stdlib.List.filter
+      (fun hp -> not (Formula.heap_pred_equal hp to_remove))
+      from
+    in
+    List.append removed (List.append to_add rest)
 
   and dereference_check_freed loc instr var_id state =
     if State.is_freed_expr var_id state then
@@ -417,13 +501,6 @@ module TransferFunctions = struct
     let assign state lhs_id lhs_expr =
       store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_norm
     in
-    let transfor_spatial to_remove from to_add rest =
-      let removed = Stdlib.List.filter
-          (fun hp -> not (heap_pred_equal hp to_remove))
-          from
-        in
-        List.append removed (List.append to_add rest)
-    in
     let curr_hps, curr_rest, miss_hps, miss_rest =
       State.heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
@@ -434,7 +511,7 @@ module TransferFunctions = struct
         stale references in [current.spatial] — applied after spatial transform but before
         prepending the new [ExpPointsTo] *)
     let handle_block_split_res ?(to_missing=false) ?(rewrite_spatial=Fun.id) state to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
-      let spatial = transfor_spatial to_remove part to_add rest in
+      let spatial = transform_spatial to_remove part to_add rest in
       let state =
         if to_missing then
           { state with missing = { state.missing with spatial } }

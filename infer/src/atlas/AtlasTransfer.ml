@@ -123,7 +123,9 @@ module TransferFunctions = struct
   and assign_to_variable lhs_id rhs state =
     let open Expr in
     let open State in
-    let state = State.clear_stale_value_constraints lhs_id state in
+    let state, rewrite_spatial = State.clear_stale_value_constraints lhs_id state in
+    let state = { state with current = { state.current with
+      spatial = rewrite_spatial state.current.spatial } } in
     match rhs with
     | Expr.Var rhs_id ->
       (* Both Ids already canonical *)
@@ -276,7 +278,10 @@ module TransferFunctions = struct
           let rhs_norm = normalize_expr rhs_expr state in
           let lhs_norm = normalize_expr lhs_expr state in
           let state = match lhs_norm with
-            | Expr.Var id -> State.clear_stale_value_constraints id state (* maybe unecessary *)
+            | Expr.Var id ->
+              let state, rewrite_spatial = State.clear_stale_value_constraints id state in
+              { state with current = { state.current with
+                spatial = rewrite_spatial state.current.spatial } }
             | _ -> state
           in
           let exp = Expr.BinOp (Peq, lhs_norm, rhs_norm) in
@@ -424,8 +429,11 @@ module TransferFunctions = struct
     in
     (** Applies block split result: removes the matched predicate, adds split fragments,
         runs [store_dereference_assign], then fixes up the separated [new_exp_points_to]
-        using [canonical_rhs] from [AddressStored] if a pointer was stored *)
-    let handle_block_split_res ?(to_missing=false) state to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
+        using [canonical_rhs] from [AddressStored] if a pointer was stored.
+        [rewrite_spatial] is a callback from [clear_stale_value_constraints] that rewrites
+        stale references in [current.spatial] — applied after spatial transform but before
+        prepending the new [ExpPointsTo] *)
+    let handle_block_split_res ?(to_missing=false) ?(rewrite_spatial=Fun.id) state to_remove to_add part rest new_dest_id (new_exp_points_to: heap_pred) =
       let spatial = transfor_spatial to_remove part to_add rest in
       let state =
         if to_missing then
@@ -452,6 +460,10 @@ module TransferFunctions = struct
             Formula.expr_replace ~old_:canonical_rhs ~new_:lhs_expr size,
             Expr.Var new_dest_id))
       in
+      (* Apply stale-constraint spatial rewrite after block split transform + assign,
+         but before prepending new ExpPointsTo *)
+      let state = { state with current = { state.current with
+        spatial = rewrite_spatial state.current.spatial } } in
       if to_missing then
         (* mirror new ExpPointsTo to current — subsequent accesses find the current copy *)
         [ { state with
@@ -466,11 +478,11 @@ module TransferFunctions = struct
       begin match block_split_res with
       | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest } ->
         (* Clear stale value constraints for the old destination being overwritten *)
-        let state = match old_dest with
+        let state, rewrite_spatial = match old_dest with
           | Expr.Var id -> State.clear_stale_value_constraints id state
-          | _ -> state
+          | _ -> (state, Fun.id)
         in
-        handle_block_split_res state to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
+        handle_block_split_res ~rewrite_spatial state to_remove to_add curr_hps curr_rest new_dest_id new_exp_points_to
       | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
       | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
       | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->
@@ -481,11 +493,11 @@ module TransferFunctions = struct
       | Some block_split_res ->
         begin match block_split_res with
         | ExpExactMatch { block_split_args = { to_remove; to_add; new_exp_points_to; new_dest_id }; old_dest } ->
-          let state = match old_dest with
+          let state, rewrite_spatial = match old_dest with
             | Expr.Var id -> State.clear_stale_value_constraints id state
-            | _ -> state
+            | _ -> (state, Fun.id)
           in
-          handle_block_split_res ~to_missing:true state to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
+          handle_block_split_res ~to_missing:true ~rewrite_spatial state to_remove to_add miss_hps miss_rest new_dest_id new_exp_points_to
         | BlockExactMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
         | BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id }
         | BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id } ->

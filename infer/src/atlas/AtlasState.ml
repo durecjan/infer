@@ -225,17 +225,22 @@ let is_direct_value_constraint id constraint_ =
   | _ -> false
 
 (** Prepares [state] for a value reassignment of [lhs_id].
-    Removes stale value constraints (Peq, Pneq, Pless, Plesseq where [Var lhs_id]
-    is a direct operand) from [current.pure]. Also cleans up substitution:
-    - Removes forward entry [subst\[lhs_id\]]
-    - Finds reverse entries [subst\[yi\] = Var lhs_id], picks one as canonical
-      representative for the old value, rewrites the stale constraints under it,
-      and redirects remaining reverse entries to it *)
+    When no reverse subst deps exist: drops stale value constraints from [current.pure].
+    When reverse deps exist: picks a non-temp canonical representative for the old value,
+    deep-rewrites ALL occurrences of [Var lhs_id] → [Var canonical] in [current.pure]
+    (covers value constraints AND block properties like Base/End/Freed),
+    removes canonical's subst entry, and redirects remaining reverse deps to canonical.
+
+    Returns [(state, rewrite_current_spatial)] where the callback rewrites [current.spatial]
+    with the same [Var lhs_id] → [Var canonical] substitution. The caller is responsible for
+    applying the callback at the right point — specifically AFTER spatial transforms (block
+    split) but BEFORE prepending new heap predicates. This avoids the rewrite being
+    overwritten by subsequent spatial modifications.
+
+    Invariant: in [subst\[x\] = y], [y] is always a non-temp id (pvar or cell id).
+    This cannot be violated because temps are created by SIL Load instructions and
+    always appear as subst keys, never as subst values — and ExitScope clears them *)
 let clear_stale_value_constraints lhs_id state =
-  (* Partition current.pure into stale value constraints and the rest *)
-  let stale, kept = List.partition_tf state.current.pure
-    ~f:(is_direct_value_constraint lhs_id)
-  in
   (* Find all reverse subst dependencies: yi where subst[yi] = Var lhs_id *)
   let reverse_deps = VarIdMap.fold
     (fun yi expr acc ->
@@ -248,33 +253,54 @@ let clear_stale_value_constraints lhs_id state =
   let subst = VarIdMap.remove lhs_id state.subst in
   match reverse_deps with
   | [] ->
-    (* No reverse deps — stale constraints are simply dropped *)
-    { state with
-      current = { state.current with pure = kept };
-      subst }
-  | canonical :: rest ->
-    (* Pick first reverse dep as canonical for the old value.
-       Rewrite stale constraints: Var lhs_id → Var canonical *)
-    let rewrite_expr e =
-      match e with
-      | Expr.Var id' when Id.equal id' lhs_id -> Expr.Var canonical
-      | _ -> e
+    (* No reverse deps — drop stale value constraints, block properties become
+       orphaned but harmless (cleaned by postprocessing / unreachable id pruning) *)
+    let kept = List.filter state.current.pure
+      ~f:(fun c -> not (is_direct_value_constraint lhs_id c))
     in
-    let rewritten = List.map stale ~f:(fun c ->
-      match c with
-      | Expr.BinOp (op, lhs, rhs) ->
-        Expr.BinOp (op, rewrite_expr lhs, rewrite_expr rhs)
-      | other -> other)
+    ({ state with
+      current = { state.current with pure = kept };
+      subst },
+     Fun.id)
+  | _ ->
+    (* Pick non-temp canonical: prefer pvar ids, then cell ids (not in vars map).
+       Temps (LogicalVar in vars map) must never be canonical *)
+    let is_non_temp id =
+      match VarIdMap.find_opt id state.vars with
+      | Some var -> Var.is_pvar var  (* pvar → non-temp *)
+      | None -> true                 (* not in vars → cell id → non-temp *)
+    in
+    let canonical = match List.find reverse_deps ~f:is_non_temp with
+      | Some id -> id
+      | None -> Logging.die InternalError
+          "[clear_stale_value_constraints] no non-temp canonical candidate \
+           among reverse deps of id %d" lhs_id
+    in
+    let current_pure = subst_apply_to_pure
+      ~from_:(Expr.Var lhs_id)
+      ~to_:(Expr.Var canonical)
+      state.current.pure
+    in
+    (* Spatial rewrite callback — applied by caller after spatial transforms *)
+    let rewrite_current_spatial spatial =
+      subst_apply_to_spatial
+        ~from_:(Expr.Var lhs_id)
+        ~to_:(Expr.Var canonical)
+        spatial
     in
     (* Remove canonical's subst entry (it is now the root),
        redirect remaining reverse deps to canonical *)
+    let rest = List.filter reverse_deps
+      ~f:(fun yi -> not (Id.equal yi canonical))
+    in
     let subst = VarIdMap.remove canonical subst in
     let subst = List.fold rest ~init:subst ~f:(fun acc yi ->
       VarIdMap.add yi (Var canonical) acc)
     in
-    { state with
-      current = { state.current with pure = List.append rewritten kept };
-      subst }
+    ({ state with
+      current = { state.current with pure = current_pure };
+      subst },
+     rewrite_current_spatial)
 
 
 (* ==================== Exp.t helpers ==================== *)

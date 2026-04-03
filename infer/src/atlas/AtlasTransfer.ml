@@ -536,9 +536,6 @@ module TransferFunctions = struct
       end
 
   and exec_malloc_instr lhs typ actual state =
-    let open State in
-    let open Formula in
-    let open Expr in
     let lhs_id = Id.fresh () in
     let state = { state with
       vars = VarIdMap.add lhs_id (Var.of_id lhs) state.vars;
@@ -549,33 +546,26 @@ module TransferFunctions = struct
     let size = normalize_expr actual state in
     (* try to evaluate the size *)
     let size = match eval_expr_to_int64_opt size state with
-      Some i -> Const (Int i)
-    | None -> size
+      | Some i -> Expr.Const (Int i)
+      | None -> size
     in
-    let { current } = state in
     (* success state: block allocated with Base/End constraints *)
-    let ok_state = {
-      state with
+    let ok_state = { state with
       current = {
-        spatial = BlockPointsTo (source, size) :: current.spatial;
+        spatial = BlockPointsTo (source, size) :: state.current.spatial;
         pure =
-          BinOp (Peq, UnOp (Base, source), source) ::
-          BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
-          current.pure
-      };
-    } in
+          Expr.BinOp (Peq, UnOp (Base, source), source) ::
+          Expr.BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
+          state.current.pure } } in
     (* failure state: malloc returned NULL *)
-    let null_state = {
-      state with
-      current = {
-        current with pure =
-          BinOp (Peq, source, Expr.null) ::
-          BinOp (Peq, UnOp (Base, source), Expr.zero) ::
-          BinOp (Peq, UnOp (End, source), Expr.zero) ::
-          current.pure
-      };
-    } in
-    [ ok_state; null_state ]
+    let null_state = { state with
+      current = { state.current with
+        pure =
+          Expr.BinOp (Peq, source, Expr.null) ::
+          Expr.BinOp (Peq, UnOp (Base, source), Expr.zero) ::
+          Expr.BinOp (Peq, UnOp (End, source), Expr.zero) ::
+          state.current.pure } } in
+    [ok_state; null_state]
 
   (** free(NULL) is a no-op per the C standard. Recovers base pointer and offset,
       checks for null (both literal and resolved), then delegates to freed/base checks.

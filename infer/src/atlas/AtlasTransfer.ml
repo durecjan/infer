@@ -577,42 +577,130 @@ module TransferFunctions = struct
     } in
     [ ok_state; null_state ]
 
-  (** free(NULL) is a no-op per the C standard. We check for null both as a literal
-      constant and as a variable whose value resolves to null *)
+  (** free(NULL) is a no-op per the C standard. Recovers base pointer and offset,
+      checks for null (both literal and resolved), then delegates to freed/base checks.
+      Null pointer with non-zero offset is UB — terminal error *)
   and exec_free_instr loc instr tenv actual_expr state =
     let open State in
-    let is_null_var_expr id =
-      match Formula.lookup_pure_const_exp_of_id id state.current.pure with
-      | Some e -> Formula.is_null_expr e
-      | None -> false
-    in
     if Formula.is_null_expr actual_expr then
       [state]
     else
       match base_and_offset_of_expr actual_expr state with
       | Some (base_id, offset) ->
-        if is_null_var_expr base_id then
+        let is_null = match Formula.lookup_pure_const_exp_of_id base_id state.current.pure with
+          | Some e -> Formula.is_null_expr e
+          | None -> false
+        in
+        if is_null && Int64.equal offset 0L then
+          (* free(NULL) — no-op *)
           [state]
-        else begin
-          (* Recover the original type from the preceding Load instruction's type info.
-             SIL always passes void* to free, but the variable retains its original type. *)
-          let element_size =
-            match VarIdMap.find_opt base_id state.types with
-            | Some typ ->
-              begin match typ_size_of_element_opt tenv typ with
-              | Some 0L -> 1L (* void pointer — no size info *)
-              | Some size -> size
-              | None -> 1L
-              end
-            | None -> 1L
-          in
-          (* offset from base_and_offset_of_expr is in element units, scale to bytes *)
-          let offset_bytes = Stdlib.Int64.mul offset element_size in
-          free_block loc instr base_id offset_bytes element_size state
-        end
+        else if is_null then
+          (* free(NULL + offset) — UB: null pointer arithmetic *)
+          [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+        else
+          free_compute_offset loc instr tenv base_id offset state
       | None ->
-        [{ state with
-          status = Error (err_free_no_base_pointer, loc, instr) }]
+        [{ state with status = Error (err_free_no_base_pointer, loc, instr) }]
+
+  (** Recovers element size from type info, scales offset to bytes,
+      then checks for double-free before proceeding to base lookup *)
+  and free_compute_offset loc instr tenv base_id offset state =
+    (* Recover the original type from the preceding Load instruction's type info.
+       SIL always passes void* to free, but the variable retains its original type *)
+    let element_size =
+      match VarIdMap.find_opt base_id state.types with
+      | Some typ ->
+        begin match typ_size_of_element_opt tenv typ with
+        | Some 0L -> 1L (* void pointer — no size info *)
+        | Some size -> size
+        | None -> 1L
+        end
+      | None -> 1L
+    in
+    (* offset from base_and_offset_of_expr is in element units, scale to bytes *)
+    let offset_bytes = Stdlib.Int64.mul offset element_size in
+    [state]
+    |> concat_map_ok_states (free_check_freed loc instr base_id)
+    |> concat_map_ok_states (free_lookup_base loc instr base_id offset_bytes element_size)
+
+  (** Checks whether the pointer has already been freed — terminal error if so *)
+  and free_check_freed loc instr id state =
+    if State.is_freed_expr id state then
+      [{ state with status = Error (err_free_double_free, loc, instr) }]
+    else
+      [state]
+
+  (** Looks up Base(Var id) in current. If found and non-zero, delegates to [free_with_base].
+      If found and zero, reports unallocated error. If not found, creates missing contract *)
+  and free_lookup_base loc instr id offset cell_size state =
+    match Formula.lookup_pure_base_expr id state.current.pure with
+    | Some base_exp ->
+      if Formula.is_zero_expr base_exp then
+        [{ state with status = Error (err_free_unallocated, loc, instr) }]
+      else
+        free_with_base loc instr id offset base_exp state
+    | None ->
+      free_create_missing_contract loc instr id offset cell_size state
+
+  (** Base found in current — compares offset against base offset to determine validity.
+      Equal offset: happy path (cleanup + Freed). Lower offset: attempt to lower bound
+      in missing precondition. Higher offset: non-base-pointer free error *)
+  and free_with_base loc instr id offset base_exp state =
+    (* TODO: eval_expr_offset falls back to zero for unknown formals — add comment/handling *)
+    let base_offset = eval_expr_offset base_exp id state in
+    if Int64.equal base_offset offset then
+      (* happy path: offset matches base, cleanup and add Freed to current *)
+      let state = State.cleanup_after_free id state in
+      let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+      [{ state with current = { state.current with pure } }]
+    else if Int64.compare offset base_offset < 0 then
+      (* offset below current base — check missing for lowering *)
+      begin match Formula.lookup_pure_base_expr id state.missing.pure with
+      | Some miss_base_exp ->
+        (* Found in missing — lower bound in precondition only, then free.
+           TODO: generate error contract for the lowering case (caller might not
+           satisfy the lowered precondition — needs NonBasePointerFree error state) *)
+        let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var id), miss_base_exp) in
+        let to_add = Expr.BinOp (Plesseq,
+          UnOp (Base, Var id),
+          BinOp (Pplus, Var id, Const (Int offset))) in
+        let missing_pure = Stdlib.List.filter
+          (fun e -> not (Expr.equal e to_remove)) state.missing.pure in
+        let state = { state with missing =
+          { state.missing with pure = to_add :: missing_pure } }
+        in
+        let state = State.cleanup_after_free id state in
+        let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+        [{ state with current = { state.current with pure } }]
+      | None ->
+        [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+      end
+    else
+      (* offset above base — by definition a non-base-pointer free *)
+      [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
+
+  (** Base not found in current — creates missing resources (Base, End, BlockPointsTo)
+      in missing only (NOT mirrored to current — Base/End + Freed is contradictory).
+      Returns both an error contract and an ok contract with the missing resources *)
+  and free_create_missing_contract loc instr id offset cell_size state =
+    let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
+    let missing_base = Expr.BinOp (Plesseq,
+      UnOp (Base, Var id),
+      BinOp (Pplus, Var id, Const (Int offset))) in
+    let missing_end = Expr.BinOp (Plesseq,
+      BinOp (Pplus, Var id, Const (Int (Stdlib.Int64.add offset cell_size))),
+      UnOp (End, Var id)) in
+    let missing_heap_pred = BlockPointsTo (
+      Expr.Var id,
+      Expr.Const (Int cell_size)) in
+    let missing = {
+      spatial = missing_heap_pred :: state.missing.spatial;
+      pure = missing_base :: missing_end :: state.missing.pure } in
+    let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
+    let ok_state = { state with
+      current = { state.current with pure };
+      missing } in
+    [err_state; ok_state]
 
   and exec_metadata_instr metadata state =
     let open Sil in
@@ -638,73 +726,6 @@ module TransferFunctions = struct
       [state]
     | _ ->
       [state]
-
-    (** Checks whether freeing pointer [id] at [offset] is valid and adds Freed constraint.
-        Steps: 1) check double free, 2) find Base in current, 3) check missing, 4) create missing.
-        Missing resources are NOT mirrored to current — Base/End + Freed in current is contradictory *)
-    and free_block loc instr id offset cell_size state =
-      let open State in
-      (* Step 1: check if already freed *)
-      if State.is_freed_expr id state then
-        [{ state with status = Error (err_free_double_free, loc, instr) }]
-      else
-      (* Step 2: find Base(Var id) in current *)
-      match Formula.lookup_pure_base_expr id state.current.pure with
-      | Some base_exp ->
-        if Formula.is_zero_expr base_exp then
-          [{ state with status = Error (err_free_unallocated, loc, instr) }]
-        else
-          let base_offset = eval_expr_offset base_exp id state in
-          if Int64.equal base_offset offset then
-            (* happy path: offset matches base, cleanup and add Freed to current *)
-            let state = State.cleanup_after_free id state in
-            let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-            [{ state with current = { state.current with pure } }]
-          else begin
-            if Int64.compare offset base_offset < 0 then begin
-              (* Step 3: check missing — may need to lower bound in precondition only *)
-              match Formula.lookup_pure_base_expr id state.missing.pure with
-              | Some base_exp ->
-                (* Found in missing — lower bound in precondition if needed, then free.
-                TODO: generate error contract for the lowering case (caller might not
-                satisfy the lowered precondition — needs NonBasePointerFree error state) *)
-                let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var id), base_exp) in
-                let to_add = Expr.BinOp (Plesseq,
-                  UnOp (Base, Var id),
-                  BinOp (Pplus, Var id, Const (Int offset))) in
-                let missing_pure = Stdlib.List.filter
-                  (fun e -> not (Expr.equal e to_remove)) state.missing.pure in
-                let state = { state with missing =
-                  { state.missing with pure = to_add :: missing_pure } }
-                in
-                let state = State.cleanup_after_free id state in
-                let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-                [{ state with current = { state.current with pure } }]
-              | None ->
-                [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
-            end else
-              [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
-          end
-      | None ->
-          (* Step 4: not found anywhere — create missing resources (missing only) *)
-        let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
-        let missing_base = Expr.BinOp (Plesseq,
-          UnOp (Base, Var id),
-          BinOp (Pplus, Var id, Const (Int offset))) in
-        let missing_end = Expr.BinOp (Plesseq,
-          BinOp (Pplus, Var id, Const (Int (Stdlib.Int64.add offset cell_size))),
-          UnOp (End, Var id)) in
-        let missing_heap_pred = BlockPointsTo (
-          Expr.Var id,
-          Expr.Const (Int cell_size)) in
-        let missing = {
-          spatial = missing_heap_pred :: state.missing.spatial;
-          pure = missing_base :: missing_end :: state.missing.pure } in
-        let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-        let ok_state = { state with
-          current = { state.current with pure };
-          missing } in
-        [err_state; ok_state]
 
   (** Transfer function for a single disjunct — the interpreter manages the disjunction.
       Error states are passed through unchanged *)

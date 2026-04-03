@@ -703,29 +703,26 @@ module TransferFunctions = struct
     [err_state; ok_state]
 
   and exec_metadata_instr metadata state =
-    let open Sil in
     match metadata with
-    | ExitScope (var_list, _loc) ->
-      let state = List.fold var_list ~init:state
-        ~f:(fun state var ->
-          match var with
-          | Var.LogicalVar ident ->
-            begin match lookup_variable_id (Var.of_id ident) state.vars with
-            | Some id ->
-              { state with
-                vars = VarIdMap.remove id state.vars;
-                types = VarIdMap.remove id state.types;
-                subst = VarIdMap.remove id state.subst }
-            | None -> state
-            end
-          | _ -> state)
-      in
-      [state]
-    | Abstract _ ->
-      (* TODO good place to clean up final state *)
-      [state]
+    | Sil.ExitScope (var_list, _loc) ->
+      [List.fold var_list ~init:state ~f:exit_scope_var]
     | _ ->
       [state]
+
+  (** Removes a single logical variable from state maps (vars, types, subst).
+      Program variables are ignored — only temporaries (introduced by SIL Load
+      or function calls) are cleared, as they are scoped to a single CFG node *)
+  and exit_scope_var state = function
+    | Var.LogicalVar ident ->
+      begin match lookup_variable_id (Var.of_id ident) state.vars with
+      | Some id ->
+        { state with
+          vars = VarIdMap.remove id state.vars;
+          types = VarIdMap.remove id state.types;
+          subst = VarIdMap.remove id state.subst }
+      | None -> state
+      end
+    | _ -> state
 
   (** Transfer function for a single disjunct — the interpreter manages the disjunction.
       Error states are passed through unchanged *)

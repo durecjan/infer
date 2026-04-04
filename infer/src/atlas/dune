@@ -3,6 +3,7 @@
  (public_name infer.Atlas)
  (flags
   (:standard
+   -w -23-27
    -open
    Core
    -open

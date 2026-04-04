@@ -1077,15 +1077,38 @@ let rec sil_exp_to_expr ?typ e tenv s =
     Expr.UnOp (op', exp')
   | Exp.BinOp ((Binop.PlusPI | Binop.MinusPI) as op, e1, e2)
     when Option.is_some typ ->
-      let typ_size = match typ with
-        | Some t -> typ_size_of tenv t
+      (* PlusPI/MinusPI means "pointer + N elements" where the element size is
+         determined by the pointee type of the pointer operand e1.
+
+         The ~typ parameter comes from the enclosing SIL instruction (Load.typ or
+         Store.typ), which is the type of the value being loaded/stored:
+
+         - Dereference case: sil dereferences the pointer, so typ = pointee type
+
+         - Address assignment case: no dereference occurs, so typ = pointer type,
+           PlusPI still needs the pointee size, so we extract the pointee via
+           Tptr pattern match.
+
+         - Nested pointers: typ = char**, Tptr extracts char* — advancing by one
+           char* element is also correct.
+
+         This works because SIL's typ always equals the type of e1 in the address
+         assignment case (the result of PlusPI preserves the pointer type), and
+         equals the pointee of e1 in the dereference case (Load peels one layer).
+         So: if typ is a pointer, extract its pointee; otherwise use typ as-is. *)
+      let elem_size = match typ with
+        | Some t ->
+          let elem_typ = match t.Typ.desc with
+            | Tptr (inner, _) -> inner
+            | _ -> t
+          in
+          typ_size_of tenv elem_typ
         | None -> 1L
       in
       let lhs = sil_exp_to_expr e1 tenv s in
       let rhs = sil_exp_to_expr e2 tenv s in
       let op' = sil_binop_exp_to_expr op in
-      (* if lhs is pointer then TODO make sure pointer is always lhs *)
-      Expr.BinOp (op', lhs, Expr.BinOp (Expr.Pmult, rhs, Const (Int typ_size)))
+      Expr.BinOp (op', lhs, Expr.BinOp (Expr.Pmult, rhs, Const (Int elem_size)))
   | Exp.BinOp ((Binop.Gt | Binop.Ge) as op, e1, e2) ->
     let lhs = sil_exp_to_expr e1 tenv s in
     let rhs = sil_exp_to_expr e2 tenv s in

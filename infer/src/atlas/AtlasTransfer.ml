@@ -141,80 +141,13 @@ module TransferFunctions = struct
     let cell_size = typ_size_of tenv rhs_typ in
     [state]
     |> concat_map_ok_states
-      (dereference_check_freed loc instr rhs_var_id)
+      (deref_check_freed loc instr rhs_var_id)
     |> concat_map_ok_states
-      (load_check_base loc instr rhs_var_id rhs_offset)
+      (deref_check_base loc instr rhs_var_id rhs_offset)
     |> concat_map_ok_states
-      (load_check_end loc instr rhs_var_id rhs_offset cell_size)
+      (deref_check_end loc instr rhs_var_id rhs_offset cell_size)
     |> concat_map_ok_states
       (load_match_heap loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size)
-
-  (** Checks Base bound for load dereference. Dispatches to lowering, strict check,
-      or missing resource generation depending on where the bound is found *)
-  and load_check_base loc instr var_id offset state =
-    match lookup_pure_bound_expr var_id Expr.Base state with
-    | (Some e, _) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_base, loc, instr) }]
-    | (_, Some e) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_base, loc, instr) }]
-    | (_, Some e) ->
-      dereference_lower_base_bound e var_id offset state
-    | (Some e, None) ->
-      let base_offset = eval_expr_offset e var_id state in
-      if Int64.compare offset base_offset < 0 then
-        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
-      else
-        [state]
-    | (None, None) ->
-      load_create_missing_base loc instr var_id offset state
-
-  (** Creates missing Base constraint when not found in current or missing.
-      Returns error contract + ok contract with bound mirrored to both *)
-  and load_create_missing_base loc instr var_id offset state =
-    let err_state = { state with status = Error (err_deref_missing_base, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
-      Expr.UnOp (Base, Var var_id),
-      Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
-    in
-    let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
-    in
-    [err_state; ok_state]
-
-  (** Checks End bound for load dereference. Dispatches to raising, strict check,
-      or missing resource generation depending on where the bound is found *)
-  and load_check_end loc instr var_id offset cell_size state =
-    match lookup_pure_bound_expr var_id Expr.End state with
-    | (Some e, _) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_end, loc, instr) }]
-    | (_, Some e) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_end, loc, instr) }]
-    | (_, Some e) ->
-      dereference_raise_end_bound e var_id offset cell_size state
-    | (Some e, None) ->
-      let end_offset = eval_expr_offset e var_id state in
-      let access_end = Stdlib.Int64.add offset cell_size in
-      if Int64.compare access_end end_offset > 0 then
-        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
-      else
-        [state]
-    | (None, None) ->
-      load_create_missing_end loc instr var_id offset cell_size state
-
-  (** Creates missing End constraint when not found in current or missing.
-      Returns error contract + ok contract with bound mirrored to both *)
-  and load_create_missing_end loc instr var_id offset cell_size state =
-    let err_state = { state with status = Error (err_deref_missing_end, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
-      Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
-      Expr.UnOp (End, Var var_id))
-    in
-    let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
-    in
-    [err_state; ok_state]
 
   (** Attempts to match heap predicates for load dereference. Tries current first,
       then missing, then creates missing resources if nothing matches *)
@@ -312,13 +245,80 @@ module TransferFunctions = struct
     List.append removed (List.append to_add rest)
 
   (** Checks whether pointer [var_id] has been freed — terminal error if so *)
-  and dereference_check_freed loc instr var_id state =
+  and deref_check_freed loc instr var_id state =
     if is_freed_expr var_id state then
       [{ state with status = Error (err_deref_use_after_free, loc, instr) }]
     else [state]
 
+  (** Checks Base bound for dereference. Dispatches to lowering, strict check,
+      or missing resource generation depending on where the bound is found *)
+  and deref_check_base loc instr var_id offset state =
+    match lookup_pure_bound_expr var_id Expr.Base state with
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_base, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_base, loc, instr) }]
+    | (_, Some e) ->
+      deref_lower_base_bound e var_id offset state
+    | (Some e, None) ->
+      let base_offset = eval_expr_offset e var_id state in
+      if Int64.compare offset base_offset < 0 then
+        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
+      else
+        [state]
+    | (None, None) ->
+      deref_create_missing_base loc instr var_id offset state
+
+  (** Creates missing Base constraint when not found in current or missing.
+      Returns error contract + ok contract with bound mirrored to both *)
+  and deref_create_missing_base loc instr var_id offset state =
+    let err_state = { state with status = Error (err_deref_missing_base, loc, instr) } in
+    let bound = Expr.BinOp (Plesseq,
+      Expr.UnOp (Base, Var var_id),
+      Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
+    in
+    let ok_state = { state with
+      missing = { state.missing with pure = bound :: state.missing.pure };
+      current = { state.current with pure = bound :: state.current.pure } }
+    in
+    [err_state; ok_state]
+
+  (** Checks End bound for dereference. Dispatches to raising, strict check,
+      or missing resource generation depending on where the bound is found *)
+  and deref_check_end loc instr var_id offset cell_size state =
+    match lookup_pure_bound_expr var_id Expr.End state with
+    | (Some e, _) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_end, loc, instr) }]
+    | (_, Some e) when Formula.is_zero_expr e ->
+      [{ state with status = Error (err_deref_null_end, loc, instr) }]
+    | (_, Some e) ->
+      deref_raise_end_bound e var_id offset cell_size state
+    | (Some e, None) ->
+      let end_offset = eval_expr_offset e var_id state in
+      let access_end = Stdlib.Int64.add offset cell_size in
+      if Int64.compare access_end end_offset > 0 then
+        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
+      else
+        [state]
+    | (None, None) ->
+      deref_create_missing_end loc instr var_id offset cell_size state
+
+  (** Creates missing End constraint when not found in current or missing.
+      Returns error contract + ok contract with bound mirrored to both *)
+  and deref_create_missing_end loc instr var_id offset cell_size state =
+    let err_state = { state with status = Error (err_deref_missing_end, loc, instr) } in
+    let bound = Expr.BinOp (Plesseq,
+      Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
+      Expr.UnOp (End, Var var_id))
+    in
+    let ok_state = { state with
+      missing = { state.missing with pure = bound :: state.missing.pure };
+      current = { state.current with pure = bound :: state.current.pure } }
+    in
+    [err_state; ok_state]
+
   (** Lowers the Base bound in both missing and current when access offset is below it *)
-  and dereference_lower_base_bound base_exp var_id offset state =
+  and deref_lower_base_bound base_exp var_id offset state =
     let base_offset = eval_expr_offset base_exp var_id state in
     if Int64.compare offset base_offset < 0 then
       let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var var_id), base_exp) in
@@ -334,7 +334,7 @@ module TransferFunctions = struct
       [state]
 
   (** Raises the End bound in both missing and current when access exceeds it *)
-  and dereference_raise_end_bound end_exp var_id offset cell_size state =
+  and deref_raise_end_bound end_exp var_id offset cell_size state =
     let end_offset = eval_expr_offset end_exp var_id state in
     let access_end = Stdlib.Int64.add offset cell_size in
     if Int64.compare access_end end_offset > 0 then
@@ -437,80 +437,13 @@ module TransferFunctions = struct
     let cell_size = typ_size_of tenv lhs_typ in
     [state]
     |> concat_map_ok_states
-      (dereference_check_freed loc instr lhs_var_id)
+      (deref_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
-      (store_check_base loc instr lhs_var_id lhs_offset)
+      (deref_check_base loc instr lhs_var_id lhs_offset)
     |> concat_map_ok_states
-      (store_check_end loc instr lhs_var_id lhs_offset cell_size)
+      (deref_check_end loc instr lhs_var_id lhs_offset cell_size)
     |> concat_map_ok_states
       (store_match_heap loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr)
-
-  (** Checks Base bound for store dereference. Dispatches to lowering, strict check,
-      or missing resource generation depending on where the bound is found *)
-  and store_check_base loc instr var_id offset state =
-    match lookup_pure_bound_expr var_id Expr.Base state with
-    | (Some e, _) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_base, loc, instr) }]
-    | (_, Some e) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_base, loc, instr) }]
-    | (_, Some e) ->
-      dereference_lower_base_bound e var_id offset state
-    | (Some e, None) ->
-      let base_offset = eval_expr_offset e var_id state in
-      if Int64.compare offset base_offset < 0 then
-        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
-      else
-        [state]
-    | (None, None) ->
-      store_create_missing_base loc instr var_id offset state
-
-  (** Creates missing Base constraint for store dereference.
-      Returns error contract + ok contract with bound mirrored to both *)
-  and store_create_missing_base loc instr var_id offset state =
-    let err_state = { state with status = Error (err_deref_missing_base, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
-      Expr.UnOp (Base, Var var_id),
-      Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
-    in
-    let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
-    in
-    [err_state; ok_state]
-
-  (** Checks End bound for store dereference. Dispatches to raising, strict check,
-      or missing resource generation depending on where the bound is found *)
-  and store_check_end loc instr var_id offset cell_size state =
-    match lookup_pure_bound_expr var_id Expr.End state with
-    | (Some e, _) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_end, loc, instr) }]
-    | (_, Some e) when Formula.is_zero_expr e ->
-      [{ state with status = Error (err_deref_null_end, loc, instr) }]
-    | (_, Some e) ->
-      dereference_raise_end_bound e var_id offset cell_size state
-    | (Some e, None) ->
-      let end_offset = eval_expr_offset e var_id state in
-      let access_end = Stdlib.Int64.add offset cell_size in
-      if Int64.compare access_end end_offset > 0 then
-        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
-      else
-        [state]
-    | (None, None) ->
-      store_create_missing_end loc instr var_id offset cell_size state
-
-  (** Creates missing End constraint for store dereference.
-      Returns error contract + ok contract with bound mirrored to both *)
-  and store_create_missing_end loc instr var_id offset cell_size state =
-    let err_state = { state with status = Error (err_deref_missing_end, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
-      Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
-      Expr.UnOp (End, Var var_id))
-    in
-    let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
-    in
-    [err_state; ok_state]
 
   (** Attempts to match heap predicates for store dereference. Tries current first,
       then missing, then creates missing resources if nothing matches *)

@@ -36,7 +36,8 @@
   IR
   Absint
   BO
-  Pulselib)
+  Pulselib
+  astral)
  (preprocess
   (pps
    ppx_compare

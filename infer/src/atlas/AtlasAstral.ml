@@ -144,19 +144,41 @@ let translate_heap_pred types (hp : Formula.heap_pred) : LL.t =
   | UniformBlockPointsTo (src, size, _value) ->
     LL.mk_pto_array (translate_expr types src) ~size:(translate_expr types size)
 
+(** Negates an expression at the formula level.
+    [Peq] ↔ [Pneq], [Lnot] unwraps, everything else wraps in [Lnot] *)
+let negate_expr (expr : Expr.t) : Expr.t =
+  match expr with
+  | BinOp (Peq, e1, e2) -> BinOp (Pneq, e1, e2)
+  | BinOp (Pneq, e1, e2) -> BinOp (Peq, e1, e2)
+  | UnOp (Lnot, inner) -> inner
+  | _ -> UnOp (Lnot, expr)
+
 (** Translates a pure constraint to an Astral formula atom.
     Returns [None] for constraints that cannot be expressed in LowLevelSeplog
-    (inequalities, freed markers, boolean connectives) *)
-let translate_pure_constraint types (expr : Expr.t) : LL.t option =
+    (inequalities, freed markers, Base/End==0 for unallocated pointers).
+    Handles [Lnot]-wrapped conditions from SIL false branches by negating
+    the inner expression and retrying *)
+let rec translate_pure_constraint types (expr : Expr.t) : LL.t option =
   match expr with
+  | BinOp (Peq, UnOp ((Base | End), _), rhs) when Formula.is_zero_expr rhs ->
+    (* Base(p)==0 / End(p)==0 encodes "unallocated" in Atlas. Astral adds an
+       internal axiom block_begin < block_end for every block term in the formula,
+       which contradicts begin==end==0. Skip these — Astral infers allocation
+       status from the presence or absence of spatial predicates *)
+    None
+  | BinOp (Peq, lhs, UnOp ((Base | End), _)) when Formula.is_zero_expr lhs ->
+    None
   | BinOp (Peq, e1, e2) ->
     Some (LL.mk_eq2 (translate_expr types e1) (translate_expr types e2))
   | BinOp (Pneq, e1, e2) ->
     Some (LL.mk_distinct2 (translate_expr types e1) (translate_expr types e2))
+  | UnOp (Lnot, inner) ->
+    (* SIL false branches wrap conditions in Lnot: !(e1 == e2).
+       Unwrap by negating the inner expression and retrying *)
+    translate_pure_constraint types (negate_expr inner)
   | UnOp (Freed, _) ->
     None
   | BinOp ((Plesseq | Pless), _, _) ->
-    (* LowLevelSeplog does not expose inequality predicates *)
     None
   | _ ->
     None
@@ -193,15 +215,6 @@ let check_sat (state : AtlasState.t) : [`Sat | `Unsat | `Unknown] =
   let ll_formula = translate_state state in
   LL.check_sat ll_formula
 
-(** Negates an expression at the formula level.
-    [Peq] ↔ [Pneq], [Lnot] unwraps, everything else wraps in [Lnot] *)
-let negate_expr (expr : Expr.t) : Expr.t =
-  match expr with
-  | BinOp (Peq, e1, e2) -> BinOp (Pneq, e1, e2)
-  | BinOp (Pneq, e1, e2) -> BinOp (Peq, e1, e2)
-  | UnOp (Lnot, inner) -> inner
-  | _ -> UnOp (Lnot, expr)
-
 (** Checks satisfiability of the current state conjoined with an additional
     condition. Used for prune condition strengthening: when [eval_prune_condition]
     returns Unknown, we check whether the conjunction of the state with the
@@ -210,8 +223,14 @@ let check_sat_with_condition (state : AtlasState.t) (condition : Expr.t) : [`Sat
   let base = translate_state state in
   match translate_pure_constraint state.types condition with
   | Some cond_atom ->
-    LL.check_sat (LL.mk_star [base; cond_atom])
+    let query = LL.mk_star [base; cond_atom] in
+    Format.printf "[ASTRAL] query: %s\n" (LL.show query);
+    let result = LL.check_sat query in
+    Format.printf "[ASTRAL] result: %s\n"
+      (match result with `Sat -> "SAT" | `Unsat -> "UNSAT" | `Unknown -> "UNKNOWN");
+    result
   | None ->
+    Format.printf "[ASTRAL] condition not translatable, returning Unknown\n";
     `Unknown
 
 (** Evaluates a prune condition using Astral. Checks both the condition and
@@ -220,6 +239,7 @@ let check_sat_with_condition (state : AtlasState.t) (condition : Expr.t) : [`Sat
     - [UNSAT(state ∧ ¬cond)] → condition must hold → [Sat]
     - Otherwise → [Unknown] *)
 let eval_prune (state : AtlasState.t) (condition : Expr.t) : AtlasState.prune_result =
+  Format.printf "[ASTRAL] eval_prune called\n";
   match check_sat_with_condition state condition with
   | `Unsat -> Unsat
   | `Sat | `Unknown ->

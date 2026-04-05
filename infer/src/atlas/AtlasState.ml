@@ -658,27 +658,27 @@ let is_var_null id state =
   | None -> scan state.missing.pure
 
 (** Evaluates whether two expressions are equal in the given state.
-    Handles concrete values via [eval_expr_to_int64_opt] and null checks
-    for pointer variables via Base constraints *)
+    Only handles fast structural checks after substitution resolution:
+    - Identical expressions after [normalize_expr] → [Sat]
+    - Null check: one side is null, other is a pointer variable with
+      known null/non-null status via Base constraints → [Sat]/[Unsat]
+    - Everything else → [Unknown] (delegated to Astral solver) *)
 let eval_eq e1 e2 state =
   let e1 = normalize_expr e1 state in
   let e2 = normalize_expr e2 state in
   if Expr.equal e1 e2 then Sat
   else
-    match eval_expr_to_int64_opt e1 state, eval_expr_to_int64_opt e2 state with
-    | Some v1, Some v2 ->
-      if Int64.equal v1 v2 then Sat else Unsat
-    | _ ->
-      (* null check: one side is null, other is a pointer variable *)
-      match e1, e2 with
-      | Expr.Const Null, Expr.Var id
-      | Expr.Var id, Expr.Const Null ->
-        begin match is_var_null id state with
-        | Some true -> Sat
-        | Some false -> Unsat
-        | None -> Unknown
-        end
-      | _ -> Unknown
+    match e1, e2 with
+    | Expr.Const Null, Expr.Var id
+    | Expr.Var id, Expr.Const Null ->
+      begin match is_var_null id state with
+      | Some true -> Sat
+      | Some false -> Unsat
+      | None -> Unknown
+      end
+    | Expr.Var id1, Expr.Var id2
+      when Id.equal id1 id2 -> Sat
+    | _ -> Unknown
 
 (** Evaluates a prune condition expression against a state.
     Returns [Sat] if the condition is satisfiable (keep state),

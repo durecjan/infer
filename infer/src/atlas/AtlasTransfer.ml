@@ -58,9 +58,14 @@ module TransferFunctions = struct
         | Unsat -> []
         | Sat -> [state]
         | Unknown ->
-          [{ state with
-            missing = { state.missing with pure = cond :: state.missing.pure };
-            current = { state.current with pure = cond :: state.current.pure } }]
+          (* Fast eval could not determine — delegate to Astral solver *)
+          match AtlasAstral.eval_prune state cond with
+          | Unsat -> []
+          | Sat -> [state]
+          | Unknown ->
+            [{ state with
+              missing = { state.missing with pure = cond :: state.missing.pure };
+              current = { state.current with pure = cond :: state.current.pure } }]
       end
     | Sil.Call _ ->
       Format.print_string (

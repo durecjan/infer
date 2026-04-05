@@ -193,6 +193,15 @@ let check_sat (state : AtlasState.t) : [`Sat | `Unsat | `Unknown] =
   let ll_formula = translate_state state in
   LL.check_sat ll_formula
 
+(** Negates an expression at the formula level.
+    [Peq] ↔ [Pneq], [Lnot] unwraps, everything else wraps in [Lnot] *)
+let negate_expr (expr : Expr.t) : Expr.t =
+  match expr with
+  | BinOp (Peq, e1, e2) -> BinOp (Pneq, e1, e2)
+  | BinOp (Pneq, e1, e2) -> BinOp (Peq, e1, e2)
+  | UnOp (Lnot, inner) -> inner
+  | _ -> UnOp (Lnot, expr)
+
 (** Checks satisfiability of the current state conjoined with an additional
     condition. Used for prune condition strengthening: when [eval_prune_condition]
     returns Unknown, we check whether the conjunction of the state with the
@@ -204,3 +213,16 @@ let check_sat_with_condition (state : AtlasState.t) (condition : Expr.t) : [`Sat
     LL.check_sat (LL.mk_star [base; cond_atom])
   | None ->
     `Unknown
+
+(** Evaluates a prune condition using Astral. Checks both the condition and
+    its negation against the current state:
+    - [UNSAT(state ∧ cond)] → condition impossible → [Unsat]
+    - [UNSAT(state ∧ ¬cond)] → condition must hold → [Sat]
+    - Otherwise → [Unknown] *)
+let eval_prune (state : AtlasState.t) (condition : Expr.t) : AtlasState.prune_result =
+  match check_sat_with_condition state condition with
+  | `Unsat -> Unsat
+  | `Sat | `Unknown ->
+    match check_sat_with_condition state (negate_expr condition) with
+    | `Unsat -> Sat
+    | `Sat | `Unknown -> Unknown

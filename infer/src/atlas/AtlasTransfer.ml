@@ -266,7 +266,7 @@ module TransferFunctions = struct
     | (_, Some e) when Formula.is_zero_expr e ->
       [{ state with status = Error (err_deref_null_base, loc, instr) }]
     | (_, Some e) ->
-      deref_lower_base_bound e var_id offset state
+      deref_lower_base_bound loc instr e var_id offset state
     | (Some e, None) ->
       let base_offset = eval_expr_offset e var_id state in
       if Int64.compare offset base_offset < 0 then
@@ -359,19 +359,28 @@ module TransferFunctions = struct
     in
     [err_state; ok_state]
 
-  (** Lowers the Base bound in both missing and current when access offset is below it *)
-  and deref_lower_base_bound base_exp var_id offset state =
+  (** Lowers the Base bound in both missing and current when access offset is below
+      the existing bound. Generates an error contract with Base(id) > id + offset
+      added to missing precondition (access before block start in the gap) *)
+  and deref_lower_base_bound loc instr base_exp var_id offset state =
     let base_offset = eval_expr_offset base_exp var_id state in
     if Int64.compare offset base_offset < 0 then
+      let err_state = { state with status = Error (err_deref_below_lower_bound, loc, instr);
+        missing = { state.missing with pure =
+          Expr.BinOp (Pless, Expr.BinOp (Pplus, Var var_id, Const (Int offset)),
+            Expr.UnOp (Base, Var var_id)) :: state.missing.pure } }
+      in
       let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var var_id), base_exp) in
       let to_add = Expr.BinOp (Plesseq,
         UnOp (Base, Var var_id),
         BinOp (Pplus, Var var_id, Const (Int offset)))
       in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
-      [{ state with
+      let ok_state = { state with
         missing = { state.missing with pure = to_add :: filter state.missing.pure };
-        current = { state.current with pure = to_add :: filter state.current.pure } }]
+        current = { state.current with pure = to_add :: filter state.current.pure } }
+      in
+      [err_state; ok_state]
     else
       [state]
 

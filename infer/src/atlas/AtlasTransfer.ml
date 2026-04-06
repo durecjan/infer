@@ -148,7 +148,7 @@ module TransferFunctions = struct
     |> concat_map_ok_states
       (deref_check_freed loc instr rhs_var_id)
     |> concat_map_ok_states
-      (deref_check_base loc instr rhs_var_id rhs_offset)
+      (deref_check_base loc instr rhs_var_id rhs_offset cell_size)
     |> concat_map_ok_states
       (deref_check_end loc instr rhs_var_id rhs_offset cell_size)
     |> concat_map_ok_states
@@ -256,8 +256,10 @@ module TransferFunctions = struct
     else [state]
 
   (** Checks Base bound for dereference. Dispatches to lowering, strict check,
-      or missing resource generation depending on where the bound is found *)
-  and deref_check_base loc instr var_id offset state =
+      or missing resource generation depending on where the bound is found.
+      [cell_size] is forwarded to [deref_create_missing_base] for the case
+      where no Base exists and all missing resources must be created at once *)
+  and deref_check_base loc instr var_id offset cell_size state =
     match lookup_pure_bound_expr var_id Expr.Base state with
     | (Some e, _) when Formula.is_zero_expr e ->
       [{ state with status = Error (err_deref_null_base, loc, instr) }]
@@ -272,21 +274,56 @@ module TransferFunctions = struct
       else
         [state]
     | (None, None) ->
-      deref_create_missing_base loc instr var_id offset state
+      deref_create_missing_base loc instr var_id offset cell_size state
 
-  (** Creates missing Base constraint when not found in current or missing.
-      Returns error contract + ok contract with bound mirrored to both *)
-  and deref_create_missing_base loc instr var_id offset state =
-    let err_state = { state with status = Error (err_deref_missing_base, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
+  (** Creates all missing resources when no Base constraint exists (first access
+      to this pointer). Since no Base implies no End and no spatial predicate,
+      we generate three error contracts and one OK state with full resources:
+      - err_base: Base(id) > id + offset (access before block start)
+      - err_end: End(id) < id + offset + cell_size (buffer too small / unallocated)
+      - err_freed: Freed(id) (use after free)
+      - ok: Base <= id+offset, End >= id+offset+cell_size, BlockPointsTo at access point
+      The OK state provides Base + End + BlockPointsTo so downstream check_end and
+      match_heap find everything in place and pass through without further errors *)
+  and deref_create_missing_base loc instr var_id offset cell_size state =
+    let access_end = Stdlib.Int64.add offset cell_size in
+    (* Error contract 1: access before block start *)
+    let err_base = { state with status = Error (err_deref_missing_base, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Expr.BinOp (Pplus, Var var_id, Const (Int offset)),
+          Expr.UnOp (Base, Var var_id)) :: state.missing.pure } }
+    in
+    (* Error contract 2: buffer too small *)
+    let err_end = { state with status = Error (err_deref_missing_end, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Expr.UnOp (End, Var var_id),
+          Expr.BinOp (Pplus, Var var_id, Const (Int access_end))) :: state.missing.pure } }
+    in
+    (* Error contract 3: use after free *)
+    let err_freed = { state with status = Error (err_deref_use_after_free, loc, instr);
+      missing = { state.missing with pure =
+        Expr.UnOp (Freed, Var var_id) :: state.missing.pure } }
+    in
+    (* OK state: full resources — Base + End bounds + BlockPointsTo at access point *)
+    let base_bound = Expr.BinOp (Plesseq,
       Expr.UnOp (Base, Var var_id),
       Expr.BinOp (Pplus, Var var_id, Const (Int offset)))
     in
-    let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
+    let end_bound = Expr.BinOp (Plesseq,
+      Expr.BinOp (Pplus, Var var_id, Const (Int access_end)),
+      Expr.UnOp (End, Var var_id))
     in
-    [err_state; ok_state]
+    let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
+    let block_pto = Formula.BlockPointsTo (block_src, Const (Int cell_size)) in
+    let ok_state = { state with
+      missing = { state.missing with
+        pure = base_bound :: end_bound :: state.missing.pure;
+        spatial = block_pto :: state.missing.spatial };
+      current = { state.current with
+        pure = base_bound :: end_bound :: state.current.pure;
+        spatial = block_pto :: state.current.spatial } }
+    in
+    [err_base; err_end; err_freed; ok_state]
 
   (** Checks End bound for dereference. Dispatches to raising, strict check,
       or missing resource generation depending on where the bound is found *)
@@ -444,7 +481,7 @@ module TransferFunctions = struct
     |> concat_map_ok_states
       (deref_check_freed loc instr lhs_var_id)
     |> concat_map_ok_states
-      (deref_check_base loc instr lhs_var_id lhs_offset)
+      (deref_check_base loc instr lhs_var_id lhs_offset cell_size)
     |> concat_map_ok_states
       (deref_check_end loc instr lhs_var_id lhs_offset cell_size)
     |> concat_map_ok_states

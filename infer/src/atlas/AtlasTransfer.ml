@@ -607,29 +607,35 @@ module TransferFunctions = struct
       spatial = new_exp_points_to :: state.current.spatial } }]
 
   (** Handles a block split for a formal pointer (found in both current and missing).
-      Transforms both current and missing spatial, runs assignment, prepends new
-      [ExpPointsTo] to both *)
+      For [Block*Match] (first access): transforms both current and missing spatial,
+      adds new [ExpPointsTo] to both.
+      For [ExpExactMatch] (reassignment): only updates current — missing precondition
+      cell is left intact to preserve the pre-postcondition connection *)
   and store_split_formal lhs_typ rhs_norm block_split_res
       curr_hps curr_rest miss_hps miss_rest state =
-    let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, rewrite_spatial =
-      store_extract_split_args block_split_res state
-    in
-    let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
-    let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
-    let state = { state with
-      current = { state.current with spatial = curr_spatial };
-      missing = { state.missing with spatial = miss_spatial } }
-    in
-    let lhs_expr = Expr.Var new_dest_id in
-    let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm in
-    let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
-    let state = { state with current = { state.current with
-      spatial = rewrite_spatial state.current.spatial } } in
-    [{ state with
-      current = { state.current with
-        spatial = new_exp_points_to :: state.current.spatial };
-      missing = { state.missing with
-        spatial = new_exp_points_to :: state.missing.spatial } }]
+    match block_split_res with
+    | ExpExactMatch _ ->
+      (* Reassignment: treat like local — only update current, leave missing intact *)
+      store_split_local lhs_typ rhs_norm block_split_res curr_hps curr_rest state
+    | BlockExactMatch _ | BlockEdgeMatch _ | BlockMiddleMatch _ ->
+      (* First access: mirror split to both current and missing *)
+      let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, _rewrite_spatial =
+        store_extract_split_args block_split_res state
+      in
+      let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
+      let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
+      let state = { state with
+        current = { state.current with spatial = curr_spatial };
+        missing = { state.missing with spatial = miss_spatial } }
+      in
+      let lhs_expr = Expr.Var new_dest_id in
+      let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm in
+      let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
+      [{ state with
+        current = { state.current with
+          spatial = new_exp_points_to :: state.current.spatial };
+        missing = { state.missing with
+          spatial = new_exp_points_to :: state.missing.spatial } }]
 
   (** Fixes up [new_exp_points_to] after assignment: when an address was stored,
       replaces [canonical_rhs] references in the source/size with the cell variable *)

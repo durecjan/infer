@@ -802,14 +802,20 @@ module TransferFunctions = struct
       (* happy path: offset matches base, cleanup and add Freed to current *)
       let state = cleanup_after_free id state in
       let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-      [{ state with current = { state.current with pure } }]
+      let ok = { state with current = { state.current with pure } } in
+      match Formula.lookup_pure_base_expr id state.missing.pure with
+      | Some miss_base_exp ->
+        (* memory allocated outside the method, need to change leq -> eq *)
+        let err, ok = 
+          free_create_non_base_error_contract loc instr id offset state,
+          free_mutate_base_ok_contract id miss_base_exp offset ok
+        in [err; ok]
+      | None -> [ok] (* memory allocated locally *)
     else if Int64.compare offset base_offset < 0 then
       (* offset below current base — check missing for lowering *)
       begin match Formula.lookup_pure_base_expr id state.missing.pure with
       | Some miss_base_exp ->
-        (* Found in missing — lower bound in precondition only, then free.
-           TODO: generate error contract for the lowering case (caller might not
-           satisfy the lowered precondition — needs NonBasePointerFree error state) *)
+        (* Found in missing — lower bound in precondition only, then free. *)
         let to_remove = Expr.BinOp (Plesseq, UnOp (Base, Var id), miss_base_exp) in
         let to_add = Expr.BinOp (Plesseq,
           UnOp (Base, Var id),
@@ -819,9 +825,13 @@ module TransferFunctions = struct
         let state = { state with missing =
           { state.missing with pure = to_add :: missing_pure } }
         in
-        let state = cleanup_after_free id state in
         let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-        [{ state with current = { state.current with pure } }]
+        let ok = { state with current = { state.current with pure } } in
+        let state = cleanup_after_free id state in
+        let err, ok =
+          free_create_non_base_error_contract loc instr id offset state,
+          free_mutate_base_ok_contract id miss_base_exp offset ok
+        in [err; ok]
       | None ->
         [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
       end
@@ -829,16 +839,49 @@ module TransferFunctions = struct
       (* offset above base — by definition a non-base-pointer free *)
       [{ state with status = Error (err_free_non_base_offset, loc, instr) }]
 
+  (** Creates [Base(id) != id + offset] error contract *)
+  and free_create_non_base_error_contract loc instr id offset state =
+    let to_add = Expr.BinOp (Pneq, UnOp(Base, Var id),
+      BinOp (Pplus, Var id, Const (Int offset))) in
+    let missing_pure = to_add :: state.missing.pure in
+    { state with
+      status = Error (err_free_non_base_offset, loc, instr);
+      missing = { state.missing with pure = missing_pure } }
+
+  (** Replaces [Base(id) <= base_exp] pure constraint with
+      [Base(id) == id + offset] constraint in missing *)
+  and free_mutate_base_ok_contract id base_exp offset state =
+    let to_remove = Expr.BinOp (Plesseq, UnOp(Base, Var id), base_exp) in
+    let to_add = Expr.BinOp (Peq, UnOp(Base, Var id),
+      BinOp (Pplus, Var id, Const (Int offset))) in
+    let missing_pure = Stdlib.List.filter
+      (fun e -> not (Expr.equal e to_remove)) state.missing.pure in
+    { state with missing = { state.missing with pure = to_add :: missing_pure } }
+
   (** Base not found in current — creates missing resources (Base, End, BlockPointsTo)
       in missing only (NOT mirrored to current — Base/End + Freed is contradictory).
       Returns both an error contract and an ok contract with the missing resources *)
-  and free_create_missing_contract loc instr id offset cell_size state =
-    let err_state = { state with status = Error (err_free_missing_base, loc, instr) } in
-    let missing_base = Expr.BinOp (Plesseq,
+  and free_create_missing_contract loc instr id offset cell_size state =    
+    let access_end = Stdlib.Int64.add offset cell_size in
+    (* Error contract 1: access not equal to block start *)
+    let err_base = free_create_non_base_error_contract loc instr id offset state in
+    (* Error contract 2: double free *)
+    let err_freed = { state with status = Error (err_deref_use_after_free, loc, instr);
+      missing = { state.missing with pure =
+        Expr.UnOp (Freed, Var id) :: state.missing.pure } }
+    in
+    (* Ok contract 1: variable is null *)
+    let ok_null = { state with missing =
+      { state.missing with pure =
+        Expr.BinOp (Peq, BinOp (Pplus, Var id, Const (Int offset)),
+        Expr.null) :: state.missing.pure } }
+    in
+    (* OK contract 2: full resources — Base + End bounds + BlockPointsTo at access point *)
+    let missing_base = Expr.BinOp (Peq,
       UnOp (Base, Var id),
       BinOp (Pplus, Var id, Const (Int offset))) in
     let missing_end = Expr.BinOp (Plesseq,
-      BinOp (Pplus, Var id, Const (Int (Stdlib.Int64.add offset cell_size))),
+      BinOp (Pplus, Var id, Const (Int access_end)),
       UnOp (End, Var id)) in
     let missing_heap_pred = Formula.BlockPointsTo (
       Expr.Var id,
@@ -847,10 +890,10 @@ module TransferFunctions = struct
       spatial = missing_heap_pred :: state.missing.spatial;
       pure = missing_base :: missing_end :: state.missing.pure } in
     let pure = Expr.UnOp (Freed, Var id) :: state.current.pure in
-    let ok_state = { state with
+    let ok_allocated = { state with
       current = { state.current with pure };
       missing } in
-    [err_state; ok_state]
+    [err_base; err_freed; ok_null; ok_allocated]
 
   (* ==================== SIL Metadata ==================== *)
 

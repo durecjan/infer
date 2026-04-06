@@ -345,19 +345,41 @@ module TransferFunctions = struct
     | (None, None) ->
       deref_create_missing_end loc instr var_id offset cell_size state
 
-  (** Creates missing End constraint when not found in current or missing.
-      Returns error contract + ok contract with bound mirrored to both *)
+  (** Creates missing End + spatial resources when End constraint not found.
+      Should not happen in practice (deref_create_missing_base creates everything),
+      but kept for consistency. Base already passed, so two error contracts:
+      - err_end: End(id) < id + offset + cell_size (buffer too small)
+      - err_freed: Freed(id) (use after free)
+      OK state gets End bound + BlockPointsTo at access point, mirrored to both *)
   and deref_create_missing_end loc instr var_id offset cell_size state =
-    let err_state = { state with status = Error (err_deref_missing_end, loc, instr) } in
-    let bound = Expr.BinOp (Plesseq,
-      Expr.BinOp (Pplus, Var var_id, Const (Int (Stdlib.Int64.add offset cell_size))),
+    let access_end = Stdlib.Int64.add offset cell_size in
+    (* Error contract 1: buffer too small *)
+    let err_end = { state with status = Error (err_deref_missing_end, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Expr.UnOp (End, Var var_id),
+          Expr.BinOp (Pplus, Var var_id, Const (Int access_end))) :: state.missing.pure } }
+    in
+    (* Error contract 2: use after free *)
+    let err_freed = { state with status = Error (err_deref_use_after_free, loc, instr);
+      missing = { state.missing with pure =
+        Expr.UnOp (Freed, Var var_id) :: state.missing.pure } }
+    in
+    (* OK state: End bound + BlockPointsTo at access point *)
+    let end_bound = Expr.BinOp (Plesseq,
+      Expr.BinOp (Pplus, Var var_id, Const (Int access_end)),
       Expr.UnOp (End, Var var_id))
     in
+    let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
+    let block_pto = Formula.BlockPointsTo (block_src, Const (Int cell_size)) in
     let ok_state = { state with
-      missing = { state.missing with pure = bound :: state.missing.pure };
-      current = { state.current with pure = bound :: state.current.pure } }
+      missing = { state.missing with
+        pure = end_bound :: state.missing.pure;
+        spatial = block_pto :: state.missing.spatial };
+      current = { state.current with
+        pure = end_bound :: state.current.pure;
+        spatial = block_pto :: state.current.spatial } }
     in
-    [err_state; ok_state]
+    [err_end; err_freed; ok_state]
 
   (** Lowers the Base bound in both missing and current when access offset is below
       the existing bound. Generates an error contract with Base(id) > id + offset

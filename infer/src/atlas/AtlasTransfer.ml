@@ -334,7 +334,7 @@ module TransferFunctions = struct
     | (_, Some e) when Formula.is_zero_expr e ->
       [{ state with status = Error (err_deref_null_end, loc, instr) }]
     | (_, Some e) ->
-      deref_raise_end_bound e var_id offset cell_size state
+      deref_raise_end_bound loc instr e var_id offset cell_size state
     | (Some e, None) ->
       let end_offset = eval_expr_offset e var_id state in
       let access_end = Stdlib.Int64.add offset cell_size in
@@ -384,20 +384,29 @@ module TransferFunctions = struct
     else
       [state]
 
-  (** Raises the End bound in both missing and current when access exceeds it *)
-  and deref_raise_end_bound end_exp var_id offset cell_size state =
+  (** Raises the End bound in both missing and current when access exceeds
+      the existing bound. Generates an error contract with End(id) < id + offset + cell_size
+      added to missing precondition (buffer too small in the gap) *)
+  and deref_raise_end_bound loc instr end_exp var_id offset cell_size state =
     let end_offset = eval_expr_offset end_exp var_id state in
     let access_end = Stdlib.Int64.add offset cell_size in
     if Int64.compare access_end end_offset > 0 then
+      let err_state = { state with status = Error (err_deref_above_upper_bound, loc, instr);
+        missing = { state.missing with pure =
+          Expr.BinOp (Pless, Expr.UnOp (End, Var var_id),
+            Expr.BinOp (Pplus, Var var_id, Const (Int access_end))) :: state.missing.pure } }
+      in
       let to_remove = Expr.BinOp (Plesseq, end_exp, UnOp (End, Var var_id)) in
       let to_add = Expr.BinOp (Plesseq,
         BinOp (Pplus, Var var_id, Const (Int access_end)),
         UnOp (End, Var var_id))
       in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
-      [{ state with
+      let ok_state = { state with
         missing = { state.missing with pure = to_add :: filter state.missing.pure };
-        current = { state.current with pure = to_add :: filter state.current.pure } }]
+        current = { state.current with pure = to_add :: filter state.current.pure } }
+      in
+      [err_state; ok_state]
     else
       [state]
 

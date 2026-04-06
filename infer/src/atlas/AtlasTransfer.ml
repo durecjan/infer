@@ -291,7 +291,7 @@ module TransferFunctions = struct
     | (_, Some e) when Formula.is_zero_expr e ->
       [{ state with status = Error (err_deref_null_base, loc, instr) }]
     | (_, Some e) ->
-      deref_lower_base_bound loc instr e var_id offset state
+      deref_lower_base_bound loc instr e var_id offset cell_size state
     | (Some e, None) ->
       let base_offset = eval_expr_offset e var_id state in
       if Int64.compare offset base_offset < 0 then
@@ -409,7 +409,7 @@ module TransferFunctions = struct
   (** Lowers the Base bound in both missing and current when access offset is below
       the existing bound. Generates an error contract with Base(id) > id + offset
       added to missing precondition (access before block start in the gap) *)
-  and deref_lower_base_bound loc instr base_exp var_id offset state =
+  and deref_lower_base_bound loc instr base_exp var_id offset cell_size state =
     let base_offset = eval_expr_offset base_exp var_id state in
     if Int64.compare offset base_offset < 0 then
       let err_state = { state with status = Error (err_deref_below_lower_bound, loc, instr);
@@ -422,10 +422,16 @@ module TransferFunctions = struct
         UnOp (Base, Var var_id),
         BinOp (Pplus, Var var_id, Const (Int offset)))
       in
+      let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
+      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int cell_size)) in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
       let ok_state = { state with
-        missing = { state.missing with pure = to_add :: filter state.missing.pure };
-        current = { state.current with pure = to_add :: filter state.current.pure } }
+        missing = { state.missing with
+          spatial = block_pto :: state.missing.spatial;
+          pure = to_add :: filter state.missing.pure };
+        current = { state.current with
+          spatial = block_pto :: state.current.spatial;
+          pure = to_add :: filter state.current.pure } }
       in
       [err_state; ok_state]
     else
@@ -448,10 +454,16 @@ module TransferFunctions = struct
         BinOp (Pplus, Var var_id, Const (Int access_end)),
         UnOp (End, Var var_id))
       in
+      let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
+      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int cell_size)) in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
       let ok_state = { state with
-        missing = { state.missing with pure = to_add :: filter state.missing.pure };
-        current = { state.current with pure = to_add :: filter state.current.pure } }
+        missing = { state.missing with
+          spatial = block_pto :: state.missing.spatial;
+          pure = to_add :: filter state.missing.pure };
+        current = { state.current with
+          spatial = block_pto :: state.current.spatial;
+          pure = to_add :: filter state.current.pure } }
       in
       [err_state; ok_state]
     else
@@ -765,15 +777,8 @@ module TransferFunctions = struct
     (* offset from base_and_offset_of_expr is in element units, scale to bytes *)
     let offset_bytes = Stdlib.Int64.mul offset element_size in
     [state]
-    |> concat_map_ok_states (free_check_freed loc instr base_id)
+    |> concat_map_ok_states (deref_check_freed loc instr base_id)
     |> concat_map_ok_states (free_lookup_base loc instr base_id offset_bytes element_size)
-
-  (** Checks whether the pointer has already been freed — terminal error if so *)
-  and free_check_freed loc instr id state =
-    if is_freed_expr id state then
-      [{ state with status = Error (err_free_double_free, loc, instr) }]
-    else
-      [state]
 
   (** Looks up Base(Var id) in current. If found and non-zero, delegates to [free_with_base].
       If found and zero, reports unallocated error. If not found, creates missing contract *)

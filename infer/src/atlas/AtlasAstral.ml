@@ -10,9 +10,6 @@
       must appear as equalities in the Astral formula
 
     Limitations:
-    - [Plesseq] / [Pless] inequalities are not supported by LowLevelSeplog
-      (internally Astral uses SMT.Bitvector.mk_lesser_eq but does not expose it).
-      Pure constraints containing inequalities are skipped during translation.
     - [Pmult] / [Pdiv] / [Pmod] must be statically evaluable to integer constants
       (our offsets are always concrete Int64 in practice).
     - [Freed] has no spatial encoding in Astral — tracked externally by Atlas.
@@ -150,35 +147,31 @@ let negate_expr (expr : Expr.t) : Expr.t =
   match expr with
   | BinOp (Peq, e1, e2) -> BinOp (Pneq, e1, e2)
   | BinOp (Pneq, e1, e2) -> BinOp (Peq, e1, e2)
+  | BinOp (Pless, e1, e2) -> BinOp (Plesseq, e2, e1)
+  | BinOp (Plesseq, e1, e2) -> BinOp (Pless, e2, e1)
   | UnOp (Lnot, inner) -> inner
   | _ -> UnOp (Lnot, expr)
 
 (** Translates a pure constraint to an Astral formula atom.
     Returns [None] for constraints that cannot be expressed in LowLevelSeplog
-    (inequalities, freed markers, Base/End==0 for unallocated pointers).
+    (freed markers, unsupported operations).
     Handles [Lnot]-wrapped conditions from SIL false branches by negating
     the inner expression and retrying *)
 let rec translate_pure_constraint types (expr : Expr.t) : LL.t option =
   match expr with
-  | BinOp (Peq, UnOp ((Base | End), _), rhs) when Formula.is_zero_expr rhs ->
-    (* Base(p)==0 / End(p)==0 encodes "unallocated" in Atlas. Astral adds an
-       internal axiom block_begin < block_end for every block term in the formula,
-       which contradicts begin==end==0. Skip these — Astral infers allocation
-       status from the presence or absence of spatial predicates *)
-    None
-  | BinOp (Peq, lhs, UnOp ((Base | End), _)) when Formula.is_zero_expr lhs ->
-    None
   | BinOp (Peq, e1, e2) ->
     Some (LL.mk_eq2 (translate_expr types e1) (translate_expr types e2))
   | BinOp (Pneq, e1, e2) ->
     Some (LL.mk_distinct2 (translate_expr types e1) (translate_expr types e2))
+  | BinOp (Pless, e1, e2) ->
+    Some (LL.mk_lesser (translate_expr types e1) (translate_expr types e2))
+  | BinOp (Plesseq, e1, e2) ->
+    Some (LL.mk_lesser_or_eq (translate_expr types e1) (translate_expr types e2))
   | UnOp (Lnot, inner) ->
     (* SIL false branches wrap conditions in Lnot: !(e1 == e2).
        Unwrap by negating the inner expression and retrying *)
     translate_pure_constraint types (negate_expr inner)
   | UnOp (Freed, _) ->
-    None
-  | BinOp ((Plesseq | Pless), _, _) ->
     None
   | _ ->
     None

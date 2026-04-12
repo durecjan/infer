@@ -297,8 +297,16 @@ let clear_stale_value_constraints lhs_id state =
     let subst = List.fold rest ~init:subst ~f:(fun acc yi ->
       VarIdMap.add yi (Var canonical) acc)
     in
+    (* Anchor equality: preserve the identity between the precondition's cell id
+       (lhs_id, still referenced in missing) and the local that now owns it
+       (canonical, used in current after the rewrite). Without this, the link
+       between missing and current is lost after the subst entry is removed. *)
+    let missing_pure =
+      Expr.BinOp (Peq, Var lhs_id, Var canonical) :: state.missing.pure
+    in
     ({ state with
       current = { state.current with pure = current_pure };
+      missing = { state.missing with pure = missing_pure };
       subst },
      rewrite_current_spatial)
 

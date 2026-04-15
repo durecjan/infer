@@ -1074,7 +1074,7 @@ let interval_trim_and_convert var_id interval_off interval_end cell_size hp =
     Does not mirror anything to missing.
 
     Returns [(state, offset_map)] where [offset_map] is a list of
-    [(offset, dest_id)] sorted by offset ascending.
+    [(relative_offset, dest_id)] sorted by offset ascending.
     NOTE: assumes concrete offsets, sizes, and aligned predicates *)
 let rec heap_extract_interval_local state var_id offset size cell_size curr_in curr_rest =
   let interval_end = Stdlib.Int64.add offset size in
@@ -1087,16 +1087,16 @@ let rec heap_extract_interval_local state var_id offset size cell_size curr_in c
     current = { state.current with
       spatial = curr_cells @ curr_remainders @ curr_rest } }
   in
-  (state, build_offset_map curr_cells)
+  (state, build_offset_map offset curr_cells)
 
-(** Builds a sorted offset map [(offset, dest_id)] from a list of
-    [ExpPointsTo] cells. Offsets are absolute (as stored in the heap predicate source) *)
-and build_offset_map cells =
+(** Builds a sorted offset map [(relative_offset, dest_id)] from a list of                       
+    [ExpPointsTo] cells. [base_offset] is subtracted to produce relative offsets *)              
+and build_offset_map base_offset cells =
   let entries = List.filter_map cells ~f:(fun hp ->
     match hp with
     | Formula.ExpPointsTo (_, _, Expr.Var dest_id) ->
       let hp_off = Formula.points_to_src_offset hp in
-      Some (hp_off, dest_id)
+      Some (Stdlib.Int64.sub hp_off base_offset, dest_id)
     | _ -> None)
   in
   List.sort entries ~compare:(fun (o1, _) (o2, _) -> Int64.compare o1 o2)
@@ -1108,7 +1108,7 @@ and build_offset_map cells =
     missing spatial to retain original precondition dest ids.
 
     Returns [(state, offset_map)] where [offset_map] is a list of
-    [(offset, dest_id)] from current's cells, sorted by offset ascending.
+    [(relative_offset, dest_id)] from current's cells, sorted by offset ascending.
     NOTE: assumes concrete offsets, sizes, and aligned predicates *)
 let heap_extract_interval_formal state var_id offset size cell_size curr_in curr_rest miss_in miss_rest =
   let interval_end = Stdlib.Int64.add offset size in
@@ -1136,7 +1136,7 @@ let heap_extract_interval_formal state var_id offset size cell_size curr_in curr
     missing = { state.missing with
       spatial = miss_cells @ miss_remainders @ miss_rest } }
   in
-  (state, build_offset_map curr_cells)
+  (state, build_offset_map offset curr_cells)
 
 
 (* ==================== Typ.t -> byte offset conversion ==================== *)

@@ -440,6 +440,50 @@ and points_to_src_offset hp =
   | Expr.Var _ -> 0L
   | _ -> Logging.die InternalError "unexpected src format"
 
+(** Extracts the concrete size from a heap predicate's size expression.
+    Returns [None] for non-constant sizes *)
+let points_to_size hp =
+  let size_expr = match hp with
+    | BlockPointsTo (_, size)
+    | ExpPointsTo (_, size, _)
+    | UniformBlockPointsTo (_, size, _) -> size
+  in
+  match size_expr with
+  | Expr.Const (Int s) -> Some s
+  | _ -> None
+
+(** Partitions [spatial] into (within, rest) where [within] contains heap predicates
+    whose source is rooted at [Var var_id] and whose byte range
+    \[[hp_offset, hp_offset + hp_size)\] overlaps with the interval
+    \[[interval_off, interval_off + interval_size)\].
+    Assumes concrete offsets and sizes.
+    NOTE: does not support symbolic offsets or sizes — predicates with
+    non-constant offsets or sizes are placed in [rest] *)
+let heap_find_in_interval spatial var_id interval_off interval_size =
+  let interval_end = Stdlib.Int64.add interval_off interval_size in
+  Stdlib.List.partition
+    (fun hp ->
+      match points_to_size hp with
+      | None -> false
+      | Some hp_size ->
+        let hp_off = points_to_src_offset hp in
+        let hp_end = Stdlib.Int64.add hp_off hp_size in
+        let src_id = match hp with
+          | BlockPointsTo (Expr.BinOp (Pplus, Var id, _), _)
+          | ExpPointsTo (Expr.BinOp (Pplus, Var id, _), _, _)
+          | UniformBlockPointsTo (Expr.BinOp (Pplus, Var id, _), _, _) -> Some id
+          | BlockPointsTo (Expr.Var id, _)
+          | ExpPointsTo (Expr.Var id, _, _)
+          | UniformBlockPointsTo (Expr.Var id, _, _) -> Some id
+          | _ -> None
+        in
+        match src_id with
+        | Some id ->
+          Id.equal id var_id &&
+          Int64.compare hp_off interval_end < 0 &&
+          Int64.compare hp_end interval_off > 0
+        | None -> false)
+    spatial
 
 (* ==================== expression substitution ==================== *)
 

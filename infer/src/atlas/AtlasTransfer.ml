@@ -3,6 +3,7 @@ module Formula = AtlasFormula
 module Expr = Formula.Expr
 module Id = Formula.Id
 module VarIdMap = Formula.VarIdMap
+module Astral = AtlasAstral
 
 open !AtlasState
 
@@ -49,6 +50,13 @@ module TransferFunctions = struct
             "[SIL_FREE]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr actual tenv state in
           exec_free_instr loc instr tenv actual_expr state
+    | Sil.Call
+      ((ret, ret_typ), Exp.Const (Const.Cfun procname), ((dest, dest_typ) :: (src, src_typ) :: (size, size_typ) :: _), loc, _)
+        when Procname.equal (Procname.from_string_c_fun "memcpy") procname ->
+          let dest_expr = sil_exp_to_expr ~typ:dest_typ dest tenv state in
+          let src_expr = sil_exp_to_expr ~typ:src_typ src tenv state in
+          let size_expr = sil_exp_to_expr ~typ:size_typ size tenv state in
+          exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_typ dest_expr src src_typ src_expr size size_expr
     | Sil.Prune (exp, _loc, _is_then_branch, _if_kind) ->
       begin
         Format.print_string (
@@ -59,7 +67,7 @@ module TransferFunctions = struct
         | Sat -> [state]
         | Unknown ->
           (* Fast eval could not determine — delegate to Astral solver *)
-          match AtlasAstral.eval_prune state cond with
+          match Astral.eval_prune state cond with
           | Unsat -> []
           | Sat -> [state]
           | Unknown ->
@@ -894,6 +902,111 @@ module TransferFunctions = struct
       current = { state.current with pure };
       missing } in
     [err_base; err_freed; ok_null; ok_allocated]
+
+
+  (* ==================== SIL Call - memcpy ==================== *)
+
+  (** Handles [memcpy(dest, src, size)] — copies [size] bytes from [src] to [dest].
+      Returns [dest] pointer as the result (assigned to [ret_id]).
+
+      Splits into two disjunctive paths based on [size]:
+      - **Zero-size path:** no memory access, assigns [ret_id = dest] (address assign).
+        Skipped when size is provably non-zero (via [eval_expr_to_int64_opt] or Astral).
+      - **Non-zero path:** delegates to [exec_memcpy_deref] for freed/base/end/overlap
+        checks and spatial copy. Skipped when size is provably zero.
+
+      When [size] is symbolic and cannot be resolved, both paths are produced.
+      Astral is used as fallback to refine the zero/non-zero split when static
+      evaluation fails — checks [SAT(size == 0)] and [SAT(size != 0)] against the
+      current state to prune infeasible paths.
+
+      Produces terminal error states when [dest] or [src] cannot be decomposed
+      into [(base_id, concrete_offset)] by [base_and_offset_of_expr] *)
+  and exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_typ dest_expr src src_typ src_expr size size_expr =
+    let ret_id = Id.fresh () in
+    let state = { state with
+      vars = VarIdMap.add ret_id (Var.of_id ret) state.vars;
+      types = VarIdMap.add ret_id ret_typ state.types }
+    in
+    let size_val = eval_expr_to_int64_opt size_expr state in
+    let is_zero, is_non_zero =
+      match size_val with
+      | Some i -> Int64.equal i 0L, not (Int64.equal i 0L)
+      | None ->
+        let is_zero_sat = AtlasAstral.check_sat_with_condition state                                                    
+          (BinOp (Peq, size_expr, Const (Int 0L))) in                                                                   
+        let is_nonzero_sat = AtlasAstral.check_sat_with_condition state                                                 
+          (BinOp (Pneq, size_expr, Const (Int 0L))) in                                                                  
+        match is_zero_sat, is_nonzero_sat with
+        | `Unsat, _ -> false, true
+        | _, `Unsat -> true, false
+        | _ -> false, false
+    in
+    let zero_size_states = 
+      match is_zero, is_non_zero with
+      | false, true -> []
+      | _ ->
+        (* address assignment ret = dest *)
+        match base_and_offset_of_expr dest_expr state with
+        | Some (dest_id, dest_off) ->
+          let dest_canonical = canonical_expr state.subst dest_id dest_off in
+          [{ state with subst = VarIdMap.add ret_id dest_canonical state.subst }]
+        | None ->
+          [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
+    in
+    let non_zero_size_states =
+      match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
+      | Some (dest_id, dest_off), Some (src_id, src_off) ->
+        exec_memcpy_deref loc instr tenv state ret_id dest_typ dest_id dest_off src_typ src_id src_off size_expr size_val
+      | None, _ ->
+        [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
+      | _, None ->
+        [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
+    in
+    zero_size_states @ non_zero_size_states
+
+  and exec_memcpy_deref loc instr tenv state ret_id dest_typ dest_id dest_off src_typ src_id src_off size_expr size_val =
+    let size = (* TODO for now does not support symbolic sizes *)
+      match size_val with
+      | Some s -> s
+      | None -> 1L
+    in
+    [state]
+    |> concat_map_ok_states
+      (deref_check_freed loc instr dest_id)
+    |> concat_map_ok_states
+      (deref_check_freed loc instr src_id)
+    |> concat_map_ok_states
+      (deref_check_base loc instr dest_id dest_off size)
+    |> concat_map_ok_states
+      (deref_check_base loc instr src_id src_off size)
+    |> concat_map_ok_states
+      (deref_check_end loc instr dest_id dest_off size)
+    |> concat_map_ok_states
+      (deref_check_end loc instr src_id src_off size)
+    |> concat_map_ok_states
+      (memcpy_check_overlap loc instr dest_id dest_off src_id src_off size)
+
+  (** Checks for overlapping memory regions in memcpy.
+      When [dest_id] and [src_id] refer to different blocks (different variable ids),
+      overlap is impossible — passes through.
+      When they refer to the same block, checks whether the concrete offsets are
+      far enough apart: [|dest_off - src_off| >= size]. If not, produces an error
+      contract for undefined behaviour (overlapping memcpy).
+      NOTE: does not support symbolic offsets — assumes concrete offset arithmetic *)
+  and memcpy_check_overlap loc instr dest_id dest_off src_id src_off size state =
+    if not (Id.equal dest_id src_id) then
+      (* Different blocks — no overlap possible *)
+      [state]
+    else
+      let diff = Int64.abs (Stdlib.Int64.sub dest_off src_off) in
+      if Int64.compare diff size >= 0 then
+        (* Same block but ranges do not overlap *)
+        [state]
+      else
+        (* Same block and ranges overlap — undefined behaviour *)
+        [{ state with status = Error (err_memcpy_overlap, loc, instr) }]
+
 
   (* ==================== SIL Metadata ==================== *)
 

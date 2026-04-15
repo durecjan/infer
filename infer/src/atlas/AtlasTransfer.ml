@@ -1025,6 +1025,12 @@ module TransferFunctions = struct
       | Some cs -> cs
       | None -> 1L
     in
+    (* Element type for registering fresh dest ids — dereference the pointer type *)
+    let src_elem_typ = match src_typ.Typ.desc with
+      | Typ.Tptr (pointee, _) -> pointee
+      | Typ.Tarray {elt; length = _; stride = _} -> elt
+      | _ -> Typ.mk Typ.Tvoid
+    in
     (* Extract source cells *)
     let curr_in, curr_rest, miss_in, miss_rest =
       heap_find_block_interval state src_id src_off size
@@ -1033,21 +1039,26 @@ module TransferFunctions = struct
     let state, src_offset_map =
       if mirror then
         heap_extract_interval_formal state src_id src_off size cell_size
-          curr_in curr_rest miss_in miss_rest
+          src_elem_typ curr_in curr_rest miss_in miss_rest
       else
         heap_extract_interval_local state src_id src_off size cell_size
-          curr_in curr_rest
+          src_elem_typ curr_in curr_rest
     in
     (* For each source cell, compute the dest offset and call store_match_heap *)
     let dest_cell_size = match typ_size_of_element_opt tenv dest_typ with
       | Some cs -> cs
       | None -> 1L
     in
+    let dest_elem_typ = match dest_typ.Typ.desc with
+      | Typ.Tptr (pointee, _) -> pointee
+      | Typ.Tarray {elt; length = _; stride = _} -> elt
+      | _ -> Typ.mk Typ.Tvoid
+    in
     let states = List.fold src_offset_map ~init:[state] ~f:(fun acc (src_rel_off, src_dest_id) ->
       let dest_abs_off = Stdlib.Int64.add dest_off src_rel_off in
       let rhs_expr = Expr.Var src_dest_id in
       concat_map_ok_states
-        (store_match_heap loc instr dest_typ dest_id dest_abs_off dest_cell_size rhs_expr)
+        (store_match_heap loc instr dest_elem_typ dest_id dest_abs_off dest_cell_size rhs_expr)
         acc)
     in
     (* Assign ret_id = dest *)

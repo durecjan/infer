@@ -30,6 +30,7 @@ let err_free_double_free         = "free: memory block already freed"
 let err_free_unallocated         = "free: pointer not allocated (Base==0)"
 let err_free_non_base_offset     = "free: offset does not match base"
 let err_free_missing_base        = "free: missing Base constraint"
+let err_memcpy_overlap           = "memcpy: overlapping memory regions"
 
 (** Abstract state *)
 type t = {
@@ -1005,6 +1006,137 @@ let heap_find_block_fragments state var_id var_offset cell_size =
     Formula.sort_heap_preds_by_offset_desc missing
   in
   sorted_current, current_rest, sorted_missing, missing_rest
+
+
+(** Finds all spatial predicates overlapping the byte interval
+    \[[offset, offset + size)\] for [var_id] in both current and missing.
+    Returns [(curr_in, curr_rest, miss_in, miss_rest)] — the overlapping
+    predicates and the remaining spatial for each side *)
+let heap_find_block_interval state var_id offset size =
+  let curr_in, curr_rest =
+    Formula.heap_find_in_interval state.current.spatial var_id offset size
+  in
+  let miss_in, miss_rest =
+    Formula.heap_find_in_interval state.missing.spatial var_id offset size
+  in
+  (curr_in, curr_rest, miss_in, miss_rest)
+
+(** Trims a heap predicate to the interval \[[interval_off, interval_end)\]
+    and converts [BlockPointsTo] / [UniformBlockPointsTo] into [ExpPointsTo]
+    cells of [cell_size] bytes each with fresh dest ids.
+    Existing [ExpPointsTo] pass through with their original dest ids.
+    Returns [(cells, remainders)] where [remainders] are [BlockPointsTo]
+    leftovers on the edges that extend beyond the interval *)
+let interval_trim_and_convert var_id interval_off interval_end cell_size hp =
+  let hp_off = Formula.points_to_src_offset hp in
+  let hp_size = match Formula.points_to_size hp with
+    | Some s -> s | None -> cell_size
+  in
+  let hp_end = Stdlib.Int64.add hp_off hp_size in
+  (* Left remainder: [hp_off, interval_off) *)
+  let left_rem =
+    if Int64.compare hp_off interval_off < 0 then
+      let rem_size = Stdlib.Int64.sub interval_off hp_off in
+      let src = Expr.BinOp (Pplus, Var var_id, Const (Int hp_off)) in
+      [Formula.BlockPointsTo (src, Const (Int rem_size))]
+    else []
+  in
+  (* Right remainder: [interval_end, hp_end) *)
+  let right_rem =
+    if Int64.compare hp_end interval_end > 0 then
+      let rem_size = Stdlib.Int64.sub hp_end interval_end in
+      let src = Expr.BinOp (Pplus, Var var_id, Const (Int interval_end)) in
+      [Formula.BlockPointsTo (src, Const (Int rem_size))]
+    else []
+  in
+  let trim_off = Int64.max hp_off interval_off in
+  let trim_end = Int64.min hp_end interval_end in
+  let cells = match hp with
+    | Formula.ExpPointsTo (_, _, dest) -> (* TODO do we really need to recreate ExpPointsTo? *)
+      let src = Expr.BinOp (Pplus, Var var_id, Const (Int trim_off)) in
+      let sz = Stdlib.Int64.sub trim_end trim_off in
+      [Formula.ExpPointsTo (src, Const (Int sz), dest)]
+    | Formula.BlockPointsTo _ | Formula.UniformBlockPointsTo _ ->
+      let rec chop acc off =
+        if Int64.compare off trim_end >= 0 then List.rev acc
+        else
+          let dest_id = Id.fresh () in
+          let src = Expr.BinOp (Pplus, Var var_id, Const (Int off)) in
+          let cell = Formula.ExpPointsTo (src, Const (Int cell_size), Expr.Var dest_id) in
+          chop (cell :: acc) (Stdlib.Int64.add off cell_size)
+      in
+      chop [] trim_off
+  in
+  (cells, left_rem @ right_rem)
+
+(** Extracts cells from the interval \[[offset, offset + size)\] for local
+    memory (allocated within the function). Processes only [curr_in] predicates.
+    Does not mirror anything to missing.
+
+    Returns [(state, offset_map)] where [offset_map] is a list of
+    [(offset, dest_id)] sorted by offset ascending.
+    NOTE: assumes concrete offsets, sizes, and aligned predicates *)
+let rec heap_extract_interval_local state var_id offset size cell_size curr_in curr_rest =
+  let interval_end = Stdlib.Int64.add offset size in
+  let curr_cells, curr_remainders =
+    List.fold curr_in ~init:([], []) ~f:(fun (cells, rems) hp ->
+      let new_cells, remainders = interval_trim_and_convert var_id offset interval_end cell_size hp in
+      (new_cells @ cells, remainders @ rems))
+  in
+  let state = { state with
+    current = { state.current with
+      spatial = curr_cells @ curr_remainders @ curr_rest } }
+  in
+  (state, build_offset_map curr_cells)
+
+(** Builds a sorted offset map [(offset, dest_id)] from a list of
+    [ExpPointsTo] cells. Offsets are absolute (as stored in the heap predicate source) *)
+and build_offset_map cells =
+  let entries = List.filter_map cells ~f:(fun hp ->
+    match hp with
+    | Formula.ExpPointsTo (_, _, Expr.Var dest_id) ->
+      let hp_off = Formula.points_to_src_offset hp in
+      Some (hp_off, dest_id)
+    | _ -> None)
+  in
+  List.sort entries ~compare:(fun (o1, _) (o2, _) -> Int64.compare o1 o2)
+
+(** Extracts cells from the interval \[[offset, offset + size)\] for formal
+    memory (allocated by the caller, present in missing). Processes [curr_in]
+    predicates and mirrors only newly created cells (from [BlockPointsTo] splits)
+    to missing. Existing [ExpPointsTo] in [miss_in] are preserved as-is in
+    missing spatial to retain original precondition dest ids.
+
+    Returns [(state, offset_map)] where [offset_map] is a list of
+    [(offset, dest_id)] from current's cells, sorted by offset ascending.
+    NOTE: assumes concrete offsets, sizes, and aligned predicates *)
+let heap_extract_interval_formal state var_id offset size cell_size curr_in curr_rest miss_in miss_rest =
+  let interval_end = Stdlib.Int64.add offset size in
+  (* Process current predicates *)
+  let curr_cells, curr_remainders =
+    List.fold curr_in ~init:([], []) ~f:(fun (cells, rems) hp ->
+      let new_cells, remainders = interval_trim_and_convert var_id offset interval_end cell_size hp in
+      (new_cells @ cells, remainders @ rems))
+  in
+  (* Process missing predicates — preserve existing ExpPointsTo dest ids, trim and convert others *)
+  let miss_cells, miss_remainders =
+    List.fold miss_in ~init:([], []) ~f:(fun (cells, rems) hp ->
+      match hp with
+      | (Formula.ExpPointsTo _) as preserve ->
+        (* Existing ExpPointsTo — preserve as-is (original precondition dest id) *)
+        (preserve :: cells, rems)
+      | _ ->
+        (* BlockPointsTo / UniformBlockPointsTo — mirror current's split cells *)
+        let trimmed, remainders = interval_trim_and_convert var_id offset interval_end cell_size hp in
+        (trimmed @ cells, remainders @ rems))
+  in
+  let state = { state with
+    current = { state.current with
+      spatial = curr_cells @ curr_remainders @ curr_rest };
+    missing = { state.missing with
+      spatial = miss_cells @ miss_remainders @ miss_rest } }
+  in
+  (state, build_offset_map curr_cells)
 
 
 (* ==================== Typ.t -> byte offset conversion ==================== *)

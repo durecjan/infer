@@ -986,6 +986,8 @@ module TransferFunctions = struct
       (deref_check_end loc instr src_id src_off size)
     |> concat_map_ok_states
       (memcpy_check_overlap loc instr dest_id dest_off src_id src_off size)
+    |> concat_map_ok_states
+      (memcpy_copy_cells loc instr tenv ret_id dest_typ dest_id dest_off src_typ src_id src_off size)
 
   (** Checks for overlapping memory regions in memcpy.
       When [dest_id] and [src_id] refer to different blocks (different variable ids),
@@ -1006,6 +1008,55 @@ module TransferFunctions = struct
       else
         (* Same block and ranges overlap — undefined behaviour *)
         [{ state with status = Error (err_memcpy_overlap, loc, instr) }]
+
+  (** Performs the actual memory copy for memcpy. After all safety checks have
+      passed, extracts source cells from the interval \[src_off, src_off + size)\],
+      then writes each source cell's value to the corresponding destination offset
+      via [store_match_heap]. Finally assigns [ret_id = dest].
+
+      Dispatches to [heap_extract_interval_formal] or [heap_extract_interval_local]
+      based on whether the source block exists in missing (formal) or not (local).
+      The dest side is always written via [store_match_heap] which handles its own
+      formal/local dispatch internally.
+
+      NOTE: assumes concrete offsets and sizes *)
+  and memcpy_copy_cells loc instr tenv ret_id dest_typ dest_id dest_off src_typ src_id src_off size state =
+    let cell_size = match typ_size_of_element_opt tenv src_typ with
+      | Some cs -> cs
+      | None -> 1L
+    in
+    (* Extract source cells *)
+    let curr_in, curr_rest, miss_in, miss_rest =
+      heap_find_block_interval state src_id src_off size
+    in
+    let mirror = List.length miss_in > 0 in
+    let state, src_offset_map =
+      if mirror then
+        heap_extract_interval_formal state src_id src_off size cell_size
+          curr_in curr_rest miss_in miss_rest
+      else
+        heap_extract_interval_local state src_id src_off size cell_size
+          curr_in curr_rest
+    in
+    (* For each source cell, compute the dest offset and call store_match_heap *)
+    let dest_cell_size = match typ_size_of_element_opt tenv dest_typ with
+      | Some cs -> cs
+      | None -> 1L
+    in
+    let states = List.fold src_offset_map ~init:[state] ~f:(fun acc (src_rel_off, src_dest_id) ->
+      let dest_abs_off = Stdlib.Int64.add dest_off src_rel_off in
+      let rhs_expr = Expr.Var src_dest_id in
+      concat_map_ok_states
+        (store_match_heap loc instr dest_typ dest_id dest_abs_off dest_cell_size rhs_expr)
+        acc)
+    in
+    (* Assign ret_id = dest *)
+    List.map states ~f:(fun s ->
+      match s.status with
+      | Ok ->
+        let dest_canonical = canonical_expr s.subst dest_id dest_off in
+        { s with subst = VarIdMap.add ret_id dest_canonical s.subst }
+      | Error _ -> s)
 
 
   (* ==================== SIL Metadata ==================== *)

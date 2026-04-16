@@ -51,12 +51,14 @@ module TransferFunctions = struct
           let actual_expr = sil_exp_to_expr actual tenv state in
           exec_free_instr loc instr tenv actual_expr state
     | Sil.Call
-      ((ret, ret_typ), Exp.Const (Const.Cfun procname), ((dest, dest_typ) :: (src, src_typ) :: (size, size_typ) :: _), loc, _)
+      ((ret, ret_typ), Exp.Const (Const.Cfun procname), ((dest, _) :: (src, _) :: (size, _) :: _), loc, _)
         when Procname.equal (Procname.from_string_c_fun "memcpy") procname ->
-          let dest_expr = sil_exp_to_expr ~typ:dest_typ dest tenv state in
-          let src_expr = sil_exp_to_expr ~typ:src_typ src tenv state in
-          let size_expr = sil_exp_to_expr ~typ:size_typ size tenv state in
-          exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_typ dest_expr src src_typ src_expr size size_expr
+          Format.print_string (
+          "[SIL_CALL]: " ^ sil_instr_to_string instr ^ "\n");
+          let dest_expr = sil_exp_to_expr dest tenv state in
+          let src_expr = sil_exp_to_expr src tenv state in
+          let size_expr = sil_exp_to_expr size tenv state in
+          exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_expr src src_expr size size_expr
     | Sil.Prune (exp, _loc, _is_then_branch, _if_kind) ->
       begin
         Format.print_string (
@@ -922,7 +924,7 @@ module TransferFunctions = struct
 
       Produces terminal error states when [dest] or [src] cannot be decomposed
       into [(base_id, concrete_offset)] by [base_and_offset_of_expr] *)
-  and exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_typ dest_expr src src_typ src_expr size size_expr =
+  and exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_expr src src_expr size size_expr =
     let ret_id = Id.fresh () in
     let state = { state with
       vars = VarIdMap.add ret_id (Var.of_id ret) state.vars;
@@ -957,7 +959,7 @@ module TransferFunctions = struct
     let non_zero_size_states =
       match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
       | Some (dest_id, dest_off), Some (src_id, src_off) ->
-        exec_memcpy_deref loc instr tenv state ret_id dest_typ dest_id dest_off src_typ src_id src_off size_expr size_val
+        exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val
       | None, _ ->
         [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
       | _, None ->
@@ -965,12 +967,30 @@ module TransferFunctions = struct
     in
     zero_size_states @ non_zero_size_states
 
-  and exec_memcpy_deref loc instr tenv state ret_id dest_typ dest_id dest_off src_typ src_id src_off size_expr size_val =
+  and exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val =
     let size = (* TODO for now does not support symbolic sizes *)
       match size_val with
       | Some s -> s
       | None -> 1L
     in
+    (* Recover actual types from state.types — SIL passes void* for memcpy args *)
+    let typ_of_element id = 
+      match VarIdMap.find_opt id state.types with
+      | Some typ ->
+        begin match typ.Typ.desc with
+        | Typ.Tptr (elt, _) -> elt
+        | Typ.Tarray { elt } -> elt
+        | _ -> Typ.mk Typ.Tvoid
+        end
+      | None -> Typ.mk Typ.Tvoid
+    in 
+    let dest_elem_typ = typ_of_element dest_id in
+    let src_elem_typ = typ_of_element src_id in
+    let dest_elem_size = typ_size_of tenv dest_elem_typ in
+    let src_elem_size = typ_size_of tenv src_elem_typ in
+    (* base_and_offset_of_expr returns element-unit offsets, scale to bytes *)
+    let dest_off = Stdlib.Int64.mul dest_off dest_elem_size in
+    let src_off = Stdlib.Int64.mul src_off src_elem_size in
     [state]
     |> concat_map_ok_states
       (deref_check_freed loc instr dest_id)
@@ -987,7 +1007,7 @@ module TransferFunctions = struct
     |> concat_map_ok_states
       (memcpy_check_overlap loc instr dest_id dest_off src_id src_off size)
     |> concat_map_ok_states
-      (memcpy_copy_cells loc instr tenv ret_id dest_typ dest_id dest_off src_typ src_id src_off size)
+      (memcpy_copy_cells loc instr tenv ret_id dest_id dest_off dest_elem_typ dest_elem_size src_id src_off src_elem_typ src_elem_size size)
 
   (** Checks for overlapping memory regions in memcpy.
       When [dest_id] and [src_id] refer to different blocks (different variable ids),
@@ -1020,16 +1040,11 @@ module TransferFunctions = struct
       formal/local dispatch internally.
 
       NOTE: assumes concrete offsets and sizes *)
-  and memcpy_copy_cells loc instr tenv ret_id dest_typ dest_id dest_off src_typ src_id src_off size state =
-    let cell_size = match typ_size_of_element_opt tenv src_typ with
-      | Some cs -> cs
-      | None -> 1L
-    in
-    (* Element type for registering fresh dest ids — dereference the pointer type *)
-    let src_elem_typ = match src_typ.Typ.desc with
-      | Typ.Tptr (pointee, _) -> pointee
-      | Typ.Tarray {elt; length = _; stride = _} -> elt
-      | _ -> Typ.mk Typ.Tvoid
+  and memcpy_copy_cells loc instr tenv ret_id dest_id dest_off dest_elem_typ dest_elem_size src_id src_off src_elem_typ src_elem_size size state =
+    (* if elem size is 0L, change it to 1L to prevent infinite loop *)
+    let dest_elem_size, src_elem_size =
+      (if Int64.equal dest_elem_size 0L then 1L else dest_elem_size),
+      (if Int64.equal src_elem_size 0L then 1L else src_elem_size)
     in
     (* Extract source cells *)
     let curr_in, curr_rest, miss_in, miss_rest =
@@ -1038,27 +1053,18 @@ module TransferFunctions = struct
     let mirror = List.length miss_in > 0 in
     let state, src_offset_map =
       if mirror then
-        heap_extract_interval_formal state src_id src_off size cell_size
+        heap_extract_interval_formal state src_id src_off size src_elem_size
           src_elem_typ curr_in curr_rest miss_in miss_rest
       else
-        heap_extract_interval_local state src_id src_off size cell_size
+        heap_extract_interval_local state src_id src_off size src_elem_size
           src_elem_typ curr_in curr_rest
     in
     (* For each source cell, compute the dest offset and call store_match_heap *)
-    let dest_cell_size = match typ_size_of_element_opt tenv dest_typ with
-      | Some cs -> cs
-      | None -> 1L
-    in
-    let dest_elem_typ = match dest_typ.Typ.desc with
-      | Typ.Tptr (pointee, _) -> pointee
-      | Typ.Tarray {elt; length = _; stride = _} -> elt
-      | _ -> Typ.mk Typ.Tvoid
-    in
     let states = List.fold src_offset_map ~init:[state] ~f:(fun acc (src_rel_off, src_dest_id) ->
       let dest_abs_off = Stdlib.Int64.add dest_off src_rel_off in
       let rhs_expr = Expr.Var src_dest_id in
       concat_map_ok_states
-        (store_match_heap loc instr dest_elem_typ dest_id dest_abs_off dest_cell_size rhs_expr)
+        (store_match_heap loc instr dest_elem_typ dest_id dest_abs_off dest_elem_size rhs_expr)
         acc)
     in
     (* Assign ret_id = dest *)

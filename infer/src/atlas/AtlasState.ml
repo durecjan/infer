@@ -1219,40 +1219,8 @@ let rec sil_exp_to_expr ?typ e tenv s =
     let exp' = sil_exp_to_expr exp tenv s in
     let op' = sil_unop_exp_to_expr op in
     Expr.UnOp (op', exp')
-  | Exp.BinOp ((Binop.PlusPI | Binop.MinusPI) as op, e1, e2)
-    when Option.is_some typ ->
-      (* PlusPI/MinusPI means "pointer + N elements" where the element size is
-         determined by the pointee type of the pointer operand e1.
-
-         The ~typ parameter comes from the enclosing SIL instruction (Load.typ or
-         Store.typ), which is the type of the value being loaded/stored:
-
-         - Dereference case: sil dereferences the pointer, so typ = pointee type
-
-         - Address assignment case: no dereference occurs, so typ = pointer type,
-           PlusPI still needs the pointee size, so we extract the pointee via
-           Tptr pattern match.
-
-         - Nested pointers: typ = char**, Tptr extracts char* — advancing by one
-           char* element is also correct.
-
-         This works because SIL's typ always equals the type of e1 in the address
-         assignment case (the result of PlusPI preserves the pointer type), and
-         equals the pointee of e1 in the dereference case (Load peels one layer).
-         So: if typ is a pointer, extract its pointee; otherwise use typ as-is. *)
-      let elem_size = match typ with
-        | Some t ->
-          let elem_typ = match t.Typ.desc with
-            | Tptr (inner, _) -> inner
-            | _ -> t
-          in
-          typ_size_of tenv elem_typ
-        | None -> 1L
-      in
-      let lhs = sil_exp_to_expr e1 tenv s in
-      let rhs = sil_exp_to_expr e2 tenv s in
-      let op' = sil_binop_exp_to_expr op in
-      Expr.BinOp (op', lhs, Expr.BinOp (Expr.Pmult, rhs, Const (Int elem_size)))
+  | Exp.BinOp ((Binop.PlusPI | Binop.MinusPI) as op, e1, e2) ->
+      sil_ptr_arith_to_expr op e1 e2 typ tenv s
   | Exp.BinOp ((Binop.Gt | Binop.Ge) as op, e1, e2) ->
     let lhs = sil_exp_to_expr e1 tenv s in
     let rhs = sil_exp_to_expr e2 tenv s in
@@ -1312,32 +1280,66 @@ and sil_struct_field_offset_bytes tenv target_field struct_typ =
   | _ ->
     0L
 
-and sil_array_offset_bytes base index tenv s =
+(** Resolves the pointee element size from a SIL expression by extracting
+    the pointer variable, looking up its type in [state.types], and dereferencing.
+    Returns [None] if the variable cannot be resolved or has no type info *)
+and sil_resolve_ptr_element_size sil_exp tenv s =
   let temp_vars =
-    Sequence.map ~f:(fun id -> Var.of_id id) (Exp.free_vars base)
+    Sequence.map ~f:(fun id -> Var.of_id id) (Exp.free_vars sil_exp)
   in
   let pvars =
-    Sequence.map ~f:(fun p -> Var.of_pvar p) (Exp.program_vars base)
+    Sequence.map ~f:(fun p -> Var.of_pvar p) (Exp.program_vars sil_exp)
   in
   let vars = Sequence.append temp_vars pvars |> Sequence.to_list in
   let var_ids = List.map vars
-    ~f:(fun var ->
-      get_canonical_var_id var s)
+    ~f:(fun var -> get_canonical_var_id var s)
   in
   match List.filter_opt var_ids with
   | [id] ->
     begin match VarIdMap.find_opt id s.types with
     | Some t ->
-      (* dereference the pointer type to get the element type — for [int *arr],
-         the array offset should be [index * sizeof(int)] *)
       let elem_size = match t.Typ.desc with
         | Typ.Tptr (elem_typ, _) -> typ_size_of tenv elem_typ
         | _ -> typ_size_of tenv t
       in
-      Expr.BinOp (Expr.Pmult, index, Const (Int elem_size))
-    | None -> index
+      Some elem_size
+    | None -> None
     end
-  | _ -> index  (* TODO maybe not the best fallback *)
+  | _ -> None
+
+and sil_array_offset_bytes base index tenv s =
+  match sil_resolve_ptr_element_size base tenv s with
+  | Some elem_size -> Expr.BinOp (Expr.Pmult, index, Const (Int elem_size))
+  | None -> index
+
+(** Translates SIL [PlusPI]/[MinusPI] to Formula.Expr with byte-scaled offset.
+    Resolves element size by looking up the pointer operand's type in [state.types].
+    Either operand may be the pointer — tries [e1] first, then [e2].
+    Falls back to [~typ] if variable lookup fails, and to [1L] as last resort *)
+and sil_ptr_arith_to_expr op e1 e2 typ tenv s =
+  let ptr = sil_exp_to_expr e1 tenv s in
+  let idx = sil_exp_to_expr e2 tenv s in
+  let op' = sil_binop_exp_to_expr op in
+  (* Try resolving element size from the pointer variable in state.types.
+     Check e1 first (typical: pointer + index), then e2 (index + pointer) *)
+  let elem_size =
+    match sil_resolve_ptr_element_size e1 tenv s with
+    | Some sz -> sz
+    | None ->
+      match sil_resolve_ptr_element_size e2 tenv s with
+      | Some sz -> sz
+      | None ->
+        (* Fall back to ~typ from enclosing SIL instruction *)
+        match typ with
+        | Some t ->
+          let elem_typ = match t.Typ.desc with
+            | Tptr (inner, _) -> inner
+            | _ -> t
+          in
+          typ_size_of tenv elem_typ
+        | None -> 1L
+  in
+  Expr.BinOp (op', ptr, Expr.BinOp (Expr.Pmult, idx, Const (Int elem_size)))
 
 and sil_unop_exp_to_expr op =
   match op with

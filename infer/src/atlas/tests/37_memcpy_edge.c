@@ -31,7 +31,7 @@ void test_no_overlap_same_block() {
 	buf[0] = 10;
 	buf[1] = 20;
 	/* src=[buf+0, buf+4), dst=[buf+8, buf+12) — no overlap */
-	memcpy(&buf[2], &buf[0], sizeof(int));
+	memcpy(&buf[2], &buf[0], 2 * sizeof(int));
 	free(buf);
 }
 

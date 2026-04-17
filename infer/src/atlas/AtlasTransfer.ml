@@ -1042,7 +1042,11 @@ module TransferFunctions = struct
       The dest side is always written via [store_match_heap] which handles its own
       formal/local dispatch internally.
 
-      NOTE: assumes concrete offsets and sizes *)
+      NOTE: assumes concrete offsets and sizes.
+      KNOWN LIMITATION: partial struct copies (memcpy size < sizeof(struct element
+      type)) do not work correctly — interval_trim_and_convert.chop uses the full
+      struct element size as its granularity, so it cannot split within a struct.
+      Full struct copies work fine. *)
   and memcpy_copy_cells loc instr tenv ret_id dest_id dest_off dest_elem_typ dest_elem_size src_id src_off src_elem_typ src_elem_size size state =
     (* if elem size is 0L, change it to 1L to prevent infinite loop *)
     let dest_elem_size, src_elem_size =

@@ -769,26 +769,23 @@ module TransferFunctions = struct
       | None ->
         [{ state with status = Error (err_free_no_base_pointer, loc, instr) }]
 
-  (** Recovers element size from type info, scales offset to bytes,
-      then checks for double-free before proceeding to base lookup *)
+  (** Recovers element size from type info, then checks for double-free
+      before proceeding to base lookup. Offset is already in bytes
+      (scaled during SIL→Expr translation by [sil_ptr_arith_to_expr]) *)
   and free_compute_offset loc instr tenv base_id offset state =
-    (* Recover the original type from the preceding Load instruction's type info.
-       SIL always passes void* to free, but the variable retains its original type *)
     let element_size =
       match VarIdMap.find_opt base_id state.types with
       | Some typ ->
         begin match typ_size_of_element_opt tenv typ with
-        | Some 0L -> 1L (* void pointer — no size info *)
+        | Some 0L -> 1L
         | Some size -> size
         | None -> 1L
         end
       | None -> 1L
     in
-    (* offset from base_and_offset_of_expr is in element units, scale to bytes *)
-    let offset_bytes = Stdlib.Int64.mul offset element_size in
     [state]
     |> concat_map_ok_states (deref_check_freed loc instr base_id)
-    |> concat_map_ok_states (free_lookup_base loc instr base_id offset_bytes element_size)
+    |> concat_map_ok_states (free_lookup_base loc instr base_id offset element_size)
 
   (** Looks up Base(Var id) in current. If found and non-zero, delegates to [free_with_base].
       If found and zero, reports unallocated error. If not found, creates missing contract *)
@@ -991,9 +988,6 @@ module TransferFunctions = struct
     let src_elem_typ = typ_of_element src_id in
     let dest_elem_size = typ_size_of tenv dest_elem_typ in
     let src_elem_size = typ_size_of tenv src_elem_typ in
-    (* base_and_offset_of_expr returns element-unit offsets, scale to bytes *)
-    let dest_off = Stdlib.Int64.mul dest_off dest_elem_size in
-    let src_off = Stdlib.Int64.mul src_off src_elem_size in
     [state]
     |> concat_map_ok_states
       (deref_check_freed loc instr dest_id)

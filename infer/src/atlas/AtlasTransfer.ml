@@ -957,13 +957,16 @@ module TransferFunctions = struct
           [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
     in
     let non_zero_size_states =
-      match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
-      | Some (dest_id, dest_off), Some (src_id, src_off) ->
-        exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val
-      | None, _ ->
-        [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
-      | _, None ->
-        [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
+      match is_zero, is_non_zero with
+      | true, false -> []
+      | _ ->
+        match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
+        | Some (dest_id, dest_off), Some (src_id, src_off) ->
+          exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val
+        | None, _ ->
+          [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
+        | _, None ->
+          [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
     in
     zero_size_states @ non_zero_size_states
 

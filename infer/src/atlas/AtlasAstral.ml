@@ -10,8 +10,7 @@
       must appear as equalities in the Astral formula
 
     Limitations:
-    - [Pmult] / [Pdiv] / [Pmod] must be statically evaluable to integer constants
-      (our offsets are always concrete Int64 in practice).
+    - [Pdiv] / [Pmod] must be statically evaluable to integer constants.
     - [Freed] has no spatial encoding in Astral — tracked externally by Atlas.
     - [String] / [Float] constants are not translatable. *)
 
@@ -46,9 +45,8 @@ let var_width_of_id id (types : Typ.t VarIdMap.t) : int =
 
 (** Translates an AtlasFormula expression to an Astral LowLevelSeplog term.
     Uses [state.types] to determine variable widths. Constants are 64-bit
-    bitvectors. Arithmetic ([Pplus], [Pminus]) maps directly. [Pmult] is
-    evaluated statically when both sides reduce to constants, otherwise
-    unfolded as repeated addition for small multipliers *)
+    bitvectors. Arithmetic ([Pplus], [Pminus], [Pmult]) maps directly to
+    Astral's [mk_plus], [mk_minus], [mk_mult] *)
 let rec translate_expr (types : Typ.t VarIdMap.t) (expr : Expr.t) : LL.Term.t =
   match expr with
   | Var id ->
@@ -73,18 +71,7 @@ let rec translate_expr (types : Typ.t VarIdMap.t) (expr : Expr.t) : LL.Term.t =
   | BinOp (Pminus, e1, e2) ->
     LL.Term.mk_minus (translate_expr types e1) (translate_expr types e2)
   | BinOp (Pmult, e1, e2) ->
-    (* Multiplication is not supported in LowLevelSeplog terms.
-       In Atlas, Pmult appears only in offset scaling (e.g. idx * elem_size)
-       where at least one side is a concrete integer. We evaluate statically *)
-    begin match eval_const_int64 e1, eval_const_int64 e2 with
-    | Some a, Some b -> LL.Term.mk_const ~size:64 (Int64.to_int (Int64.mul a b))
-    | None, Some b ->
-      unfold_mult (translate_expr types e1) (Int64.to_int b)
-    | Some a, None ->
-      unfold_mult (translate_expr types e2) (Int64.to_int a)
-    | None, None ->
-      LL.Term.mk_fresh_var 64 "unsupported"
-    end
+    LL.Term.mk_mult (translate_expr types e1) (translate_expr types e2)
   | BinOp ((Peq | Pneq | Pless | Plesseq), _, _) ->
     (* Boolean-valued comparisons as terms — LowLevelSeplog has no boolean
        term type (mk_eq2/mk_distinct2 return formulas, not terms), so these
@@ -94,40 +81,6 @@ let rec translate_expr (types : Typ.t VarIdMap.t) (expr : Expr.t) : LL.Term.t =
            | BVlshift | BVrshift | BVand | BVor | BVxor), _, _) ->
     LL.Term.mk_fresh_var 64 "unsupported"
 
-(** Attempts to statically evaluate an expression to an Int64 constant *)
-and eval_const_int64 (expr : Expr.t) : Int64.t option =
-  match expr with
-  | Const (Int n) -> Some n
-  | Const Null -> Some 0L
-  | BinOp (Pplus, e1, e2) ->
-    begin match eval_const_int64 e1, eval_const_int64 e2 with
-    | Some a, Some b -> Some (Int64.add a b)
-    | _ -> None
-    end
-  | BinOp (Pminus, e1, e2) ->
-    begin match eval_const_int64 e1, eval_const_int64 e2 with
-    | Some a, Some b -> Some (Int64.sub a b)
-    | _ -> None
-    end
-  | BinOp (Pmult, e1, e2) ->
-    begin match eval_const_int64 e1, eval_const_int64 e2 with
-    | Some a, Some b -> Some (Int64.mul a b)
-    | _ -> None
-    end
-  | _ -> None
-
-(** Unfolds multiplication by a small constant as repeated addition.
-    Returns a fresh variable for non-positive or excessively large multipliers *)
-and unfold_mult t n =
-  if n <= 0 then LL.Term.mk_const ~size:64 0
-  else if n = 1 then t
-  else if n <= 16 then
-    let rec add acc remaining =
-      if remaining <= 0 then acc
-      else add (LL.Term.mk_plus acc t) (remaining - 1)
-    in
-    add t (n - 1)
-  else LL.Term.mk_fresh_var 64 "large_mult"
 
 (** Translates a heap predicate to an Astral formula atom.
     [BlockPointsTo] and [UniformBlockPointsTo] become [mk_pto_array] (allocated region).

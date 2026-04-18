@@ -1194,43 +1194,61 @@ module TransferFunctions = struct
       else
         let base_bound = lookup_pure_bound_expr x_id Expr.Base state in
         let ids_match = Int.equal x_id y_id in
-        match fst base_bound, ids_match with
+        match base_bound, ids_match with
         (* Base found & same block — null check only *)
-        | Some base_exp, true ->
+        | (Some base_exp, _), true ->
           ptrsub_base_found_same loc instr base_exp state
-        (* Base found & different ids — check RHS within LHS bounds *)
-        | Some base_exp, false ->
+        (* Base in current only & different ids — local memory, terminal error *)
+        | (Some _, None), false ->
+          ptrsub_current_found_diff loc instr state
+        (* Base in missing & different ids — formal memory, error + ok contracts *)
+        | (Some _, Some _), false ->
           let end_bound = lookup_pure_bound_expr x_id Expr.End state in
-          ptrsub_base_found_diff loc instr x_id y_id base_exp end_bound state
+          ptrsub_missing_found_diff loc instr x_id y_id end_bound state
         (* No base & same variable — minimal contracts *)
-        | None, true ->
+        | (None, _), true ->
           ptrsub_no_base_same loc instr x_id state
         (* No base & different ids — full contracts with bound checks *)
-        | None, false ->
+        | (None, _), false ->
           ptrsub_no_base_diff loc instr x_id y_id state
 
-  (** Base found, different variable ids — check that y is within x's block.
-      Uses concrete offsets from existing Base/End bounds.
-      Error if y < Base(x) or y > End(x), null check on Base *)
-  and ptrsub_base_found_diff loc instr x_id y_id base_exp end_bound state =
-    if Formula.is_zero_expr base_exp then
-      [{ state with status = Error (err_ptrsub_null, loc, instr) }]
-    else
-      let base_offset = eval_expr_offset base_exp x_id state in
-      let y_offset = eval_expr_offset (Expr.Var y_id) x_id state in
-      if Int64.compare y_offset base_offset < 0 then
-        [{ state with status = Error (err_ptrsub_below_base, loc, instr) }]
-      else
-        match fst end_bound with
-        | Some end_exp ->
-          let end_offset = eval_expr_offset end_exp x_id state in
-          if Int64.compare y_offset end_offset > 0 then
-            [{ state with status = Error (err_ptrsub_above_end, loc, instr) }]
-          else
-            [state]
-        | None ->
-          (* End not found — should not happen if Base was found *)
-          Logging.die InternalError "ptrsub_base_found_diff: Base found but End missing for %d" x_id
+  (** Base in current only, different variable ids — two separate local
+      allocations, definitely different blocks. Terminal error *)
+  and ptrsub_current_found_diff loc instr state =
+    [{ state with status = Error (err_ptrsub_different_blocks, loc, instr) }]
+
+  (** Base in missing, different variable ids — formal memory, could be same
+      block at runtime. Generate error contracts (y outside x's block) +
+      ok contract (y within x's block) using existing bounds *)
+  and ptrsub_missing_found_diff loc instr x_id y_id end_bound state =
+    (* Error: y below Base(x) — different blocks *)
+    let err_below = { state with
+      status = Error (err_ptrsub_different_blocks, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Var y_id, Expr.UnOp (Base, Var x_id))
+        :: state.missing.pure } }
+    in
+    (* Error: y above End(x) — different blocks *)
+    let err_above = { state with
+      status = Error (err_ptrsub_different_blocks, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Expr.UnOp (End, Var x_id), Var y_id)
+        :: state.missing.pure } }
+    in
+    (* OK: Base(x) <= y <= End(x) *)
+    let y_geq_base = Expr.BinOp (Plesseq, Expr.UnOp (Base, Var x_id), Var y_id) in
+    let y_leq_end = match fst end_bound with
+      | Some _ -> Expr.BinOp (Plesseq, Var y_id, Expr.UnOp (End, Var x_id))
+      | None -> Logging.die InternalError
+          "ptrsub_missing_found_diff: Base found but End missing for %d" x_id
+    in
+    let ok = { state with
+      missing = { state.missing with pure =
+        y_geq_base :: y_leq_end :: state.missing.pure };
+      current = { state.current with pure =
+        y_geq_base :: y_leq_end :: state.current.pure } }
+    in
+    [err_below; err_above; ok]
 
   (** No Base, different variable ids — first access, full contracts.
       err_freed (x), err_below (y < Base(x)), err_above (y > End(x)),

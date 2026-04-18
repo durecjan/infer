@@ -30,6 +30,8 @@ module TransferFunctions = struct
       let states = if is_pointer_type typ then
         check_sil_ptr_arith loc instr tenv e state
       else [state] in
+      let states = concat_map_ok_states
+        (check_sil_ptrsub loc instr tenv e) states in
       concat_map_ok_states
         (exec_load_instr loc instr id tenv typ e rhs_expr)
         states
@@ -41,6 +43,8 @@ module TransferFunctions = struct
       let states = if is_pointer_type typ then
         check_sil_ptr_arith loc instr tenv e2 state
       else [state] in
+      let states = concat_map_ok_states
+        (check_sil_ptrsub loc instr tenv e2) states in
       concat_map_ok_states
         (exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr)
         states
@@ -75,6 +79,8 @@ module TransferFunctions = struct
           "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
         let cond = sil_exp_to_expr exp tenv state in
         let states = check_sil_ptr_arith loc instr tenv exp state in
+        let states = concat_map_ok_states
+          (check_sil_ptrsub loc instr tenv exp) states in
         concat_map_ok_states (fun state ->
           match eval_prune_condition cond state with
           | Unsat -> []
@@ -1100,7 +1106,17 @@ module TransferFunctions = struct
     let arith_nodes = collect_sil_ptr_arith_nodes sil_exp in
     List.fold arith_nodes ~init:[state] ~f:(fun acc (base_sil, full_sil) ->
       concat_map_ok_states
-        (ptrarith_check loc instr tenv base_sil full_sil)
+        (ptrplus_check loc instr tenv base_sil full_sil)
+        acc)
+
+  (** Scans a SIL expression for [MinusPP] nodes and runs pointer subtraction
+      checks on each. Runs unconditionally (MinusPP result is an integer,
+      not gated by [is_pointer_type]) *)
+  and check_sil_ptrsub loc instr tenv sil_exp state =
+    let ptrsub_nodes = collect_sil_ptrsub_nodes sil_exp in
+    List.fold ptrsub_nodes ~init:[state] ~f:(fun acc (lhs_sil, rhs_sil) ->
+      concat_map_ok_states
+        (ptrsub_check loc instr tenv lhs_sil rhs_sil)
         acc)
 
   (** Collects all pointer arithmetic nodes from a SIL expression.
@@ -1123,14 +1139,29 @@ module TransferFunctions = struct
     in
     aux [] sil_exp
 
+  (** Collects all [MinusPP] nodes from a SIL expression.
+      Returns a list of [(lhs_sil_exp, rhs_sil_exp)] pairs *)
+  and collect_sil_ptrsub_nodes sil_exp =
+    let rec aux acc exp =
+      match Exp.ignore_cast exp with
+      | Exp.BinOp (Binop.MinusPP, e1, e2) ->
+        (e1, e2) :: acc
+      | Exp.BinOp (_, e1, e2) ->
+        let acc = aux acc e1 in
+        aux acc e2
+      | Exp.UnOp (_, e, _) -> aux acc e
+      | _ -> acc
+    in
+    aux [] sil_exp
+
   (** Entry point for a single pointer arithmetic check.
       Extracts base variable id, translates the full arithmetic expression
       to get byte-scaled result, then runs the check pipeline:
       freed → base+end lookup → bounds comparison *)
-  and ptrarith_check loc instr tenv base_sil full_sil state =
+  and ptrplus_check loc instr tenv base_sil full_sil state =
     match sil_extract_base_var_id base_sil state with
     | None ->
-      [{ state with status = Error (err_ptrarith_no_base_var, loc, instr) }]
+      [{ state with status = Error (err_ptrplus_no_base_var, loc, instr) }]
     | Some base_id ->
       match VarIdMap.find_opt base_id state.types with
       | None ->
@@ -1141,44 +1172,175 @@ module TransferFunctions = struct
         let result_expr = sil_exp_to_expr full_sil tenv state in
         (* Extract byte offset relative to base variable *)
         let result_offset = eval_expr_offset result_expr base_id state in
-        ptrarith_check_freed loc instr tenv base_id result_expr result_offset state
+        ptrplus_check_freed loc instr tenv base_id result_expr result_offset state
+
+  (** Entry point for a MinusPP (pointer subtraction) check.
+      Extracts base variable ids from both operands, checks freed on both,
+      looks up Base for LHS, then dispatches:
+      - Base found & ids match → null check only
+      - Base found & ids differ → check RHS within LHS bounds
+      - Base not found & ids match → create minimal missing contracts
+      - Base not found & ids differ → create full missing contracts with bound checks *)
+  and ptrsub_check loc instr tenv lhs_sil rhs_sil state =
+    match sil_extract_base_var_id lhs_sil state, sil_extract_base_var_id rhs_sil state with
+    | None, _ | _, None ->
+      [{ state with status = Error (err_ptrsub_no_base_var, loc, instr) }]
+    | Some x_id, Some y_id ->
+      (* Check freed on both operands *)
+      if is_freed_expr x_id state then
+        [{ state with status = Error (err_ptrsub_use_after_free, loc, instr) }]
+      else if is_freed_expr y_id state then
+        [{ state with status = Error (err_ptrsub_use_after_free, loc, instr) }]
+      else
+        let base_bound = lookup_pure_bound_expr x_id Expr.Base state in
+        let ids_match = Int.equal x_id y_id in
+        match fst base_bound, ids_match with
+        (* Base found & same block — null check only *)
+        | Some base_exp, true ->
+          ptrsub_base_found_same loc instr base_exp state
+        (* Base found & different ids — check RHS within LHS bounds *)
+        | Some base_exp, false ->
+          let end_bound = lookup_pure_bound_expr x_id Expr.End state in
+          ptrsub_base_found_diff loc instr x_id y_id base_exp end_bound state
+        (* No base & same variable — minimal contracts *)
+        | None, true ->
+          ptrsub_no_base_same loc instr x_id state
+        (* No base & different ids — full contracts with bound checks *)
+        | None, false ->
+          ptrsub_no_base_diff loc instr x_id y_id state
+
+  (** Base found, different variable ids — check that y is within x's block.
+      Uses concrete offsets from existing Base/End bounds.
+      Error if y < Base(x) or y > End(x), null check on Base *)
+  and ptrsub_base_found_diff loc instr x_id y_id base_exp end_bound state =
+    if Formula.is_zero_expr base_exp then
+      [{ state with status = Error (err_ptrsub_null, loc, instr) }]
+    else
+      let base_offset = eval_expr_offset base_exp x_id state in
+      let y_offset = eval_expr_offset (Expr.Var y_id) x_id state in
+      if Int64.compare y_offset base_offset < 0 then
+        [{ state with status = Error (err_ptrsub_below_base, loc, instr) }]
+      else
+        match fst end_bound with
+        | Some end_exp ->
+          let end_offset = eval_expr_offset end_exp x_id state in
+          if Int64.compare y_offset end_offset > 0 then
+            [{ state with status = Error (err_ptrsub_above_end, loc, instr) }]
+          else
+            [state]
+        | None ->
+          (* End not found — should not happen if Base was found *)
+          Logging.die InternalError "ptrsub_base_found_diff: Base found but End missing for %d" x_id
+
+  (** No Base, different variable ids — first access, full contracts.
+      err_freed (x), err_below (y < Base(x)), err_above (y > End(x)),
+      ok (Base(x) <= y <= End(x) with Base/End mirrored) *)
+  and ptrsub_no_base_diff loc instr x_id y_id state =
+    (* Error: x freed *)
+    let err_freed = { state with
+      status = Error (err_ptrsub_use_after_free, loc, instr);
+      missing = { state.missing with pure =
+        Expr.UnOp (Freed, Var x_id) :: state.missing.pure } }
+    in
+    (* Error: y below Base(x) — different blocks *)
+    let err_below = { state with
+      status = Error (err_ptrsub_different_blocks, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Var y_id, Expr.UnOp (Base, Var x_id))
+        :: state.missing.pure } }
+    in
+    (* Error: y above End(x) — different blocks *)
+    let err_above = { state with
+      status = Error (err_ptrsub_different_blocks, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Pless, Expr.UnOp (End, Var x_id), Var y_id)
+        :: state.missing.pure } }
+    in
+    (* OK: Base(x)!=0 & End(x)!=0 & Base(x) <= y <= End(x) *)
+    let base_neq = Expr.BinOp (Pneq, Expr.UnOp (Base, Var x_id), Expr.Const (Int 0L)) in
+    let end_neq = Expr.BinOp (Pneq, Expr.UnOp (End, Var x_id), Expr.Const (Int 0L)) in
+    let y_geq_base = Expr.BinOp (Plesseq, Expr.UnOp (Base, Var x_id), Var y_id) in
+    let y_leq_end = Expr.BinOp (Plesseq, Var y_id, Expr.UnOp (End, Var x_id)) in
+    let ok = { state with
+      missing = { state.missing with pure =
+        base_neq :: end_neq :: y_geq_base :: y_leq_end :: state.missing.pure };
+      current = { state.current with pure =
+        base_neq :: end_neq :: y_geq_base :: y_leq_end :: state.current.pure } }
+    in
+    [err_freed; err_below; err_above; ok]
+
+  (** No Base, same variable — first access via pointer subtraction (e.g. p - p).
+      Creates minimal missing contracts: err_freed, err_null, ok with
+      Base!=0 & End!=0 mirrored to current *)
+  and ptrsub_no_base_same loc instr x_id state =
+    (* Error: freed *)
+    let err_freed = { state with
+      status = Error (err_ptrsub_use_after_free, loc, instr);
+      missing = { state.missing with pure =
+        Expr.UnOp (Freed, Var x_id) :: state.missing.pure } }
+    in
+    (* Error: null *)
+    let err_null = { state with
+      status = Error (err_ptrsub_null, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Peq, Expr.UnOp (Base, Var x_id), Expr.Const (Int 0L))
+        :: state.missing.pure } }
+    in
+    (* OK: Base!=0 & End!=0 *)
+    let base_neq = Expr.BinOp (Pneq, Expr.UnOp (Base, Var x_id), Expr.Const (Int 0L)) in
+    let end_neq = Expr.BinOp (Pneq, Expr.UnOp (End, Var x_id), Expr.Const (Int 0L)) in
+    let ok = { state with
+      missing = { state.missing with pure =
+        base_neq :: end_neq :: state.missing.pure };
+      current = { state.current with pure =
+        base_neq :: end_neq :: state.current.pure } }
+    in
+    [err_freed; err_null; ok]
+
+  (** Base found, same canonical variable — both pointers are in the same block.
+      Only check for null (Base==0 means no allocation) *)
+  and ptrsub_base_found_same loc instr base_exp state =
+    if Formula.is_zero_expr base_exp then
+      [{ state with status = Error (err_ptrsub_null, loc, instr) }]
+    else
+      [state]
 
   (** Step 1: Check if base pointer has been freed *)
-  and ptrarith_check_freed loc instr tenv base_id result_expr result_offset state =
+  and ptrplus_check_freed loc instr tenv base_id result_expr result_offset state =
     if is_freed_expr base_id state then
-      [{ state with status = Error (err_ptrarith_use_after_free, loc, instr) }]
+      [{ state with status = Error (err_ptrplus_use_after_free, loc, instr) }]
     else
-      ptrarith_check_bounds loc instr tenv base_id result_expr result_offset state
+      ptrplus_check_bounds loc instr tenv base_id result_expr result_offset state
 
   (** Step 2: Look up Base and End simultaneously, dispatch based on what's found *)
-  and ptrarith_check_bounds loc instr _tenv base_id result_expr result_offset state =
+  and ptrplus_check_bounds loc instr _tenv base_id result_expr result_offset state =
     let base_bound = lookup_pure_bound_expr base_id Expr.Base state in
     let end_bound = lookup_pure_bound_expr base_id Expr.End state in
     match base_bound, end_bound with
     (* Both found in current - local memory *)
     | (Some base_exp, None), (Some end_exp, None) ->
-      ptrarith_with_bounds loc instr base_id base_exp end_exp result_offset state
+      ptrplus_with_bounds loc instr base_id base_exp end_exp result_offset state
     (* Both found in current - caller owned memory *)
     | (Some base_exp, Some _), (Some end_exp, Some _) ->
-      ptrarith_with_missing_bound loc instr base_id base_exp end_exp result_offset state
+      ptrplus_with_missing_bound loc instr base_id base_exp end_exp result_offset state
     (* Missing base, end *)
     | (None, None), _ ->
-      ptrarith_create_missing_base_end loc instr base_id result_expr state
+      ptrplus_create_missing_base_end loc instr base_id result_expr state
     | _ ->
-      Logging.die InternalError "ptrarith_check_bounds: inconsistent state"
+      Logging.die InternalError "ptrplus_check_bounds: inconsistent state"
 
   (** Both Base and End found — check null then compare concrete offsets.
       [result_offset] is the byte offset of the arithmetic result relative to base *)
-  and ptrarith_with_bounds loc instr base_id base_exp end_exp result_offset state =
+  and ptrplus_with_bounds loc instr base_id base_exp end_exp result_offset state =
     if Formula.is_zero_expr base_exp then
-      [{ state with status = Error (err_ptrarith_null, loc, instr) }]
+      [{ state with status = Error (err_ptrplus_null, loc, instr) }]
     else
       let base_offset = eval_expr_offset base_exp base_id state in
       let end_offset = eval_expr_offset end_exp base_id state in
       if Int64.compare result_offset base_offset < 0 then
-        [{ state with status = Error (err_ptrarith_below_base, loc, instr) }]
+        [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
       else if Int64.compare result_offset end_offset > 0 then
-        [{ state with status = Error (err_ptrarith_above_end, loc, instr) }]
+        [{ state with status = Error (err_ptrplus_above_end, loc, instr) }]
       else
         [state]
 
@@ -1186,16 +1348,16 @@ module TransferFunctions = struct
       raises End bound when result offset falls outside, generating error
       contracts for each gap (same pattern as [deref_lower_base_bound] /
       [deref_raise_end_bound] but without spatial predicates — not an access) *)
-  and ptrarith_with_missing_bound loc instr base_id base_exp end_exp result_offset state =
+  and ptrplus_with_missing_bound loc instr base_id base_exp end_exp result_offset state =
     if Formula.is_zero_expr base_exp then
-      [{ state with status = Error (err_ptrarith_null, loc, instr) }]
+      [{ state with status = Error (err_ptrplus_null, loc, instr) }]
     else
       let states = [state] in
       (* Lower Base bound if result is below current Base *)
       let states = List.concat_map states ~f:(fun s ->
         let base_offset = eval_expr_offset base_exp base_id s in
         if Int64.compare result_offset base_offset < 0 then
-          let err_state = { s with status = Error (err_ptrarith_below_base, loc, instr);
+          let err_state = { s with status = Error (err_ptrplus_below_base, loc, instr);
             missing = { s.missing with pure =
               Expr.BinOp (Pless, Expr.BinOp (Pplus, Var base_id, Const (Int result_offset)),
                 Expr.UnOp (Base, Var base_id)) :: s.missing.pure } }
@@ -1220,7 +1382,7 @@ module TransferFunctions = struct
         match s.status with Error _ -> [s] | Ok ->
         let end_offset = eval_expr_offset end_exp base_id s in
         if Int64.compare result_offset end_offset > 0 then
-          let err_state = { s with status = Error (err_ptrarith_above_end, loc, instr);
+          let err_state = { s with status = Error (err_ptrplus_above_end, loc, instr);
             missing = { s.missing with pure =
               Expr.BinOp (Pless, Expr.UnOp (End, Var base_id),
                 Expr.BinOp (Pplus, Var base_id, Const (Int result_offset)))
@@ -1245,30 +1407,30 @@ module TransferFunctions = struct
 
   (** Missing Base and End — create error (null) + error (freed) +
       ok (Base!=0 & End!=0 & within bounds) contracts *)
-  and ptrarith_create_missing_base_end loc instr base_id result_expr state =
+  and ptrplus_create_missing_base_end loc instr base_id result_expr state =
     (* Error: null pointer *)
     let err_null = { state with
-      status = Error (err_ptrarith_null, loc, instr);
+      status = Error (err_ptrplus_null, loc, instr);
       missing = { state.missing with pure =
         Expr.BinOp (Peq, Expr.UnOp (Base, Var base_id), Expr.Const (Int 0L))
           :: state.missing.pure } }
     in
     (* Error: use after free *)
     let err_freed = { state with
-      status = Error (err_ptrarith_use_after_free, loc, instr);
+      status = Error (err_ptrplus_use_after_free, loc, instr);
       missing = { state.missing with pure =
         Expr.UnOp (Freed, Var base_id) :: state.missing.pure } }
     in
     (* Error: below lower bound *)
     let err_below = { state with
-      status = Error (err_ptrarith_below_base, loc, instr);
+      status = Error (err_ptrplus_below_base, loc, instr);
       missing = { state.missing with pure = 
         Expr.BinOp (Pless, result_expr, Expr.UnOp (Base, Var base_id))
         :: state.missing.pure } }
     in
     (* Error: above upper bound *)
     let err_above = { state with 
-      status = Error (err_ptrarith_above_end, loc, instr);
+      status = Error (err_ptrplus_above_end, loc, instr);
       missing = { state.missing with pure = 
         Expr.BinOp (Pless, Expr.UnOp (End, Var base_id), result_expr)
         :: state.missing.pure } }

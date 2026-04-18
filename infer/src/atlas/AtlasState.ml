@@ -31,6 +31,13 @@ let err_free_unallocated         = "free: pointer not allocated (Base==0)"
 let err_free_non_base_offset     = "free: offset does not match base"
 let err_free_missing_base        = "free: missing Base constraint"
 let err_memcpy_overlap           = "memcpy: overlapping memory regions"
+let err_ptrarith_no_base_var     = "pointer arithmetic: no base pointer variable found"
+let err_ptrarith_use_after_free  = "pointer arithmetic: freed memory block"
+let err_ptrarith_null            = "pointer arithmetic: null pointer (Base==End==0)"
+let err_ptrarith_below_base      = "pointer arithmetic: result below Base"
+let err_ptrarith_above_end       = "pointer arithmetic: result above End"
+let err_ptrarith_missing_base    = "pointer arithmetic: missing Base constraint"
+let err_ptrarith_missing_end     = "pointer arithmetic: missing End constraint"
 
 (** Abstract state *)
 type t = {
@@ -1280,10 +1287,9 @@ and sil_struct_field_offset_bytes tenv target_field struct_typ =
   | _ ->
     0L
 
-(** Resolves the pointee element size from a SIL expression by extracting
-    the pointer variable, looking up its type in [state.types], and dereferencing.
-    Returns [None] if the variable cannot be resolved or has no type info *)
-and sil_resolve_ptr_element_size sil_exp tenv s =
+(** Extracts the canonical variable id from a SIL expression.
+    Returns [Some id] if exactly one variable is found, [None] otherwise *)
+and sil_extract_base_var_id sil_exp s =
   let temp_vars =
     Sequence.map ~f:(fun id -> Var.of_id id) (Exp.free_vars sil_exp)
   in
@@ -1295,7 +1301,15 @@ and sil_resolve_ptr_element_size sil_exp tenv s =
     ~f:(fun var -> get_canonical_var_id var s)
   in
   match List.filter_opt var_ids with
-  | [id] ->
+  | [id] -> Some id
+  | _ -> None
+
+(** Resolves the pointee element size from a SIL expression by extracting
+    the pointer variable, looking up its type in [state.types], and dereferencing.
+    Returns [None] if the variable cannot be resolved or has no type info *)
+and sil_resolve_ptr_element_size sil_exp tenv s =
+  match sil_extract_base_var_id sil_exp s with
+  | Some id ->
     begin match VarIdMap.find_opt id s.types with
     | Some t ->
       let elem_size = match t.Typ.desc with
@@ -1305,7 +1319,7 @@ and sil_resolve_ptr_element_size sil_exp tenv s =
       Some elem_size
     | None -> None
     end
-  | _ -> None
+  | None -> None
 
 and sil_array_offset_bytes base index tenv s =
   match sil_resolve_ptr_element_size base tenv s with

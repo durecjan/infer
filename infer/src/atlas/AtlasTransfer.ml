@@ -510,7 +510,7 @@ module TransferFunctions = struct
         exec_store_deref loc instr tenv lhs_typ lhs_id off rhs_expr state
       | None ->
         [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
-    else if is_sil_address_assign lhs && is_pointer_type lhs_typ then
+    else if is_sil_pointer_address_assign lhs lhs_typ state then
       store_address_assign loc instr lhs lhs_expr rhs_expr state
     else
       store_value_assign lhs lhs_expr rhs_expr state

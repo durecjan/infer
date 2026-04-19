@@ -383,6 +383,19 @@ let direct_id_of_sil_lvar exp state =
   | Some pvar -> Formula.lookup_variable_id (Var.of_pvar pvar) state.vars
   | None -> None
 
+(** Checks whether a SIL expression is a pointer-typed address assignment.
+    Extracts the underlying variable and looks up its actual type in [state.types],
+    falling back to the SIL instruction type [sil_typ] when the variable is not found.
+    This avoids SIL type misreporting (e.g. MinusPP result as [int*]) *)
+let is_sil_pointer_address_assign exp sil_typ state =
+  is_sil_address_assign exp &&
+  match direct_id_of_sil_lvar exp state with
+  | Some id ->
+    (match VarIdMap.find_opt id state.types with
+     | Some t -> is_pointer_type t
+     | None -> is_pointer_type sil_typ)
+  | None -> is_pointer_type sil_typ
+
 (* ==================== Expr.t helpers ==================== *)
 
 (** Extracts the single pointer-typed variable id and its evaluated byte offset from [expr].

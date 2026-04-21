@@ -1055,15 +1055,21 @@ module TransferFunctions = struct
       formal/local dispatch internally.
 
       NOTE: assumes concrete offsets and sizes.
-      KNOWN LIMITATION: partial struct copies (memcpy size < sizeof(struct element
-      type)) do not work correctly — interval_trim_and_convert.chop uses the full
-      struct element size as its granularity, so it cannot split within a struct.
-      Full struct copies work fine. *)
+      When the element type is a struct, dispatches to struct-aware chopping
+      via [interval_trim_and_convert_struct] which uses field-aligned cell sizes.
+      Misaligned copies (size not aligned to field boundaries) raise InternalError. *)
   and memcpy_copy_cells loc instr tenv ret_id dest_id dest_off dest_elem_typ dest_elem_size src_id src_off src_elem_typ src_elem_size size state =
     (* if elem size is 0L, change it to 1L to prevent infinite loop *)
     let dest_elem_size, src_elem_size =
       (if Int64.equal dest_elem_size 0L then 1L else dest_elem_size),
       (if Int64.equal src_elem_size 0L then 1L else src_elem_size)
+    in
+    (* Detect struct element type — compute field layout for struct-aware chopping *)
+    let src_struct_layout = match struct_field_layout tenv src_elem_typ with
+      | Some layout ->
+        let struct_size = List.fold layout ~init:0L ~f:(fun acc (_, sz, _) -> Stdlib.Int64.add acc sz) in
+        Some (layout, struct_size)
+      | None -> None
     in
     (* Extract source cells *)
     let curr_in, curr_rest, miss_in, miss_rest =
@@ -1073,17 +1079,25 @@ module TransferFunctions = struct
     let state, src_offset_map =
       if mirror then
         heap_extract_interval_formal state src_id src_off size src_elem_size
-          src_elem_typ curr_in curr_rest miss_in miss_rest
+          src_elem_typ ?struct_layout:src_struct_layout
+          curr_in curr_rest miss_in miss_rest
       else
         heap_extract_interval_local state src_id src_off size src_elem_size
-          src_elem_typ curr_in curr_rest
+          src_elem_typ ?struct_layout:src_struct_layout
+          curr_in curr_rest
     in
-    (* For each source cell, compute the dest offset and call store_match_heap *)
+    (* For each source cell, compute the dest offset and call store_match_heap.
+       Cell size is derived from the source cell's registered type — correct for
+       both uniform (non-struct) and variable-sized (struct field) cases *)
     let states = List.fold src_offset_map ~init:[state] ~f:(fun acc (src_rel_off, src_dest_id) ->
       let dest_abs_off = Stdlib.Int64.add dest_off src_rel_off in
       let rhs_expr = Expr.Var src_dest_id in
+      let cell_typ, cell_size = match VarIdMap.find_opt src_dest_id state.types with
+        | Some t -> (t, typ_size_of tenv t)
+        | None -> (dest_elem_typ, dest_elem_size)
+      in
       concat_map_ok_states
-        (store_match_heap loc instr dest_elem_typ dest_id dest_abs_off dest_elem_size rhs_expr)
+        (store_match_heap loc instr cell_typ dest_id dest_abs_off cell_size rhs_expr)
         acc)
     in
     (* Assign ret_id = dest *)

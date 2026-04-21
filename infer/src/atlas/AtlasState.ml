@@ -822,6 +822,55 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
       "[Error] store_dereference_address_assign - failed to find base pointer variable"
 
 
+(* ==================== Typ.t -> byte offset conversion ==================== *)
+
+let rec typ_size_of_element_opt tenv typ =
+  let open Typ in
+  match typ.desc with
+  | Tptr (element, _) -> Some (typ_size_of tenv element)
+  | Tarray {elt; length = _; stride = _} -> Some (typ_size_of tenv elt)
+  | _ -> None
+
+and typ_size_of tenv typ =
+  let open Typ in
+  let open Struct in
+  match typ.desc with
+  (* for now assume 64bit architecture *)
+  (* TODO wire up to infer's runtime info -- i did not find any *)
+  | Tint ikind ->
+      begin match ikind with
+      | IChar | ISChar | IUChar | IBool -> 1L
+      | IInt | IUInt -> 4L
+      | IShort | IUShort -> 2L
+      | ILong | IULong | ILongLong | IULongLong -> 8L
+      | I128 | IU128 -> 16L
+      end
+  | Tfloat fkind ->
+    begin match fkind with
+    | FFloat -> 4L
+    | FDouble | FLongDouble -> 8L
+    end
+  | Tvoid -> 0L
+  | Tfun _ -> 8L
+  | Tptr (_, _) -> 8L
+  | Tstruct name ->
+    begin match Tenv.lookup tenv name with
+    | Some { fields } ->
+      let rec sum acc = function
+        | [] -> acc
+        | { name = _; typ } :: rest ->
+          let size = typ_size_of tenv typ in
+          sum (Stdlib.Int64.add acc size) rest
+      in
+      sum 0L fields
+    | _ ->
+      0L
+    end
+  | Tarray {elt; length = _; stride = _} ->
+    typ_size_of tenv elt
+  | TVar _ -> 0L (* C++ template variables *)
+
+
 (* ==================== heap predicate helpers ==================== *)
 
 type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_exp_points_to: heap_pred ; new_dest_id: Id.t }
@@ -1047,6 +1096,23 @@ let heap_find_block_interval state var_id offset size =
   in
   (curr_in, curr_rest, miss_in, miss_rest)
 
+(** Computes the field layout of a struct type as a list of
+    [(field_offset, field_size, field_type)] triples.
+    Returns [None] if the type is not a struct or lookup fails *)
+let struct_field_layout tenv (typ : Typ.t) : (int64 * int64 * Typ.t) list option =
+  match typ.desc with
+  | Typ.Tstruct name ->
+    begin match Tenv.lookup tenv name with
+    | Some { Struct.fields } ->
+      let layout, _ = List.fold fields ~init:([], 0L) ~f:(fun (acc, off) { Struct.name; Struct.typ } ->
+        let sz = typ_size_of tenv typ in
+        ((off, sz, typ) :: acc, Stdlib.Int64.add off sz))
+      in
+      Some (List.rev layout)
+    | None -> None
+    end
+  | _ -> None
+
 (** Trims a heap predicate to the interval \[interval_off, interval_end)\]
     and converts [BlockPointsTo] / [UniformBlockPointsTo] into [ExpPointsTo]
     cells of [cell_size] bytes each with fresh dest ids.
@@ -1093,22 +1159,105 @@ let interval_trim_and_convert var_id interval_off interval_end cell_size hp =
   in
   (cells, fresh_ids, left_rem @ right_rem)
 
+(** Struct-aware variant of [interval_trim_and_convert]. Chops [BlockPointsTo]
+    regions according to a repeating field layout instead of a fixed cell size.
+    [field_layout] is [(field_offset_within_struct, field_size, field_type)]
+    from [struct_field_layout].
+    [struct_size] is the total struct size (sum of all field sizes).
+    Existing [ExpPointsTo] are preserved as-is.
+    Returns [(cells, typed_fresh_ids, remainders)] where [typed_fresh_ids] is
+    a list of [(id, field_type)] pairs for type registration.
+    Raises [InternalError] if a field boundary does not align to the trim interval
+    (misaligned copy — not supported in thesis scope) *)
+let interval_trim_and_convert_struct var_id interval_off interval_end field_layout struct_size hp =
+  let hp_off = Formula.points_to_src_offset hp in
+  let hp_size = match Formula.points_to_size hp with
+    | Some s -> s | None -> struct_size
+  in
+  let hp_end = Stdlib.Int64.add hp_off hp_size in
+  let left_rem =
+    if Int64.compare hp_off interval_off < 0 then
+      let rem_size = Stdlib.Int64.sub interval_off hp_off in
+      let src = Expr.BinOp (Pplus, Var var_id, Const (Int hp_off)) in
+      [Formula.BlockPointsTo (src, Const (Int rem_size))]
+    else []
+  in
+  let right_rem =
+    if Int64.compare hp_end interval_end > 0 then
+      let rem_size = Stdlib.Int64.sub hp_end interval_end in
+      let src = Expr.BinOp (Pplus, Var var_id, Const (Int interval_end)) in
+      [Formula.BlockPointsTo (src, Const (Int rem_size))]
+    else []
+  in
+  let trim_off = Int64.max hp_off interval_off in
+  let trim_end = Int64.min hp_end interval_end in
+  let cells, typed_ids = match hp with
+    | (Formula.ExpPointsTo _) as preserve ->
+      ([preserve], [])
+    | Formula.BlockPointsTo _ | Formula.UniformBlockPointsTo _ ->
+      let rec chop cells ids off =
+        if Int64.compare off trim_end >= 0 then (List.rev cells, List.rev ids)
+        else
+          (* Find which struct field this offset falls into *)
+          let pos_in_struct = Int64.rem (Stdlib.Int64.sub off interval_off) struct_size in
+          match List.find field_layout ~f:(fun (foff, _, _) -> Int64.equal foff pos_in_struct) with
+          | Some (_foff, fsz, ftyp) ->
+            let remaining = Stdlib.Int64.sub trim_end off in
+            if Int64.compare remaining fsz < 0 then
+              Logging.die InternalError
+                "interval_trim_and_convert_struct: misaligned copy at offset %Ld (field size %Ld, remaining %Ld)"
+                off fsz remaining
+            else
+              let dest_id = Id.fresh () in
+              let src = Expr.BinOp (Pplus, Var var_id, Const (Int off)) in
+              let cell = Formula.ExpPointsTo (src, Const (Int fsz), Expr.Var dest_id) in
+              chop (cell :: cells) ((dest_id, ftyp) :: ids) (Stdlib.Int64.add off fsz)
+          | None ->
+            Logging.die InternalError
+              "interval_trim_and_convert_struct: offset %Ld does not align to any field (pos_in_struct=%Ld)"
+              off pos_in_struct
+      in
+      chop [] [] trim_off
+  in
+  (cells, typed_ids, left_rem @ right_rem)
+
 (** Extracts cells from the interval \[offset, offset + size)\] for local
     memory (allocated within the function). Processes only [curr_in] predicates.
     Does not mirror anything to missing.
 
+    When [struct_layout] is provided, dispatches to struct-aware chopping with
+    variable-sized cells matching field boundaries and per-field type registration.
+
     Returns [(state, offset_map)] where [offset_map] is a list of
     [(relative_offset, dest_id)] sorted by offset ascending.
     NOTE: assumes concrete offsets, sizes, and aligned predicates *)
-let rec heap_extract_interval_local state var_id offset size cell_size cell_typ curr_in curr_rest =
+let rec heap_extract_interval_local state var_id offset size cell_size cell_typ
+    ?struct_layout curr_in curr_rest =
   let interval_end = Stdlib.Int64.add offset size in
-  let curr_spatial, fresh_ids =
-    List.fold curr_in ~init:([], []) ~f:(fun (spatial, ids) hp ->
-      let new_cells, new_ids, remainders = interval_trim_and_convert var_id offset interval_end cell_size hp in
-      (new_cells @ remainders @ spatial, new_ids @ ids))
-  in
-  let types = List.fold fresh_ids ~init:state.types ~f:(fun acc id ->
-    VarIdMap.add id cell_typ acc)
+  let curr_spatial, types =
+    match struct_layout with
+    | Some (layout, struct_size) ->
+      let spatial, typed_ids =
+        List.fold curr_in ~init:([], []) ~f:(fun (spatial, ids) hp ->
+          let new_cells, new_ids, remainders =
+            interval_trim_and_convert_struct var_id offset interval_end layout struct_size hp in
+          (new_cells @ remainders @ spatial, new_ids @ ids))
+      in
+      let types = List.fold typed_ids ~init:state.types ~f:(fun acc (id, ftyp) ->
+        VarIdMap.add id ftyp acc)
+      in
+      (spatial, types)
+    | None ->
+      let spatial, fresh_ids =
+        List.fold curr_in ~init:([], []) ~f:(fun (spatial, ids) hp ->
+          let new_cells, new_ids, remainders =
+            interval_trim_and_convert var_id offset interval_end cell_size hp in
+          (new_cells @ remainders @ spatial, new_ids @ ids))
+      in
+      let types = List.fold fresh_ids ~init:state.types ~f:(fun acc id ->
+        VarIdMap.add id cell_typ acc)
+      in
+      (spatial, types)
   in
   let state = { state with
     types;
@@ -1136,28 +1285,54 @@ and build_offset_map base_offset cells =
     in [miss_in] are preserved as-is to retain original precondition dest ids.
     [BlockPointsTo] in [miss_in] are replaced by the mirrored cells.
 
+    When [struct_layout] is provided, dispatches to struct-aware chopping with
+    variable-sized cells matching field boundaries and per-field type registration.
+
     Returns [(state, offset_map)] where [offset_map] is a list of
     [(relative_offset, dest_id)] from current's cells, sorted by offset ascending.
     NOTE: assumes concrete offsets, sizes, and aligned predicates *)
-let heap_extract_interval_formal state var_id offset size cell_size cell_typ curr_in curr_rest miss_in miss_rest =
+let heap_extract_interval_formal state var_id offset size cell_size cell_typ
+    ?struct_layout curr_in curr_rest miss_in miss_rest =
   let interval_end = Stdlib.Int64.add offset size in
   (* Process current predicates — track BlockPointsTo-originated cells for mirroring *)
-  let curr_spatial, fresh_ids, to_mirror =
-    List.fold curr_in ~init:([], [], []) ~f:(fun (spatial, ids, mirror) hp ->
-      let new_cells, new_ids, remainders = interval_trim_and_convert var_id offset interval_end cell_size hp in
-      let all = new_cells @ remainders in
-      match hp with
-      | Formula.ExpPointsTo _ ->
-        (all @ spatial, new_ids @ ids, mirror)
-      | _ ->
-        (all @ spatial, new_ids @ ids, all @ mirror))
+  let curr_spatial, types, to_mirror =
+    match struct_layout with
+    | Some (layout, struct_size) ->
+      let spatial, typed_ids, mirror =
+        List.fold curr_in ~init:([], [], []) ~f:(fun (spatial, ids, mirror) hp ->
+          let new_cells, new_ids, remainders =
+            interval_trim_and_convert_struct var_id offset interval_end layout struct_size hp in
+          let all = new_cells @ remainders in
+          match hp with
+          | Formula.ExpPointsTo _ ->
+            (all @ spatial, new_ids @ ids, mirror)
+          | _ ->
+            (all @ spatial, new_ids @ ids, all @ mirror))
+      in
+      let types = List.fold typed_ids ~init:state.types ~f:(fun acc (id, ftyp) ->
+        VarIdMap.add id ftyp acc)
+      in
+      (spatial, types, mirror)
+    | None ->
+      let spatial, fresh_ids, mirror =
+        List.fold curr_in ~init:([], [], []) ~f:(fun (spatial, ids, mirror) hp ->
+          let new_cells, new_ids, remainders =
+            interval_trim_and_convert var_id offset interval_end cell_size hp in
+          let all = new_cells @ remainders in
+          match hp with
+          | Formula.ExpPointsTo _ ->
+            (all @ spatial, new_ids @ ids, mirror)
+          | _ ->
+            (all @ spatial, new_ids @ ids, all @ mirror))
+      in
+      let types = List.fold fresh_ids ~init:state.types ~f:(fun acc id ->
+        VarIdMap.add id cell_typ acc)
+      in
+      (spatial, types, mirror)
   in
   (* Missing: keep existing ExpPointsTo as-is, replace BlockPointsTo with mirrored cells *)
   let miss_preserved = List.filter miss_in ~f:(fun hp ->
     match hp with Formula.ExpPointsTo _ -> true | _ -> false)
-  in
-  let types = List.fold fresh_ids ~init:state.types ~f:(fun acc id ->
-    VarIdMap.add id cell_typ acc)
   in
   let state = { state with
     types;
@@ -1167,55 +1342,6 @@ let heap_extract_interval_formal state var_id offset size cell_size cell_typ cur
       spatial = miss_preserved @ to_mirror @ miss_rest } }
   in
   (state, build_offset_map offset curr_spatial)
-
-
-(* ==================== Typ.t -> byte offset conversion ==================== *)
-
-let rec typ_size_of_element_opt tenv typ =
-  let open Typ in
-  match typ.desc with
-  | Tptr (element, _) -> Some (typ_size_of tenv element)
-  | Tarray {elt; length = _; stride = _} -> Some (typ_size_of tenv elt)
-  | _ -> None
-
-and typ_size_of tenv typ =
-  let open Typ in
-  let open Struct in
-  match typ.desc with
-  (* for now assume 64bit architecture *)
-  (* TODO wire up to infer's runtime info -- i did not find any *)
-  | Tint ikind ->
-      begin match ikind with
-      | IChar | ISChar | IUChar | IBool -> 1L
-      | IInt | IUInt -> 4L
-      | IShort | IUShort -> 2L
-      | ILong | IULong | ILongLong | IULongLong -> 8L
-      | I128 | IU128 -> 16L
-      end
-  | Tfloat fkind ->
-    begin match fkind with
-    | FFloat -> 4L
-    | FDouble | FLongDouble -> 8L
-    end
-  | Tvoid -> 0L
-  | Tfun _ -> 8L
-  | Tptr (_, _) -> 8L
-  | Tstruct name ->
-    begin match Tenv.lookup tenv name with
-    | Some { fields } ->
-      let rec sum acc = function
-        | [] -> acc
-        | { name = _; typ } :: rest ->
-          let size = typ_size_of tenv typ in
-          sum (Stdlib.Int64.add acc size) rest
-      in
-      sum 0L fields
-    | _ ->
-      0L
-    end
-  | Tarray {elt; length = _; stride = _} ->
-    typ_size_of tenv elt
-  | TVar _ -> 0L (* C++ template variables *)
 
 
 (* ==================== Exp.t -> Expr.t conversion ==================== *)

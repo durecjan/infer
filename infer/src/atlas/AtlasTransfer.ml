@@ -389,14 +389,66 @@ module TransferFunctions = struct
     | (_, Some e) ->
       deref_raise_end_bound loc instr e var_id offset cell_size state
     | (Some e, None) ->
-      let end_offset = eval_expr_offset e var_id state in
+      let end_off_expr = match Formula.extract_offset_expr e var_id with
+        | Some oe -> oe
+        | None -> Logging.die InternalError
+            "deref_check_end: End expression %s does not match expected shape (id + offset)"
+            (Expr.to_string state.vars e)
+      in
       let access_end = Stdlib.Int64.add offset cell_size in
-      if Int64.compare access_end end_offset > 0 then
-        [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
-      else
-        [state]
+      begin match eval_expr_to_int64_opt end_off_expr state with
+      | Some end_offset ->
+        if Int64.compare access_end end_offset > 0 then
+          [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
+        else
+          [state]
+      | None ->
+        deref_check_end_symbolic loc instr e end_off_expr var_id access_end state
+      end
     | (None, None) ->
       deref_create_missing_end loc instr var_id offset cell_size state
+
+  (** Handles End bound check when the End offset is symbolic (e.g. End(x) = x + n
+      where n is a formal parameter from malloc(n)). Compares the symbolic offset
+      expression directly against the concrete access end (integer sort) using Astral.
+      - Definitely within bounds (end_off <= access_end is Unsat): pass through
+      - Definitely out of bounds (access_end < end_off is Unsat): terminal error
+      - Unknown: error contract (end_off <= access_end) + ok contract with upserted
+        access_end < end_off, no BlockPointsTo gap needed (local malloc covers it). *)
+  and deref_check_end_symbolic loc instr end_exp end_off_expr var_id access_end state =
+    let oob_condition = Expr.BinOp (Plesseq, end_off_expr, Const (Int access_end)) in
+    let within_condition = Expr.BinOp (Pless, Const(Int access_end), end_off_expr) in
+    let within, not_within = 
+      match AtlasAstral.check_sat_with_condition state oob_condition with
+      | `Unsat -> true, false
+      | _ ->
+        match AtlasAstral.check_sat_with_condition state within_condition with
+        | `Unsat -> false, true
+        | _ -> false, false
+    in
+    match within, not_within with
+    | true, false -> [state]
+    | false, true ->
+      [{ state with status = Error (err_deref_above_upper_bound, loc, instr) }]
+    | _ ->
+      let err_state = { state with
+        status = Error (err_deref_above_upper_bound, loc, instr);
+        current = { state.current with
+          pure = oob_condition :: state.current.pure } }
+      in
+      let filter pure = Stdlib.List.filter
+        (fun e -> match e with
+          | Expr.BinOp (Pless, _, end_off_expr) -> true
+          | _ -> false)
+        pure
+      in
+      let ok_state = { state with
+        current = { state.current with
+          pure = within_condition :: filter state.current.pure };
+        missing = { state.missing with
+          pure = within_condition :: filter state.missing.pure } }
+      in
+      [err_state; ok_state]
 
   (** Creates missing End + spatial resources when End constraint not found.
       Should not happen in practice (deref_create_missing_base creates everything),

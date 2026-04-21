@@ -343,6 +343,13 @@ and eval_expr_to_int64 e =
 
 (** Evaluates [expr] to Int64 and checks whether the result is zero.
     Limited to constant arithmetic — expressions containing variables return false *)
+(** Extracts the offset expression from [BinOp(Pplus, Var id, offset_expr)]
+    where [id] matches [var_id]. Returns [Some offset_expr] if matched, [None] otherwise *)
+let extract_offset_expr expr var_id =
+  match expr with
+  | Expr.BinOp (Pplus, Var id, offset) when Id.equal id var_id -> Some offset
+  | _ -> None
+
 let is_zero_expr expr =
   match eval_expr_to_int64 expr with
   | Some i when Int64.equal i 0L -> true

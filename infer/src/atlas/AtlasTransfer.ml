@@ -1251,9 +1251,17 @@ module TransferFunctions = struct
     [err_below; err_above; ok]
 
   (** No Base, different variable ids — first access, full contracts.
-      err_freed (x), err_below (y < Base(x)), err_above (y > End(x)),
-      ok (Base(x) <= y <= End(x) with Base/End mirrored) *)
+      err_null (Base(x)==0), err_freed (x), err_below (y < Base(x)),
+      err_above (y > End(x)), ok (Base(x) <= y <= End(x) with Base/End mirrored) *)
   and ptrsub_no_base_diff loc instr x_id y_id state =
+    (* Error: null pointer (Base==End==0) *)
+    let err_null = { state with
+      status = Error (err_ptrsub_null, loc, instr);
+      missing = { state.missing with pure =
+        Expr.BinOp (Peq, Expr.UnOp (Base, Var x_id), Expr.Const (Int 0L))
+        :: Expr.BinOp (Peq, Expr.UnOp (End, Var x_id), Expr.Const (Int 0L))
+        :: state.missing.pure } }
+    in
     (* Error: x freed *)
     let err_freed = { state with
       status = Error (err_ptrsub_use_after_free, loc, instr);
@@ -1285,7 +1293,7 @@ module TransferFunctions = struct
       current = { state.current with pure =
         base_neq :: end_neq :: y_geq_base :: y_leq_end :: state.current.pure } }
     in
-    [err_freed; err_below; err_above; ok]
+    [err_null; err_freed; err_below; err_above; ok]
 
   (** No Base, same variable — first access via pointer subtraction (e.g. p - p).
       Creates minimal missing contracts: err_freed, err_null, ok with

@@ -450,8 +450,9 @@ module TransferFunctions = struct
         UnOp (Base, Var var_id),
         BinOp (Pplus, Var var_id, Const (Int offset)))
       in
+      let gap_size = Stdlib.Int64.sub base_offset offset in
       let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
-      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int cell_size)) in
+      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int gap_size)) in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
       let ok_state = { state with
         missing = { state.missing with
@@ -482,8 +483,9 @@ module TransferFunctions = struct
         BinOp (Pplus, Var var_id, Const (Int access_end)),
         UnOp (End, Var var_id))
       in
-      let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int offset)) in
-      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int cell_size)) in
+      let gap_size = Stdlib.Int64.sub access_end end_offset in
+      let block_src = Expr.BinOp (Pplus, Var var_id, Const (Int end_offset)) in
+      let block_pto = Formula.BlockPointsTo (block_src, Expr.Const (Int gap_size)) in
       let filter pure = Stdlib.List.filter (fun e -> not (Expr.equal e to_remove)) pure in
       let ok_state = { state with
         missing = { state.missing with

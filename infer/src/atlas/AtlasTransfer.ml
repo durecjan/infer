@@ -947,54 +947,70 @@ module TransferFunctions = struct
       vars = VarIdMap.add ret_id (Var.of_id ret) state.vars;
       types = VarIdMap.add ret_id ret_typ state.types }
     in
-    let size_val = eval_expr_to_int64_opt size_expr state in
-    let is_zero, is_non_zero =
-      match size_val with
-      | Some i -> Int64.equal i 0L, not (Int64.equal i 0L)
-      | None ->
-        let is_zero_sat = AtlasAstral.check_sat_with_condition state                                                    
-          (BinOp (Peq, size_expr, Const (Int 0L))) in                                                                   
-        let is_nonzero_sat = AtlasAstral.check_sat_with_condition state                                                 
-          (BinOp (Pneq, size_expr, Const (Int 0L))) in                                                                  
-        match is_zero_sat, is_nonzero_sat with
-        | `Unsat, _ -> false, true
-        | _, `Unsat -> true, false
-        | _ -> false, false
-    in
-    let zero_size_states = 
-      match is_zero, is_non_zero with
-      | false, true -> []
-      | _ ->
-        (* address assignment ret = dest *)
-        match base_and_offset_of_expr dest_expr state with
-        | Some (dest_id, dest_off) ->
-          let dest_canonical = canonical_expr state.subst dest_id dest_off in
-          [{ state with subst = VarIdMap.add ret_id dest_canonical state.subst }]
+    (* Resolve base+offset for both pointers — terminal error if either is unresolvable *)
+    match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
+    | None, _ ->
+      [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
+    | _, None ->
+      [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
+    | Some (dest_id, dest_off), Some (src_id, src_off) ->
+      let size_val = eval_expr_to_int64_opt size_expr state in
+      let is_zero, is_non_zero =
+        match size_val with
+        | Some i -> Int64.equal i 0L, not (Int64.equal i 0L)
         | None ->
-          [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
-    in
-    let non_zero_size_states =
-      match is_zero, is_non_zero with
-      | true, false -> []
-      | _ ->
-        match base_and_offset_of_expr dest_expr state, base_and_offset_of_expr src_expr state with
-        | Some (dest_id, dest_off), Some (src_id, src_off) ->
-          exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val
-        | None, _ ->
-          [{ state with status = Error (err_load_deref_no_base, loc, instr) }]
-        | _, None ->
-          [{ state with status = Error (err_store_deref_no_base, loc, instr) }]
-    in
-    zero_size_states @ non_zero_size_states
+          let is_zero_sat = AtlasAstral.check_sat_with_condition state
+            (BinOp (Peq, size_expr, Const (Int 0L))) in
+          let is_nonzero_sat = AtlasAstral.check_sat_with_condition state
+            (BinOp (Pneq, size_expr, Const (Int 0L))) in
+          match is_zero_sat, is_nonzero_sat with
+          | `Unsat, _ -> false, true
+          | _, `Unsat -> true, false
+          | _ -> false, false
+      in
+      let zero_size_states =
+        if is_non_zero then []
+        else exec_memcpy_addr_assign loc instr state ret_id dest_id dest_off src_id src_off
+      in
+      let non_zero_size_states =
+        if is_zero then []
+        else exec_memcpy_deref loc instr tenv state ret_id
+          dest_id dest_off src_id src_off size_expr size_val
+      in
+      zero_size_states @ non_zero_size_states
+
+  (** Zero-size memcpy: per C standard 7.21.1, pointers must still be valid even
+      when n=0. Checks freed/base/end for both pointers using access size 1L
+      (to avoid zero-sized blocks in missing), then assigns ret = dest *)
+  and exec_memcpy_addr_assign loc instr state ret_id dest_id dest_off src_id src_off =
+    [state]
+    |> concat_map_ok_states
+      (deref_check_freed loc instr dest_id)
+    |> concat_map_ok_states
+      (deref_check_freed loc instr src_id)
+    |> concat_map_ok_states
+      (deref_check_base loc instr dest_id dest_off 1L)
+    |> concat_map_ok_states
+      (deref_check_base loc instr src_id src_off 1L)
+    |> concat_map_ok_states
+      (deref_check_end loc instr dest_id dest_off 1L)
+    |> concat_map_ok_states
+      (deref_check_end loc instr src_id src_off 1L)
+    |> List.map ~f:(fun state ->
+      match state.status with
+      | Ok ->
+        let dest_canonical = canonical_expr state.subst dest_id dest_off in
+        { state with subst = VarIdMap.add ret_id dest_canonical state.subst }
+      | _ -> state)
 
   and exec_memcpy_deref loc instr tenv state ret_id dest_id dest_off src_id src_off size_expr size_val =
-    let size = (* TODO for now does not support symbolic sizes *)
+    let size =
       match size_val with
       | Some s -> s
-      | None -> 1L
+      | None -> 1L (* TODO: symbolic sizes not fully supported *)
     in
     (* Recover actual types from state.types — SIL passes void* for memcpy args *)
-    let typ_of_element id = 
+    let typ_of_element id =
       match VarIdMap.find_opt id state.types with
       | Some typ ->
         begin match typ.Typ.desc with
@@ -1003,7 +1019,7 @@ module TransferFunctions = struct
         | _ -> Typ.mk Typ.Tvoid
         end
       | None -> Typ.mk Typ.Tvoid
-    in 
+    in
     let dest_elem_typ = typ_of_element dest_id in
     let src_elem_typ = typ_of_element src_id in
     let dest_elem_size = typ_size_of tenv dest_elem_typ in

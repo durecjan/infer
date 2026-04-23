@@ -389,12 +389,7 @@ module TransferFunctions = struct
     | (_, Some e) ->
       deref_raise_end_bound loc instr e var_id offset cell_size state
     | (Some e, None) ->
-      let end_off_expr = match Formula.extract_offset_expr e var_id with
-        | Some oe -> oe
-        | None -> Logging.die InternalError
-            "deref_check_end: End expression %s does not match expected shape (id + offset)"
-            (Expr.to_string state.vars e)
-      in
+      let end_off_expr = Formula.extract_offset_expr e var_id in
       let access_end = Stdlib.Int64.add offset cell_size in
       begin match eval_expr_to_int64_opt end_off_expr state with
       | Some end_offset ->
@@ -433,8 +428,8 @@ module TransferFunctions = struct
     | _ ->
       let err_state = { state with
         status = Error (err_deref_above_upper_bound, loc, instr);
-        current = { state.current with
-          pure = oob_condition :: state.current.pure } }
+        missing = { state.missing with
+          pure = oob_condition :: state.missing.pure } }
       in
       let filter pure = Stdlib.List.filter
         (fun e -> match e with
@@ -1439,20 +1434,122 @@ module TransferFunctions = struct
     | _ ->
       Logging.die InternalError "ptrplus_check_bounds: inconsistent state"
 
-  (** Both Base and End found — check null then compare concrete offsets.
+  (** Both Base and End found in current — check null, extract offset expressions,
+      try concrete comparison, delegate to symbolic handler if either is non-concrete.
       [result_offset] is the byte offset of the arithmetic result relative to base *)
   and ptrplus_with_bounds loc instr base_id base_exp end_exp result_offset state =
     if Formula.is_zero_expr base_exp then
       [{ state with status = Error (err_ptrplus_null, loc, instr) }]
     else
-      let base_offset = eval_expr_offset base_exp base_id state in
-      let end_offset = eval_expr_offset end_exp base_id state in
-      if Int64.compare result_offset base_offset < 0 then
-        [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
-      else if Int64.compare result_offset end_offset > 0 then
-        [{ state with status = Error (err_ptrplus_above_end, loc, instr) }]
-      else
-        [state]
+      let base_off_expr = Formula.extract_offset_expr base_exp base_id in
+      let end_off_expr = Formula.extract_offset_expr end_exp base_id in
+      let base_val = eval_expr_to_int64_opt base_off_expr state in
+      let end_val = eval_expr_to_int64_opt end_off_expr state in
+      match base_val, end_val with
+      | Some base_offset, Some end_offset ->
+        if Int64.compare result_offset base_offset < 0 then
+          [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
+        else if Int64.compare result_offset end_offset > 0 then
+          [{ state with status = Error (err_ptrplus_above_end, loc, instr) }]
+        else
+          [state]
+      | _ ->
+        ptrplus_with_bounds_symbolic loc instr base_id base_off_expr end_off_expr
+          base_val end_val result_offset state
+
+  (** Handles pointer arithmetic bounds check when Base and/or End offset is symbolic.
+      Checks base and end independently — for each:
+      - Concrete value available: use direct Int64 comparison
+      - Symbolic: ask Astral, produce error+ok or pass through
+      Same contract structure as concrete path but with Astral fallback.
+      No BlockPointsTo gap needed — this is pointer arithmetic, not memory access.
+      NOTE: Astral may crash on symbolic comparisons (Bitwuzla sort mismatch) *)
+  and ptrplus_with_bounds_symbolic loc instr base_id base_off_expr end_off_expr
+      base_val end_val result_offset state =
+    let result_const = Expr.Const (Int result_offset) in
+    let base_states = match base_val with
+      | Some base_offset ->
+        if Int64.compare result_offset base_offset < 0 then
+          [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
+        else
+          [state]
+      | None ->
+        let below_condition = Expr.BinOp (Pless, result_const, base_off_expr) in
+        let above_condition = Expr.BinOp (Plesseq, base_off_expr, result_const) in
+        let within, not_within =
+          match AtlasAstral.check_sat_with_condition state below_condition with
+          | `Unsat -> true, false
+          | _ ->
+            match AtlasAstral.check_sat_with_condition state above_condition with
+            | `Unsat -> false, true
+            | _ -> false, false
+        in
+        match within, not_within with
+        | true, false -> [state]
+        | false, true ->
+          [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
+        | _ ->
+          let err_state = { state with
+            status = Error (err_ptrplus_below_base, loc, instr);
+            missing = { state.missing with
+              pure = below_condition :: state.missing.pure } }
+          in
+          let filter pure = Stdlib.List.filter
+            (fun e -> match e with
+              | Expr.BinOp (Plesseq, base_off_expr, _) -> true
+              | _ -> false)
+            pure
+          in
+          let ok_state = { state with
+            current = { state.current with
+              pure = above_condition :: filter state.current.pure };
+            missing = { state.missing with
+              pure = above_condition :: filter state.missing.pure } }
+          in
+          [err_state; ok_state]
+    in
+    concat_map_ok_states (fun state ->
+      match end_val with
+      | Some end_offset ->
+        if Int64.compare result_offset end_offset > 0 then
+          [{ state with status = Error (err_ptrplus_above_end, loc, instr) }]
+        else
+          [state]
+      | None ->
+        let above_condition = Expr.BinOp (Pless, end_off_expr, result_const) in
+        let below_condition = Expr.BinOp (Plesseq, result_const, end_off_expr) in
+        let within, not_within =
+          match AtlasAstral.check_sat_with_condition state above_condition with
+          | `Unsat -> true, false
+          | _ ->
+            match AtlasAstral.check_sat_with_condition state below_condition with
+            | `Unsat -> false, true
+            | _ -> false, false
+        in
+        match within, not_within with
+        | true, false -> [state]
+        | false, true ->
+          [{ state with status = Error (err_ptrplus_above_end, loc, instr) }]
+        | _ ->
+          let err_state = { state with
+            status = Error (err_ptrplus_above_end, loc, instr);
+            missing = { state.missing with
+              pure = above_condition :: state.missing.pure } }
+          in
+          let filter pure = Stdlib.List.filter
+            (fun e -> match e with
+              | Expr.BinOp (Plesseq, _, end_off_expr) -> true
+              | _ -> false)
+            pure
+          in
+          let ok_state = { state with
+            current = { state.current with
+              pure = below_condition :: filter state.current.pure };
+            missing = { state.missing with
+              pure = below_condition :: filter state.missing.pure } }
+          in
+          [err_state; ok_state]
+    ) base_states
 
   (** Formal memory — both Base and End found in missing. Lowers Base and/or
       raises End bound when result offset falls outside, generating error

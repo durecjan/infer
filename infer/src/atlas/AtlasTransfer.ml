@@ -565,7 +565,12 @@ module TransferFunctions = struct
       store_value_assign lhs lhs_expr rhs_expr state
 
   (** Store address assignment: LHS is a program variable being assigned a pointer value.
-      Handles three RHS cases: heap address (temp rename or alias), null, or error *)
+      Dispatches based on RHS shape:
+      - [x = x]: identity, no-op
+      - [x = x + offset]: self-reassignment, rename base to fresh variable
+      - [x = y + offset]: different base, temp rename or alias
+      - [x = NULL]: reset to unallocated
+      - Otherwise: error *)
   and store_address_assign loc instr lhs _lhs_expr rhs_expr state =
     match direct_id_of_sil_lvar lhs state with
     | Some lhs_direct_id ->
@@ -576,21 +581,15 @@ module TransferFunctions = struct
         let rhs_canon_base = match rhs_canonical with
           | Var id -> id | Ptr { base; _ } -> base
         in
-        let is_temp = match VarIdMap.find_opt rhs_canon_base state.vars with
-          | Some var -> not (Var.is_pvar var)
-          | None -> false
-        in
-        let state = clear_before_subst lhs_direct_id state in
-        if is_temp then
-          (* RHS is a temp variable (e.g. malloc retval) — rename it in the formula
-             so that the temp's formula entries become owned by the LHS variable *)
-          let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
-          let lhs_norm = Expr.Var lhs_direct_id in
-          [subst_apply ~from_:rhs_norm ~to_:lhs_norm state]
+        if Int.equal lhs_direct_id rhs_canon_base then
+          if Int64.equal rhs_offset 0L then
+            (* x = x: identity — no change *)
+            [state]
+          else
+            (* x = x + offset: self-reassignment within same block *)
+            store_address_self_reassign lhs_direct_id rhs_offset state
         else
-          (* RHS is a program variable or internal id — record the alias in subst
-             without modifying the formula, preserving the RHS variable's identity *)
-          [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
+          store_address_assign_other loc instr lhs_direct_id rhs_canonical rhs_canon_base state
       | None when Formula.is_null_expr rhs_norm ->
         (* RHS is null — reset LHS to unallocated state *)
         let state = clear_before_subst lhs_direct_id state in
@@ -607,6 +606,40 @@ module TransferFunctions = struct
       end
     | None ->
       [{ state with status = Error (err_store_assign_no_lhs, loc, instr) }]
+
+  (** Self-reassignment [x = x + offset]: the pointer shifts within its own block.
+      Creates a fresh variable to represent the original allocation base, renames
+      all occurrences of [lhs_id] to [fresh_id] in the state, then records
+      [lhs_id -> Ptr(fresh_id, offset)] in substitutions *)
+  and store_address_self_reassign lhs_id offset state =
+    let fresh_id = Id.fresh () in
+    let state = subst_apply
+      ~from_:(Expr.Var lhs_id) ~to_:(Expr.Var fresh_id) state in
+    let typ = VarIdMap.find_opt lhs_id state.types in
+    let state = match typ with
+      | Some t -> { state with types = VarIdMap.add fresh_id t state.types }
+      | None -> Logging.die InternalError
+        "store_address_self_reassign: VarIdMap.find_opt call failed"
+    in
+    let rhs_canonical = Ptr { base = fresh_id; offset } in
+    [{ state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
+
+  (** Address assignment where RHS base differs from LHS: temp rename or alias.
+      Temps (e.g. malloc retval) get renamed in the formula so that the temp's
+      entries become owned by the LHS variable. Program variables record an alias
+      in subst without modifying the formula *)
+  and store_address_assign_other loc instr lhs_direct_id rhs_canonical rhs_canon_base state =
+    let is_temp = match VarIdMap.find_opt rhs_canon_base state.vars with
+      | Some var -> not (Var.is_pvar var)
+      | None -> false
+    in
+    let state = clear_before_subst lhs_direct_id state in
+    if is_temp then
+      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
+      let lhs_norm = Expr.Var lhs_direct_id in
+      [subst_apply ~from_:rhs_norm ~to_:lhs_norm state]
+    else
+      [{ state with subst = VarIdMap.add lhs_direct_id rhs_canonical state.subst }]
 
   (** Store value assignment: LHS is a program variable being assigned a non-pointer value.
       Uses [assign_to_variable] when LHS resolves to a direct id, falls back to pure equality *)

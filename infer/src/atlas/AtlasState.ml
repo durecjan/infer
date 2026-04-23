@@ -955,6 +955,22 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
     in
     Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
   in
+  let eval_block_left_edge_symbolic_match to_remove symbolic_size =
+    let new_dest_id = Id.fresh () in
+    let new_exp_points_to =
+      ExpPointsTo (
+        Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+        Expr.Const (Int cell_size),
+        Expr.Var new_dest_id)
+    in
+    let rem_size = Expr.BinOp (Pminus, symbolic_size, Const (Int cell_size)) in
+    let to_add = [
+      BlockPointsTo (
+        Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+        normalize_expr rem_size empty_) ]
+    in
+    Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
+  in
   let try_block_left_edge_match hp src size =
     match src, size with
     | Expr.BinOp (Pplus, Var _, Const (Int off)),
@@ -967,6 +983,12 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
         when Int64.equal 0L lhs_offset &&
           (Int64.compare size cell_size ) >= 0 ->
             eval_block_left_edge_match hp size
+    | Expr.BinOp (Pplus, Var _, Const (Int off)), _
+        when Int64.equal off lhs_offset ->
+          eval_block_left_edge_symbolic_match hp size
+    | Expr.Var _, _
+        when Int64.equal 0L lhs_offset ->
+          eval_block_left_edge_symbolic_match hp size
     | _ -> None
   in
   let eval_block_right_edge_or_middle_match to_remove fragment_size fragment_offset =
@@ -995,6 +1017,29 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
       let to_add = [ to_add_left_block ] in
       Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
   in
+  let eval_block_right_edge_or_middle_symbolic_match to_remove symbolic_size fragment_offset =
+    let new_dest_id = Id.fresh () in
+    let new_exp_points_to = ExpPointsTo (
+      Expr.BinOp (Pplus, Var lhs_var_id, Const (Int lhs_offset)),
+      Expr.Const (Int cell_size),
+      Expr.Var new_dest_id)
+    in
+    let left_size = Stdlib.Int64.sub lhs_offset fragment_offset in
+    let left_and_middle_size =
+      Stdlib.Int64.add left_size cell_size
+    in
+    let to_add_left_block = BlockPointsTo (
+      Expr.BinOp (Pplus, Var lhs_var_id, Const (Int fragment_offset)),
+      Expr.Const (Int left_size))
+    in
+    let right_size = Expr.BinOp (Pminus, symbolic_size, Const (Int left_and_middle_size)) in
+    let to_add_right_block = BlockPointsTo (
+      Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+      normalize_expr right_size empty_)
+    in
+    let to_add = [ to_add_left_block; to_add_right_block ] in
+    Some (BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
+  in
   let try_block_right_edge_or_middle_match hp src size =
     match src, size with
     | Expr.BinOp (Pplus, Var _, Const (Int off)),
@@ -1005,6 +1050,12 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
       Expr.Const (Int size)
         when (Int64.compare size (Stdlib.Int64.add cell_size lhs_offset)) >= 0 ->
           eval_block_right_edge_or_middle_match hp size 0L
+    | Expr.BinOp (Pplus, Var _, Const (Int off)), _
+        when Int64.compare off lhs_offset < 0 ->
+          eval_block_right_edge_or_middle_symbolic_match hp size off
+    | Expr.Var _, _
+        when Int64.compare 0L lhs_offset < 0 ->
+          eval_block_right_edge_or_middle_symbolic_match hp size 0L
     | _ -> None
   in
   let rec try_block_split = function

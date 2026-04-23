@@ -433,8 +433,8 @@ module TransferFunctions = struct
       in
       let filter pure = Stdlib.List.filter
         (fun e -> match e with
-          | Expr.BinOp (Pless, _, end_off_expr) -> true
-          | _ -> false)
+          | Expr.BinOp (Pless, _, end_off_expr) -> false
+          | _ -> true)
         pure
       in
       let ok_state = { state with

@@ -577,11 +577,17 @@ module TransferFunctions = struct
       let rhs_norm = normalize_expr rhs_expr state in
       begin match base_and_offset_of_expr rhs_norm state with
       | Some (rhs_base_id, rhs_offset) ->
+        let lhs_canonical = canonical_expr state.subst lhs_direct_id 0L in
         let rhs_canonical = canonical_expr state.subst rhs_base_id rhs_offset in
-        let rhs_canon_base = match rhs_canonical with
-          | Var id -> id | Ptr { base; _ } -> base
+        let extract_canon_base = function
+          | Var id -> id
+          | Ptr { base; _ } -> base
         in
-        if Int.equal lhs_direct_id rhs_canon_base then
+        let lhs_canon_base, rhs_canon_base = 
+          extract_canon_base lhs_canonical,
+          extract_canon_base rhs_canonical
+        in
+        if Int.equal lhs_canon_base rhs_canon_base then
           if Int64.equal rhs_offset 0L then
             (* x = x: identity — no change *)
             [state]
@@ -1529,8 +1535,8 @@ module TransferFunctions = struct
           in
           let filter pure = Stdlib.List.filter
             (fun e -> match e with
-              | Expr.BinOp (Plesseq, base_off_expr, _) -> true
-              | _ -> false)
+              | Expr.BinOp (Plesseq, base_off_expr, _) -> false
+              | _ -> true)
             pure
           in
           let ok_state = { state with
@@ -1571,8 +1577,8 @@ module TransferFunctions = struct
           in
           let filter pure = Stdlib.List.filter
             (fun e -> match e with
-              | Expr.BinOp (Plesseq, _, end_off_expr) -> true
-              | _ -> false)
+              | Expr.BinOp (Plesseq, _, end_off_expr) -> false
+              | _ -> true)
             pure
           in
           let ok_state = { state with

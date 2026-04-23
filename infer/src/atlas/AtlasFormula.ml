@@ -347,8 +347,10 @@ and eval_expr_to_int64 e =
     where [id] matches [var_id]. Returns [Some offset_expr] if matched, [None] otherwise *)
 let extract_offset_expr expr var_id =
   match expr with
-  | Expr.BinOp (Pplus, Var id, offset) when Id.equal id var_id -> Some offset
-  | _ -> None
+  | Expr.BinOp (Pplus, Var id, offset) when Id.equal id var_id -> offset
+  | Expr.Var id when Id.equal id var_id -> Expr.zero
+  | _ -> Logging.die InternalError
+    "Expression does not match expected shape (id + offset)"
 
 let is_zero_expr expr =
   match eval_expr_to_int64 expr with

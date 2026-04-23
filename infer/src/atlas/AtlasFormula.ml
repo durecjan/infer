@@ -414,6 +414,10 @@ let heap_find_block_fragments spatial var_id var_offset cell_size =
         Id.equal id var_id &&
         (Int64.compare 0L var_offset) <= 0 &&
         (Int64.compare size cell_size) >= 0
+    | Expr.BinOp (Pplus, Var id, Const (Int off)),
+      _ when Id.equal id var_id -> true
+    | Expr.Var id, _
+      when Id.equal id var_id -> true
     | _ -> false
   in
   Stdlib.List.partition

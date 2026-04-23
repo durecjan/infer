@@ -411,8 +411,8 @@ module TransferFunctions = struct
       - Unknown: error contract (end_off <= access_end) + ok contract with upserted
         access_end < end_off, no BlockPointsTo gap needed (local malloc covers it). *)
   and deref_check_end_symbolic loc instr end_exp end_off_expr var_id access_end state =
-    let oob_condition = Expr.BinOp (Plesseq, end_off_expr, Const (Int access_end)) in
-    let within_condition = Expr.BinOp (Pless, Const(Int access_end), end_off_expr) in
+    let oob_condition = Expr.BinOp (Pless, end_off_expr, Const (Int access_end)) in
+    let within_condition = Expr.BinOp (Plesseq, Const(Int access_end), end_off_expr) in
     let within, not_within = 
       match AtlasAstral.check_sat_with_condition state oob_condition with
       | `Unsat -> true, false
@@ -433,7 +433,9 @@ module TransferFunctions = struct
       in
       let filter pure = Stdlib.List.filter
         (fun e -> match e with
-          | Expr.BinOp (Pless, _, end_off_expr) -> false
+          | Expr.BinOp (Plesseq, _, end_off_expr')
+            when Expr.equal end_off_expr end_off_expr'
+              -> false
           | _ -> true)
         pure
       in
@@ -1577,7 +1579,9 @@ module TransferFunctions = struct
           in
           let filter pure = Stdlib.List.filter
             (fun e -> match e with
-              | Expr.BinOp (Plesseq, _, end_off_expr) -> false
+              | Expr.BinOp (Plesseq, _, end_off_expr')
+                when Expr.equal end_off_expr end_off_expr'
+                  -> false
               | _ -> true)
             pure
           in

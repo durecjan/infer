@@ -50,8 +50,11 @@ let var_width_of_id id (types : Typ.t VarIdMap.t) : int =
 let rec translate_expr (types : Typ.t VarIdMap.t) (expr : Expr.t) : LL.Term.t =
   match expr with
   | Var id ->
-    let width = var_width_of_id id types in
-    LL.Term.mk_var width (Int.to_string id)
+    (* All variables use 64-bit width regardless of their C type.
+       Bitwuzla requires matching widths on both sides of a comparison term,
+       and our model does not support integer overflow semantics anyway —
+       sizes, offsets, and addresses all live in the same 64-bit space *)
+    LL.Term.mk_var 64 (Int.to_string id)
   | Const (Int n) ->
     LL.Term.mk_const ~size:64 (Int64.to_int n)
   | Const Null ->
@@ -76,7 +79,7 @@ let rec translate_expr (types : Typ.t VarIdMap.t) (expr : Expr.t) : LL.Term.t =
     (* Boolean-valued comparisons as terms — LowLevelSeplog has no boolean
        term type (mk_eq2/mk_distinct2 return formulas, not terms), so these
        cannot be nested inside spatial predicates. Fresh 1-bit variable *)
-    LL.Term.mk_fresh_var 1 "unsupported_bool"
+    LL.Term.mk_fresh_var 64 "unsupported_bool"
   | BinOp ((Pdiv | Pmod | Land | Lor
            | BVlshift | BVrshift | BVand | BVor | BVxor), _, _) ->
     LL.Term.mk_fresh_var 64 "unsupported"

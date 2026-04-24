@@ -766,12 +766,22 @@ type store_deref_assign_res =
     For non-pointer types: if RHS is a variable, adds a substitution; otherwise adds
     a pure equality constraint (mirrors [assign_to_variable] in AtlasTransfer).
     For pointer types: delegates to [store_dereference_address_assign] which updates substitutions.
+    When [~old_dest_value] is provided (extracted BEFORE [clear_stale_value_constraints]
+    in [store_extract_split_args]), resolves self-reassignment by replacing references
+    to the old destination variable in rhs with its former value.
     Returns [store_deref_assign_res] so callers can handle separated heap predicates correctly *)
-let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr =
+let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr ~old_dest ~old_dest_value =
   let types = VarIdMap.add lhs_id lhs_typ state.types in
   if is_pointer_type lhs_typ then
     store_dereference_address_assign { state with types } lhs_id lhs_expr rhs_expr
   else
+    (* Self-reassignment via old_dest: if rhs references the old destination variable,
+       replace it with the old value extracted before clear_stale_value_constraints *)
+    let rhs_expr = match old_dest, old_dest_value with
+      | Some Expr.Var old_id, Some old_value when expr_contains_var old_id rhs_expr ->
+        expr_replace ~old_:(Expr.Var old_id) ~new_:old_value rhs_expr
+      | _ -> rhs_expr
+    in
     let state = { state with types } in
     match rhs_expr with
     | Expr.Var rhs_id ->

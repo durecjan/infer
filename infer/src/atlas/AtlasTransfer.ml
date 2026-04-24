@@ -724,28 +724,36 @@ module TransferFunctions = struct
       store_create_missing_cell loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_norm state
 
   (** Extracts block split args and optional old_dest from a [block_split_res],
-      dispatching [ExpExactMatch] stale constraint cleanup *)
+      dispatching [ExpExactMatch] stale constraint cleanup.
+      Returns the old destination variable and its value (looked up BEFORE clearing)
+      so callers can resolve self-reassignment in [store_dereference_assign] *)
   and store_extract_split_args block_split_res state =
     match block_split_res with
     | ExpExactMatch { block_split_args; old_dest } ->
+      let old_dest_value = match old_dest with
+        | Expr.Var id -> Formula.find_peq_value id state.current.pure
+        | _ -> None
+      in
       let state, rewrite_spatial = match old_dest with
         | Expr.Var id -> clear_stale_value_constraints id state
         | _ -> (state, Fun.id)
       in
-      (state, block_split_args, rewrite_spatial)
+      (state, block_split_args, rewrite_spatial, Some old_dest, old_dest_value)
     | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args ->
-      (state, args, Fun.id)
+      (state, args, Fun.id, None, None)
 
   (** Handles a block split for a local allocation (found in current only).
       Transforms current spatial, runs assignment, prepends new [ExpPointsTo] to current *)
   and store_split_local lhs_typ rhs_norm block_split_res curr_hps curr_rest state =
-    let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, rewrite_spatial =
+    let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, rewrite_spatial,
+        old_dest, old_dest_value =
       store_extract_split_args block_split_res state
     in
     let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
     let state = { state with current = { state.current with spatial = curr_spatial } } in
     let lhs_expr = Expr.Var new_dest_id in
-    let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm in
+    let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
+      ~old_dest ~old_dest_value in
     let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
     let state = { state with current = { state.current with
       spatial = rewrite_spatial state.current.spatial } } in
@@ -765,7 +773,8 @@ module TransferFunctions = struct
       store_split_local lhs_typ rhs_norm block_split_res curr_hps curr_rest state
     | BlockExactMatch _ | BlockEdgeMatch _ | BlockMiddleMatch _ ->
       (* First access: mirror split to both current and missing *)
-      let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, _rewrite_spatial =
+      let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, _rewrite_spatial,
+          old_dest, old_dest_value =
         store_extract_split_args block_split_res state
       in
       let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
@@ -775,7 +784,8 @@ module TransferFunctions = struct
         missing = { state.missing with spatial = miss_spatial } }
       in
       let lhs_expr = Expr.Var new_dest_id in
-      let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm in
+      let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
+        ~old_dest ~old_dest_value in
       let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
       [{ state with
         current = { state.current with
@@ -815,7 +825,8 @@ module TransferFunctions = struct
       Expr.Const (Int cell_size),
       lhs_expr)
     in
-    let assign_res = store_dereference_assign state lhs_typ cell_id lhs_expr rhs_norm in
+    let assign_res = store_dereference_assign state lhs_typ cell_id lhs_expr rhs_norm
+      ~old_dest:None ~old_dest_value:None in
     let state, missing_spatial = match assign_res with
       | ValueStored state | AliasStored state ->
         (state, missing_spatial)

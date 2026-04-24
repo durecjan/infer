@@ -520,6 +520,60 @@ let find_peq_value target_id pure =
     | Expr.BinOp (Peq, value, Var id) when Id.equal id target_id -> Some value
     | _ -> None)
 
+(* ==================== expression normalization ==================== *)
+
+(** Normalizes [expr] by folding constant arithmetic, eliminating identity operations
+    (e.g. x+0, x*1), simplifying double negation, and pushing [Lnot] through
+    comparisons (e.g. [!(x != 0)] → [x == 0]). Does not resolve variables *)
+let rec normalize_expr expr =
+  let open Expr in
+  match expr with
+  | Var _ | Const _ | Undef -> expr
+  | UnOp (op, e) ->
+    let e' = normalize_expr e in
+    begin match op, e' with
+    | Puminus, Const (Int i) -> Const (Int (Int64.neg i))
+    | Lnot, Const (Int i) ->
+      Const (Int (if Int64.compare i 0L <> 0 then 0L else 1L))
+    | BVnot, Const (Int i) -> Const (Int (Stdlib.Int64.lognot i))
+    | Puminus, UnOp (Puminus, e_inner) -> e_inner
+    | Lnot, UnOp (Lnot, e_inner) -> e_inner
+    | Lnot, BinOp (Peq, e1, e2) -> BinOp (Pneq, e1, e2)
+    | Lnot, BinOp (Pneq, e1, e2) -> BinOp (Peq, e1, e2)
+    | Lnot, BinOp (Pless, e1, e2) -> BinOp (Plesseq, e2, e1)
+    | Lnot, BinOp (Plesseq, e1, e2) -> BinOp (Pless, e2, e1)
+    | _ -> UnOp (op, e')
+    end
+  | BinOp (op, e1, e2) ->
+    let e1' = normalize_expr e1 in
+    let e2' = normalize_expr e2 in
+    begin match op, e1', e2' with
+    | Pplus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.add i1 i2))
+    | Pminus, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.sub i1 i2))
+    | Pmult, Const (Int i1), Const (Int i2) ->
+      Const (Int (Stdlib.Int64.mul i1 i2))
+    | Pdiv, Const (Int i1), Const (Int i2)
+      when Int64.compare i2 0L <> 0 ->
+      Const (Int (Stdlib.Int64.div i1 i2))
+    | Pmod, Const (Int i1), Const (Int i2)
+      when Int64.compare i2 0L <> 0 ->
+      Const (Int (Int64.rem i1 i2))
+    | Pplus, e, Const (Int 0L)
+    | Pplus, Const (Int 0L), e -> e
+    | Pminus, e, Const (Int 0L) -> e
+    | Pmult, e, Const (Int 1L)
+    | Pmult, Const (Int 1L), e -> e
+    | Pmult, _, Const (Int 0L)
+    | Pmult, Const (Int 0L), _ -> Const (Int 0L)
+    | Land, Const (Int 0L), _
+    | Land, _, Const (Int 0L) -> Const (Int 0L)
+    | Lor, Const (Int 1L), _
+    | Lor, _, Const (Int 1L) -> Const (Int 1L)
+    | _ -> BinOp (op, e1', e2')
+    end
+
 (* ==================== expression substitution ==================== *)
 
 (** Replaces every occurrence of [~old_] with [~new_] within [expr], using [Expr.equal] for matching *)

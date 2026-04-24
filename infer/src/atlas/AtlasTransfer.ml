@@ -147,7 +147,7 @@ module TransferFunctions = struct
              on the RHS of Load address assigns, and null is not a heap address *)
           [{ state with status = Error (err_load_assign_no_base, loc, instr) }]
       else
-        let rhs_norm = normalize_expr rhs_expr state in
+        let rhs_norm = Formula.normalize_expr rhs_expr in
         assign_to_variable lhs_id rhs_norm state
     end
 
@@ -176,7 +176,7 @@ module TransferFunctions = struct
       else
         [{ state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }]
     | _ ->
-      let exp = Expr.BinOp (Peq, Expr.Var lhs_id, normalize_expr rhs state) in
+      let exp = Expr.BinOp (Peq, Expr.Var lhs_id, Formula.normalize_expr rhs) in
       [{ state with current = { state.current with pure = exp :: state.current.pure } }]
 
   (** Load dereference pipeline: checks freed → base bounds → end bounds → heap match *)
@@ -592,7 +592,7 @@ module TransferFunctions = struct
   and store_address_assign loc instr lhs _lhs_expr rhs_expr state =
     match direct_id_of_sil_lvar lhs state with
     | Some lhs_direct_id ->
-      let rhs_norm = normalize_expr rhs_expr state in
+      let rhs_norm = Formula.normalize_expr rhs_expr in
       begin match base_and_offset_of_expr rhs_norm state with
       | Some (rhs_base_id, rhs_offset) ->
         let lhs_canonical = canonical_expr state.subst lhs_direct_id 0L in
@@ -659,7 +659,7 @@ module TransferFunctions = struct
     in
     let state = clear_before_subst lhs_direct_id state in
     if is_temp then
-      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
+      let rhs_norm = Formula.normalize_expr (subst_expr_to_formula_expr rhs_canonical) in
       let lhs_norm = Expr.Var lhs_direct_id in
       [subst_apply ~from_:rhs_norm ~to_:lhs_norm state]
     else
@@ -670,11 +670,11 @@ module TransferFunctions = struct
   and store_value_assign lhs lhs_expr rhs_expr state =
     match direct_id_of_sil_lvar lhs state with
     | Some lhs_direct_id ->
-      let rhs_norm = normalize_expr rhs_expr state in
+      let rhs_norm = Formula.normalize_expr rhs_expr in
       assign_to_variable lhs_direct_id rhs_norm state
     | None ->
-      let rhs_norm = normalize_expr rhs_expr state in
-      let lhs_norm = normalize_expr lhs_expr state in
+      let rhs_norm = Formula.normalize_expr rhs_expr in
+      let lhs_norm = Formula.normalize_expr lhs_expr in
       let state = match lhs_norm with
         | Expr.Var id ->
           let state, rewrite_spatial = clear_stale_value_constraints id state in
@@ -705,7 +705,7 @@ module TransferFunctions = struct
       - Missing only → bug (missing mirroring failure)
       - Neither → fallback to create missing cell *)
   and store_match_heap loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_expr state =
-    let rhs_norm = normalize_expr rhs_expr state in
+    let rhs_norm = Formula.normalize_expr rhs_expr in
     let curr_hps, curr_rest, miss_hps, miss_rest =
       heap_find_block_fragments state lhs_var_id lhs_offset cell_size
     in
@@ -856,7 +856,7 @@ module TransferFunctions = struct
     in
     let source = Expr.Var lhs_id in
     (* we assume expression denotes to some size_t since it passed compilation *)
-    let size = normalize_expr actual state in
+    let size = Formula.normalize_expr actual in
     (* try to evaluate the size *)
     let size = match eval_expr_to_int64_opt size state with
       | Some i -> Expr.Const (Int i)

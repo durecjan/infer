@@ -449,7 +449,7 @@ and eval_expr_offset expr skip_id state =
     | Expr.Var id when Id.equal id skip_id -> off
     | Expr.Var id ->
       begin match lookup_pure id with
-      | Some e -> eval off (normalize_expr e state)
+      | Some e -> eval off (normalize_expr e)
       | None -> off
       end
     | Expr.Const (Int i) -> Stdlib.Int64.add off i
@@ -483,69 +483,7 @@ and eval_expr_offset expr skip_id state =
       in
       Stdlib.Int64.add off res
   in
-  eval 0L (normalize_expr expr state)
-
-(** Normalizes [expr] by folding constant arithmetic, eliminating identity operations
-    (e.g. x+0, x*1), and simplifying double negation. Does not resolve variables *)
-and normalize_expr expr _state =
-  let open Expr in 
-  let norm = normalize_expr in
-  match expr with
-    Var _ | Const _ | Undef ->
-      expr
-  | UnOp (op, e) ->
-    let e' = norm e _state in
-    begin match op, e' with
-      Puminus, Const (Int i) ->
-      Const (Int (Int64.neg i))
-    | Lnot, Const (Int i) ->
-      Const (Int (if (Int64.compare i 0L) <> 0 then 0L else 1L))
-    | BVnot, Const (Int i) ->
-      Const (Int (Stdlib.Int64.lognot i))
-    | Puminus, UnOp (Puminus, e_inner) ->
-      e_inner
-    | _ ->
-      UnOp (op, e')
-    end
-  | BinOp (op, e1, e2) ->
-    let e1' = norm e1 _state in
-    let e2' = norm e2 _state in
-    begin match op, e1, e2 with
-      Pplus, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.add i1 i2))
-    | Pminus, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.sub i1 i2))
-    | Pmult, Const (Int i1), Const (Int i2) ->
-      Const (Int (Stdlib.Int64.mul i1 i2))
-    | Pdiv, Const (Int i1), Const (Int i2)
-      when (Int64.compare i2 0L) <> 0 ->
-      Const (Int (Stdlib.Int64.div i1 i2))
-    | Pmod,   Const (Int i1), Const (Int i2)
-      when (Int64.compare i2 0L) <> 0 ->
-      Const (Int (Int64.rem i1 i2))
-
-    | Pplus, e, Const (Int 0L)
-    | Pplus, Const (Int 0L), e ->
-      e
-    | Pminus, e, Const (Int 0L) ->
-      e
-    | Pmult, e, Const (Int 1L)
-    | Pmult, Const (Int 1L), e ->
-      e
-    | Pmult, _, Const (Int 0L)
-    | Pmult, Const (Int 0L), _ ->
-      Const (Int 0L)
-
-    | Land, Const (Int 0L), _
-    | Land, _, Const (Int 0L) ->
-      Const (Int 0L)
-    | Lor, Const (Int 1L), _
-    | Lor, _, Const (Int 1L) ->
-      Const (Int 1L)
-
-    | _ ->
-      BinOp (op, e1', e2')
-    end
+  eval 0L (normalize_expr expr)
 
 (** Evaluates [expr] to Int64, resolving variables through pure constraints.
     Handles arithmetic operations (+, -, *, /, %), unary minus, and normalizes first.
@@ -559,7 +497,7 @@ let eval_expr_to_int64_opt expr state =
     | Expr.Const (Null) -> Some 0L
     | Expr.Var id ->
       begin match lookup_pure id with
-      | Some e -> eval (normalize_expr e state)
+      | Some e -> eval (normalize_expr e)
       | None -> None
       end
     | Expr.UnOp (Puminus, e) ->
@@ -588,7 +526,7 @@ let eval_expr_to_int64_opt expr state =
         else Some (Stdlib.Int64.rem v1 v2)))
     | _ -> None
   in
-  eval (normalize_expr expr state)
+  eval (normalize_expr expr)
 
 
 (* ==================== pure constraint helpers ==================== *)
@@ -708,8 +646,8 @@ let is_var_null id state =
       known null/non-null status via Base constraints → [Sat]/[Unsat]
     - Everything else → [Unknown] (delegated to Astral solver) *)
 let eval_eq e1 e2 state =
-  let e1 = normalize_expr e1 state in
-  let e2 = normalize_expr e2 state in
+  let e1 = normalize_expr e1 in
+  let e2 = normalize_expr e2 in
   if Expr.equal e1 e2 then Sat
   else
     match e1, e2 with
@@ -790,7 +728,7 @@ let rec store_dereference_assign state lhs_typ lhs_id lhs_expr rhs_expr ~old_des
       else
         ValueStored { state with subst = VarIdMap.add lhs_id (Var rhs_id) state.subst }
     | _ ->
-      let exp = Expr.BinOp (Peq, lhs_expr, normalize_expr rhs_expr state) in
+      let exp = Expr.BinOp (Peq, lhs_expr, normalize_expr rhs_expr) in
       let pure = exp :: state.current.pure in
       ValueStored { state with current = { state.current with pure } }
 
@@ -816,8 +754,8 @@ and store_dereference_address_assign state lhs_id lhs_expr rhs_expr =
     if is_temp then
       (* RHS is a temp variable — rename it in the formula so that
          the temp's formula entries become owned by the LHS variable *)
-      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) state in
-      let lhs_norm = normalize_expr lhs_expr state in
+      let rhs_norm = normalize_expr (subst_expr_to_formula_expr rhs_canonical) in
+      let lhs_norm = normalize_expr lhs_expr in
       AddressStored {
         state = subst_apply ~from_:rhs_norm ~to_:lhs_norm state;
         canonical_rhs = rhs_norm }
@@ -986,7 +924,7 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
     let to_add = [
       BlockPointsTo (
         Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
-        normalize_expr rem_size empty_) ]
+        normalize_expr rem_size) ]
     in
     Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
   in
@@ -1054,7 +992,7 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
     let right_size = Expr.BinOp (Pminus, symbolic_size, Const (Int left_and_middle_size)) in
     let to_add_right_block = BlockPointsTo (
       Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
-      normalize_expr right_size empty_)
+      normalize_expr right_size)
     in
     let to_add = [ to_add_left_block; to_add_right_block ] in
     Some (BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id })

@@ -321,11 +321,17 @@ module TransferFunctions = struct
     | (_, Some e) ->
       deref_lower_base_bound loc instr e var_id offset cell_size state
     | (Some e, None) ->
-      let base_offset = eval_expr_offset e var_id state in
-      if Int64.compare offset base_offset < 0 then
-        [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
-      else
-        [state]
+      let base_off_expr = Formula.extract_offset_expr e var_id in
+      begin match eval_expr_to_int64_opt base_off_expr state with
+      | Some base_offset ->
+        if Int64.compare offset base_offset < 0 then
+          [{ state with status = Error (err_deref_below_lower_bound, loc, instr) }]
+        else
+          [state]
+      | None ->
+        Logging.die InternalError
+          "deref_check_base: local Base offset is symbolic — this should be unreachable"
+      end
     | (None, None) ->
       deref_create_missing_base loc instr var_id offset cell_size state
 
@@ -1498,14 +1504,11 @@ module TransferFunctions = struct
         ptrplus_with_bounds_symbolic loc instr base_id base_off_expr end_off_expr
           base_val end_val result_offset state
 
-  (** Handles pointer arithmetic bounds check when Base and/or End offset is symbolic.
-      Checks base and end independently — for each:
-      - Concrete value available: use direct Int64 comparison
-      - Symbolic: ask Astral, produce error+ok or pass through
-      Same contract structure as concrete path but with Astral fallback.
-      No BlockPointsTo gap needed — this is pointer arithmetic, not memory access.
-      NOTE: Astral may crash on symbolic comparisons (Bitwuzla sort mismatch) *)
-  and ptrplus_with_bounds_symbolic loc instr base_id base_off_expr end_off_expr
+  (** Handles pointer arithmetic bounds check when End offset is symbolic.
+      Base must always be concrete for local memory — dies if not.
+      End check uses Astral fallback: error+ok or pass through.
+      No BlockPointsTo gap needed — this is pointer arithmetic, not memory access *)
+  and ptrplus_with_bounds_symbolic loc instr _base_id _base_off_expr end_off_expr
       base_val end_val result_offset state =
     let result_const = Expr.Const (Int result_offset) in
     let base_states = match base_val with
@@ -1515,39 +1518,8 @@ module TransferFunctions = struct
         else
           [state]
       | None ->
-        let below_condition = Expr.BinOp (Pless, result_const, base_off_expr) in
-        let above_condition = Expr.BinOp (Plesseq, base_off_expr, result_const) in
-        let within, not_within =
-          match AtlasAstral.check_sat_with_condition state below_condition with
-          | `Unsat -> true, false
-          | _ ->
-            match AtlasAstral.check_sat_with_condition state above_condition with
-            | `Unsat -> false, true
-            | _ -> false, false
-        in
-        match within, not_within with
-        | true, false -> [state]
-        | false, true ->
-          [{ state with status = Error (err_ptrplus_below_base, loc, instr) }]
-        | _ ->
-          let err_state = { state with
-            status = Error (err_ptrplus_below_base, loc, instr);
-            missing = { state.missing with
-              pure = below_condition :: state.missing.pure } }
-          in
-          let filter pure = Stdlib.List.filter
-            (fun e -> match e with
-              | Expr.BinOp (Plesseq, base_off_expr, _) -> false
-              | _ -> true)
-            pure
-          in
-          let ok_state = { state with
-            current = { state.current with
-              pure = above_condition :: filter state.current.pure };
-            missing = { state.missing with
-              pure = above_condition :: filter state.missing.pure } }
-          in
-          [err_state; ok_state]
+        Logging.die InternalError
+          "ptrplus_with_bounds_symbolic: local Base offset is symbolic — this should be unreachable"
     in
     concat_map_ok_states (fun state ->
       match end_val with

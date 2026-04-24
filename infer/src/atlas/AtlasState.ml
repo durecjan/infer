@@ -284,12 +284,21 @@ let clear_stale_value_constraints lhs_id state =
       | Some var -> Var.is_pvar var  (* pvar → non-temp *)
       | None -> true                 (* not in vars → cell id → non-temp *)
     in
-    let canonical = match List.find reverse_deps ~f:is_non_temp with
-      | Some id -> id
-      | None -> Logging.die InternalError
-          "[clear_stale_value_constraints] no non-temp canonical candidate \
-           among reverse deps of id %d" lhs_id
-    in
+    match List.find reverse_deps ~f:is_non_temp with
+    | None ->
+      (* All reverse deps are temps — treat same as no reverse deps.
+         Remove temps' stale subst entries pointing at lhs_id *)
+      let kept = List.filter state.current.pure
+        ~f:(fun c -> not (is_direct_value_constraint lhs_id c))
+      in
+      let subst = List.fold reverse_deps ~init:subst ~f:(fun acc yi ->
+        VarIdMap.remove yi acc)
+      in
+      ({ state with
+        current = { state.current with pure = kept };
+        subst },
+       Fun.id)
+    | Some canonical ->
     let current_pure = subst_apply_to_pure
       ~from_:(Expr.Var lhs_id)
       ~to_:(Expr.Var canonical)

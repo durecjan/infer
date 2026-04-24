@@ -500,6 +500,26 @@ let heap_find_in_interval spatial var_id interval_off interval_size =
         | None -> false)
     spatial
 
+(* ==================== expression inspection ==================== *)
+
+(** Returns [true] if [expr] contains [Var target_id] anywhere in its tree *)
+let rec expr_contains_var target_id = function
+  | Expr.Var id -> Id.equal id target_id
+  | Expr.Const _ | Expr.Undef -> false
+  | Expr.UnOp (_, e) -> expr_contains_var target_id e
+  | Expr.BinOp (_, e1, e2) ->
+    expr_contains_var target_id e1 || expr_contains_var target_id e2
+
+(** Searches [pure] for a [Peq] constraint that directly equates [Var target_id]
+    with some value expression. Returns [Some value] on the first match, [None]
+    if no such constraint exists. Skips block properties (Base/End) *)
+let find_peq_value target_id pure =
+  List.find_map pure ~f:(fun c ->
+    match c with
+    | Expr.BinOp (Peq, Var id, value) when Id.equal id target_id -> Some value
+    | Expr.BinOp (Peq, value, Var id) when Id.equal id target_id -> Some value
+    | _ -> None)
+
 (* ==================== expression substitution ==================== *)
 
 (** Replaces every occurrence of [~old_] with [~new_] within [expr], using [Expr.equal] for matching *)

@@ -153,9 +153,19 @@ module TransferFunctions = struct
 
   (** Assigns [rhs] to [lhs_id]: substitution if RHS is a variable, pure equality otherwise.
       Clears stale value constraints and subst entries for [lhs_id] before the assignment.
-      Note: when called from load, [lhs_id] is always a fresh temp so the cleanup is a no-op,
-      but the call is kept for correctness when called from store paths *)
+      Handles self-reassignment (e.g. [i = i + 1]): when rhs references [lhs_id],
+      resolves the old value from the existing Peq constraint and substitutes it into
+      rhs before clearing, avoiding circular constraints.
+      Note: when called from load, [lhs_id] is always a fresh temp so self-reassignment
+      and cleanup are no-ops *)
   and assign_to_variable lhs_id rhs state =
+    (* Self-reassignment: resolve old value before clearing *)
+    let rhs = if Formula.expr_contains_var lhs_id rhs then
+      match Formula.find_peq_value lhs_id state.current.pure with
+      | Some old_value ->
+        Formula.expr_replace ~old_:(Expr.Var lhs_id) ~new_:old_value rhs
+      | None -> rhs
+    else rhs in
     let state, rewrite_spatial = clear_stale_value_constraints lhs_id state in
     let state = { state with current = { state.current with
       spatial = rewrite_spatial state.current.spatial } } in

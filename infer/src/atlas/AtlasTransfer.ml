@@ -78,6 +78,7 @@ module TransferFunctions = struct
         Format.print_string (
           "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
         let cond = sil_exp_to_expr exp tenv state in
+        let cond = Formula.normalize_expr cond in
         let states = check_sil_ptr_arith loc instr tenv exp state in
         let states = concat_map_ok_states
           (check_sil_ptrsub loc instr tenv exp) states in

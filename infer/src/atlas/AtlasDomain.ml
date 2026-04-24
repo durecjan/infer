@@ -97,7 +97,8 @@ let match_subst (s1 : State.t) (s2 : State.t) bij =
   let open State in
   let bindings1 = VarIdMap.bindings s1.subst in
   let bindings2 = VarIdMap.bindings s2.subst in
-  let rec aux bij = function
+  if List.length bindings1 <> List.length bindings2 then None
+  else let rec aux bij = function
     | [], [] -> Some bij
     | (k1, v1) :: rest1, (k2, v2) :: rest2 ->
       if not (Id.equal k1 k2) then None
@@ -225,6 +226,135 @@ let state_alpha_equal s1 s2 =
             | None -> false
             | Some _ -> true
 
+(* ==================== State subset ==================== *)
+
+(** Subset matching for substitutions under alpha-equivalence.
+    Every binding in [s1.subst] must find a matching binding in [s2.subst].
+    [s2.subst] may contain additional entries not present in [s1.subst].
+    Both binding lists are sorted by key, so s2-only entries are skipped.
+    Returns [Some bijection] on success, [None] on mismatch *)
+let match_subst_subset (s1 : State.t) (s2 : State.t) bij =
+  let open State in
+  let bindings1 = VarIdMap.bindings s1.subst in
+  let bindings2 = VarIdMap.bindings s2.subst in
+  if List.length bindings1 > List.length bindings2 then None
+  else let rec aux bij = function
+    | [], _ -> Some bij  (* all s1 entries matched *)
+    | _, [] -> None      (* s1 has unmatched entries *)
+    | (k1, v1) :: rest1, (k2, v2) :: rest2 ->
+      let cmp = Id.compare k1 k2 in
+      if cmp > 0 then
+        (* k2 < k1: s2 has extra entry, skip it *)
+        aux bij ((k1, v1) :: rest1, rest2)
+      else if cmp < 0 then
+        (* k1 < k2: s1 entry not found in s2 *)
+        None
+      else begin match v1, v2 with
+      | Var id1, Var id2 ->
+        begin match match_ids bij id1 s1 id2 s2 with
+        | Some bij' -> aux bij' (rest1, rest2)
+        | None -> None
+        end
+      | Ptr { base = b1; offset = off1 }, Ptr { base = b2; offset = off2 } ->
+        if not (Int64.equal off1 off2) then None
+        else begin match match_ids bij b1 s1 b2 s2 with
+        | Some bij' -> aux bij' (rest1, rest2)
+        | None -> None
+        end
+      | Var id1, Ptr { base = b2; offset = 0L } ->
+        begin match match_ids bij id1 s1 b2 s2 with
+        | Some bij' -> aux bij' (rest1, rest2)
+        | None -> None
+        end
+      | Ptr { base = b1; offset = 0L }, Var id2 ->
+        begin match match_ids bij b1 s1 id2 s2 with
+        | Some bij' -> aux bij' (rest1, rest2)
+        | None -> None
+        end
+      | _ -> None
+      end
+  in
+  aux bij (bindings1, bindings2)
+
+(** Subset matching for spatial predicates under alpha-equivalence.
+    Every predicate in [sp_rhs] must find a matching predicate in [sp_lhs].
+    [sp_lhs] may contain additional unmatched predicates.
+    Matched predicates are removed from candidates to prevent double-matching.
+    Returns [Some updated_bijection] on success, [None] on mismatch *)
+let match_spatial_subset bij (s1 : State.t) (s2 : State.t) sp_lhs sp_rhs =
+  let rec find_match bij hp_rhs checked = function
+    | [] -> None
+    | hp_lhs :: rest ->
+      begin match match_heap_pred bij s1 s2 hp_lhs hp_rhs with
+      | Some bij' -> Some (bij', List.rev_append checked rest)
+      | None -> find_match bij hp_rhs (hp_lhs :: checked) rest
+      end
+  in
+  let rec aux bij candidates = function
+    | [] -> Some bij
+    | hp_rhs :: rest_rhs ->
+      begin match find_match bij hp_rhs [] candidates with
+      | Some (bij', remaining) -> aux bij' remaining rest_rhs
+      | None -> None
+      end
+  in
+  aux bij sp_lhs sp_rhs
+
+(** Subset matching for pure constraints under alpha-equivalence.
+    Every constraint in [p_rhs] must find a matching constraint in [p_lhs].
+    [p_lhs] may contain additional unmatched constraints.
+    Returns [Some updated_bijection] on success, [None] on mismatch *)
+let match_pure_subset bij (s1 : State.t) (s2 : State.t) p_lhs p_rhs =
+  let rec find_match bij e_rhs checked = function
+    | [] -> None
+    | e_lhs :: rest ->
+      begin match match_expr bij s1 s2 e_lhs e_rhs with
+      | Some bij' -> Some (bij', List.rev_append checked rest)
+      | None -> find_match bij e_rhs (e_lhs :: checked) rest
+      end
+  in
+  let rec aux bij candidates = function
+    | [] -> Some bij
+    | e_rhs :: rest_rhs ->
+      begin match find_match bij e_rhs [] candidates with
+      | Some (bij', remaining) -> aux bij' remaining rest_rhs
+      | None -> None
+      end
+  in
+  aux bij p_lhs p_rhs
+
+(** State subset: [state_leq s1 s2] holds when [s1]'s formula is contained
+    within [s2]'s — every substitution, spatial predicate, and pure constraint
+    in [s1] has a matching counterpart in [s2] (under the cell id bijection),
+    but [s2] may contain additional entries not present in [s1].
+
+    Same known limitations as [state_alpha_equal]: greedy matching without
+    backtracking. Sufficient in practice for the same reasons *)
+let state_leq s1 s2 =
+  let open State in
+  if not (status_equal s1.status s2.status) then false
+  else if not (VarIdMap.equal Var.equal s1.vars s2.vars) then false
+  else if List.length s1.current.spatial > List.length s2.current.spatial then false
+  else if List.length s1.missing.spatial > List.length s2.missing.spatial then false
+  else if List.length s1.current.pure > List.length s2.current.pure then false
+  else if List.length s1.missing.pure > List.length s2.missing.pure then false
+  else
+    match match_subst_subset s1 s2 empty_bijection with
+    | None -> false
+    | Some bij ->
+      match match_spatial_subset bij s1 s2 s2.current.spatial s1.current.spatial with
+      | None -> false
+      | Some bij ->
+        match match_spatial_subset bij s1 s2 s2.missing.spatial s1.missing.spatial with
+        | None -> false
+        | Some bij ->
+          match match_pure_subset bij s1 s2 s2.current.pure s1.current.pure with
+          | None -> false
+          | Some bij ->
+            match match_pure_subset bij s1 s2 s2.missing.pure s1.missing.pure with
+            | None -> false
+            | Some _ -> true
+
 (* ==================== Disjunctive domain ==================== *)
 
 (** Disjunctive domain — each disjunct is a single abstract state.
@@ -235,9 +365,9 @@ module DisjDomain = struct
   let pp fmt state =
     Format.fprintf fmt "%s" (State.to_string state)
 
-  (** Structural implication — identical states.
-      TODO: implement proper State.leq as subset check on spatial/pure *)
-  let leq ~lhs ~rhs = state_alpha_equal lhs rhs
+  (** State implication — lhs is subsumed by rhs if rhs's spatial/pure
+      predicates are a subset of lhs's (lhs is at least as specific) *)
+  let leq ~lhs ~rhs = state_leq lhs rhs
 
   (** Fast structural equality for deduplication at CFG join points *)
   let equal_fast = state_alpha_equal

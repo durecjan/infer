@@ -20,6 +20,15 @@ let checker (analysis_data : IntraproceduralAnalysis.t) : unit =
         | AtlasState.Ok -> true
         | AtlasState.Error _ -> false)
     in
+    (* Deduplicate states using alpha-equality *)
+    let dedup states =
+      List.fold states ~init:[] ~f:(fun acc s ->
+        if List.exists acc ~f:(fun s' -> AtlasDomain.state_alpha_equal s s') then acc
+        else s :: acc)
+      |> List.rev
+    in
+    let final_states = dedup final_states in
+    let err_states = dedup err_states in
     Format.printf
       "@[<v2>Atlas finished procedure %a@]@."
       Procname.pp proc_name;

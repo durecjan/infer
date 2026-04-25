@@ -94,6 +94,7 @@ module Expr = struct
     match op1, op2 with
     | Base, Base
     | End, End
+    | Freed, Freed
     | BVnot, BVnot
     | Lnot, Lnot
     | Puminus, Puminus -> true

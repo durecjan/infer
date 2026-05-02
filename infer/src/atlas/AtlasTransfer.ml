@@ -95,6 +95,8 @@ module TransferFunctions = struct
           "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
         let cond = sil_exp_to_expr exp tenv state in
         let cond = Formula.normalize_expr cond in
+        Format.print_string (
+          "[SIL_PRUNE_COND]: " ^ Expr.to_string state.vars cond ^ "\n");
         let states = check_sil_ptr_arith loc instr tenv exp state in
         let states = concat_map_ok_states
           (check_sil_ptrsub loc instr tenv exp) states in
@@ -103,6 +105,14 @@ module TransferFunctions = struct
           | Unsat -> []
           | Sat -> [state]
           | Unknown ->
+            (* tranform (if (x)) to (if (x != 0)), etc. *)
+            let cond = match cond with
+              | Expr.UnOp (Lnot, Const c) -> Expr.BinOp(Peq, Const c, Expr.zero)
+              | Expr.UnOp (Lnot, Var id) -> Expr.BinOp(Peq, Var id, Expr.zero)
+              | Expr.Const c -> Expr.BinOp(Pneq, Const c, Expr.zero)
+              | Expr.Var id -> Expr.BinOp(Pneq, Var id, Expr.zero)
+              | _ -> cond
+            in
             match Astral.eval_prune state cond with
             | Unsat -> []
             | Sat -> [state]

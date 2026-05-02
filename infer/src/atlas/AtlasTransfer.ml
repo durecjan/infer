@@ -73,6 +73,22 @@ module TransferFunctions = struct
           let src_expr = sil_exp_to_expr src tenv state in
           let size_expr = sil_exp_to_expr size tenv state in
           exec_memcpy_instr loc instr tenv state ret ret_typ dest dest_expr src src_expr size size_expr
+    | Sil.Call
+      ( _, Exp.Const (Const.Cfun procname), _, _loc, _ )
+        when Procname.equal (Procname.from_string_c_fun "abort") procname ->
+          Format.print_string (
+            "[SIL_ABORT]: " ^ sil_instr_to_string instr ^ "\n");
+          []
+    | Sil.Call
+      ( (ret, ret_typ), Exp.Const (Const.Cfun procname), _, _loc, _ )
+        when String.is_prefix ~prefix:"__VERIFIER_nondet_" (Procname.to_string procname) ->
+          (* SV-COMP nondeterministic value generators *)
+          Format.print_string (
+            "[SIL_VERIFIER_NONDET]: " ^ sil_instr_to_string instr ^ "\n");
+          let ret_id = Id.fresh () in
+          [{ state with
+            vars = VarIdMap.add ret_id (Var.of_id ret) state.vars;
+            types = VarIdMap.add ret_id ret_typ state.types }]
     | Sil.Prune (exp, loc, _is_then_branch, _if_kind) ->
       begin
         Format.print_string (

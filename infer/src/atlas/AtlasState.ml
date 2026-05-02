@@ -666,7 +666,9 @@ let eval_eq e1 e2 state =
     Returns [Sat] if the condition is satisfiable (keep state),
     [Unsat] if contradicted (filter out state), [Unknown] if
     undetermined (keep conservatively).
-    Handles: equality, inequality, logical not, and nested combinations *)
+    Handles: equality, inequality, logical not, bare constants,
+    bare variables pinned to a constant via current.pure, and nested
+    combinations *)
 let rec eval_prune_condition expr state =
   match expr with
   | Expr.BinOp (Peq, e1, e2) ->
@@ -675,6 +677,21 @@ let rec eval_prune_condition expr state =
     negate_prune (eval_eq e1 e2 state)
   | Expr.UnOp (Lnot, inner) ->
     negate_prune (eval_prune_condition inner state)
+  | Expr.Const _ ->
+    (* Constant condition: zero/null → Unsat, anything else (Int non-zero,
+       String literal as non-null, etc.) → Sat. Lets [while (1)] / [if (0)]
+       be decided locally instead of falling through to the SMT solver. *)
+    if Formula.is_zero_expr expr then Unsat else Sat
+  | Expr.Var id ->
+    (* Bare-variable condition: if the current pure has pinned [id] (possibly
+       transitively through other vars) to a constant, its truthiness is
+       decided. Otherwise unknown — Astral may know more, e.g. via inequality
+       bounds. Only current.pure is consulted; missing-side bindings are
+       inference shadows, not facts about the value. *)
+    begin match Formula.lookup_pure_const_exp_of_id id state.current.pure with
+    | Some c -> if Formula.is_zero_expr c then Unsat else Sat
+    | None -> Unknown
+    end
   | _ -> Unknown
 
 (** Result of [store_dereference_assign], distinguishing scalar vs pointer stores.

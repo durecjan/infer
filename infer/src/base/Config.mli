@@ -122,6 +122,12 @@ val annotation_reachability_no_allocation : bool
 
 val annotation_reachability_report_source_and_sink : bool
 
+val atlas_max_disjuncts : int
+
+val atlas_procname_filter : string option
+
+val atlas_widen_threshold : int
+
 val attributes_lru_max_size : int
 
 val bitcode_capture : bool

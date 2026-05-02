@@ -4,14 +4,22 @@ module Analyzer =
   AbstractInterpreter.MakeDisjunctive
     (AtlasTransfer.TransferFunctions)
     (struct
-      let join_policy = TransferFunctions.UnderApproximateAfter 64
-      let widen_policy = TransferFunctions.UnderApproximateAfterNumIterations 5
+      let join_policy = TransferFunctions.UnderApproximateAfter Config.atlas_max_disjuncts
+      let widen_policy =
+        TransferFunctions.UnderApproximateAfterNumIterations Config.atlas_widen_threshold
     end)
 
 let checker (analysis_data : IntraproceduralAnalysis.t) : unit =
+  let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
+  (* Optional procname filter: when [--atlas-procname NAME] is set, skip every
+     procedure whose name does not match exactly. *)
+  let skip = match Config.atlas_procname_filter with
+    | Some target -> not (String.equal target (Procname.to_string proc_name))
+    | None -> false
+  in
+  if skip then () else
   let init_state = AtlasState.empty analysis_data in
   let initial = ([init_state], AtlasDomain.NonDisjDomain.bottom) in
-  let proc_name = Procdesc.get_proc_name analysis_data.proc_desc in
   match Analyzer.compute_post analysis_data ~initial analysis_data.proc_desc with
   | Some (final_domain, _non_disj) ->
     let final_states, err_states =

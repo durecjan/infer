@@ -637,6 +637,28 @@ and annotation_reachability_report_source_and_sink =
     "Reports methods that are marked as both a source and a sink at the same time." ~default:false
 
 
+and atlas_max_disjuncts =
+  CLOpt.mk_int ~long:"atlas-max-disjuncts" ~default:20
+    "Stop exploring new paths after $(i,int) disjunctions in the Atlas domain. \
+     Matches the semantics of $(b,--pulse-max-disjuncts); the default is set to \
+     Pulse's default for an apples-to-apples SV-COMP comparison."
+
+
+and atlas_procname_filter =
+  CLOpt.mk_string_opt ~long:"atlas-procname"
+    "If set, run the Atlas checker only on procedures whose name matches the \
+     given string exactly. Used during SV-COMP-style benchmarking to skip \
+     orphaned function definitions left in place by Frama-C inlining."
+
+
+and atlas_widen_threshold =
+  CLOpt.mk_int ~long:"atlas-widen-threshold" ~default:3
+    "Stop exploring new paths after $(i,int) loop iterations in the Atlas \
+     analyzer. Matches the semantics of $(b,--pulse-widen-threshold); the \
+     default is set to Pulse's default for an apples-to-apples SV-COMP \
+     comparison."
+
+
 and attributes_lru_max_size =
   CLOpt.mk_int ~long:"attributes-lru-max-size" ~meta:"int" ~default:500
     "Specify size of procedure attribute LRU cache. Relevant only to multicore mode. Defaults to \
@@ -3901,6 +3923,12 @@ and annotation_reachability_minimize_sources = !annotation_reachability_minimize
 and annotation_reachability_no_allocation = !annotation_reachability_no_allocation
 
 and annotation_reachability_report_source_and_sink = !annotation_reachability_report_source_and_sink
+
+and atlas_max_disjuncts = !atlas_max_disjuncts
+
+and atlas_procname_filter = !atlas_procname_filter
+
+and atlas_widen_threshold = !atlas_widen_threshold
 
 and attributes_lru_max_size = !attributes_lru_max_size
 

@@ -126,7 +126,9 @@ let rec translate_pure_constraint types (expr : Expr.t) : LL.t option =
   | UnOp (Lnot, inner) ->
     (* SIL false branches wrap conditions in Lnot: !(e1 == e2).
        Unwrap by negating the inner expression and retrying *)
-    translate_pure_constraint types (negate_expr inner)
+    let inner' = negate_expr inner in
+    if Expr.equal inner' inner then None
+    else translate_pure_constraint types inner'
   | UnOp (Freed, _) ->
     None
   | _ ->

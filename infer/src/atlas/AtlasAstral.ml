@@ -22,7 +22,7 @@ module VarIdMap = Formula.VarIdMap
 open !Stdlib
 
 (** Astral LowLevelSeplog instance with 64-bit pointer width *)
-module LL = Astral.LowLevelSeplog.Make(struct let width = 64 end)()
+module LL = Astral.LowLevelSeplog.Make(struct let width, print_sorts = 64, true end)()
 
 (** Returns the bit width for a variable based on its type in [state.types].
     Pointer types are 64-bit. Integer types use their actual size in bits.

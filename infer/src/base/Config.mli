@@ -126,6 +126,8 @@ val atlas_max_disjuncts : int
 
 val atlas_procname_filter : string option
 
+val atlas_unsafe_malloc : bool
+
 val atlas_widen_threshold : int
 
 val attributes_lru_max_size : int

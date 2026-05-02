@@ -897,15 +897,18 @@ module TransferFunctions = struct
           Expr.BinOp (Peq, UnOp (Base, source), source) ::
           Expr.BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
           state.current.pure } } in
-    (* failure state: malloc returned NULL *)
-    let null_state = { state with
-      current = { state.current with
-        pure =
-          Expr.BinOp (Peq, source, Expr.null) ::
-          Expr.BinOp (Peq, UnOp (Base, source), Expr.zero) ::
-          Expr.BinOp (Peq, UnOp (End, source), Expr.zero) ::
-          state.current.pure } } in
-    [ok_state; null_state]
+    (* failure state: malloc returned NULL — suppressed under
+       [--atlas-unsafe-malloc] (mirrors Pulse's [--pulse-unsafe-malloc]) *)
+    if Config.atlas_unsafe_malloc then [ok_state]
+    else
+      let null_state = { state with
+        current = { state.current with
+          pure =
+            Expr.BinOp (Peq, source, Expr.null) ::
+            Expr.BinOp (Peq, UnOp (Base, source), Expr.zero) ::
+            Expr.BinOp (Peq, UnOp (End, source), Expr.zero) ::
+            state.current.pure } } in
+      [ok_state; null_state]
 
   (* ==================== SIL Call - free ==================== *)
 

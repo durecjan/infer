@@ -651,6 +651,13 @@ and atlas_procname_filter =
      orphaned function definitions left in place by Frama-C inlining."
 
 
+and atlas_unsafe_malloc =
+  CLOpt.mk_bool ~long:"atlas-unsafe-malloc"
+    "Assume that malloc(3) never returns null. When set, \
+     $(b,exec_malloc_instr) emits only the success state and skips the \
+     null-return disjunct."
+
+
 and atlas_widen_threshold =
   CLOpt.mk_int ~long:"atlas-widen-threshold" ~default:3
     "Stop exploring new paths after $(i,int) loop iterations in the Atlas \
@@ -3927,6 +3934,8 @@ and annotation_reachability_report_source_and_sink = !annotation_reachability_re
 and atlas_max_disjuncts = !atlas_max_disjuncts
 
 and atlas_procname_filter = !atlas_procname_filter
+
+and atlas_unsafe_malloc = !atlas_unsafe_malloc
 
 and atlas_widen_threshold = !atlas_widen_threshold
 

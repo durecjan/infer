@@ -19,12 +19,15 @@ module TransferFunctions = struct
 
   let pp_session_name _node fmt = Format.pp_print_string fmt "Atlas"
 
+  (** Print [s] only when [--atlas-debug] is set. *)
+  let dbg s = if Config.atlas_debug then Format.print_string s
+
   (** Transfer function for a single state — returns a list of successor states *)
   let rec exec_instr_single _node analysis_data state instr =
     let tenv = analysis_data.IntraproceduralAnalysis.tenv in
     let states = match instr with
     | Sil.Load { id; e; typ; loc } ->
-      Format.print_string (
+      dbg (
         "[SIL_LOAD]: " ^ sil_instr_to_string instr ^ "\n");
       let rhs_expr = sil_exp_to_expr ~typ:typ e tenv state in
       let states = if is_pointer_type typ then
@@ -36,7 +39,7 @@ module TransferFunctions = struct
         (exec_load_instr loc instr id tenv typ e rhs_expr)
         states
     | Sil.Store {e1; typ; e2; loc} ->
-      Format.print_string (
+      dbg (
         "[SIL_STORE]: " ^ sil_instr_to_string instr ^ "\n");
       let lhs_expr = sil_exp_to_expr ~typ:typ e1 tenv state in
       let rhs_expr = sil_exp_to_expr ~typ:typ e2 tenv state in
@@ -51,7 +54,7 @@ module TransferFunctions = struct
     | Sil.Call
       ( (ident, typ), Exp.Const (Const.Cfun procname), ((actual, actual_typ) :: _), _loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
-          Format.print_string (
+          dbg (
             "[SIL_MALLOC]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
           exec_malloc_instr ident typ actual_expr state
@@ -60,14 +63,14 @@ module TransferFunctions = struct
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
           (* Note: _actual_typ is always void* in SIL — the original type is on
              the preceding Sil.Load instruction. We recover it from state.types. *)
-          Format.print_string (
+          dbg (
             "[SIL_FREE]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr actual tenv state in
           exec_free_instr loc instr tenv actual_expr state
     | Sil.Call
       ((ret, ret_typ), Exp.Const (Const.Cfun procname), ((dest, _) :: (src, _) :: (size, _) :: _), loc, _)
         when Procname.equal (Procname.from_string_c_fun "memcpy") procname ->
-          Format.print_string (
+          dbg (
           "[SIL_CALL]: " ^ sil_instr_to_string instr ^ "\n");
           let dest_expr = sil_exp_to_expr dest tenv state in
           let src_expr = sil_exp_to_expr src tenv state in
@@ -76,14 +79,14 @@ module TransferFunctions = struct
     | Sil.Call
       ( _, Exp.Const (Const.Cfun procname), _, _loc, _ )
         when Procname.equal (Procname.from_string_c_fun "abort") procname ->
-          Format.print_string (
+          dbg (
             "[SIL_ABORT]: " ^ sil_instr_to_string instr ^ "\n");
           []
     | Sil.Call
       ( (ret, ret_typ), Exp.Const (Const.Cfun procname), _, _loc, _ )
         when String.is_prefix ~prefix:"__VERIFIER_nondet_" (Procname.to_string procname) ->
           (* SV-COMP nondeterministic value generators *)
-          Format.print_string (
+          dbg (
             "[SIL_VERIFIER_NONDET]: " ^ sil_instr_to_string instr ^ "\n");
           let ret_id = Id.fresh () in
           [{ state with
@@ -91,11 +94,11 @@ module TransferFunctions = struct
             types = VarIdMap.add ret_id ret_typ state.types }]
     | Sil.Prune (exp, loc, _is_then_branch, _if_kind) ->
       begin
-        Format.print_string (
+        dbg (
           "[SIL_PRUNE]: " ^ sil_instr_to_string instr ^ "\n");
         let cond = sil_exp_to_expr exp tenv state in
         let cond = Formula.normalize_expr cond in
-        Format.print_string (
+        dbg (
           "[SIL_PRUNE_COND]: " ^ Expr.to_string state.vars cond ^ "\n");
         let states = check_sil_ptr_arith loc instr tenv exp state in
         let states = concat_map_ok_states
@@ -123,11 +126,11 @@ module TransferFunctions = struct
           states
       end
     | Sil.Call _ ->
-      Format.print_string (
+      dbg (
         "[SIL_CALL]: " ^ sil_instr_to_string instr ^ "\n");
       [state]
     | Sil.Metadata metadata ->
-      Format.print_string (
+      dbg (
         "[SIL_METADATA]: " ^ sil_metadata_to_string metadata ^ "\n");
       exec_metadata_instr metadata state
     in
@@ -136,7 +139,7 @@ module TransferFunctions = struct
       | Sil.Load _ | Sil.Store _ | Sil.Call _ | Sil.Prune _ | Sil.Metadata (Sil.ExitScope _) -> true
       | _ -> false
     in
-    if is_modified_state then
+    if Config.atlas_debug && is_modified_state then
       Format.print_string (String.concat (
         List.map
           ~f:(fun state -> to_string state)

@@ -22,40 +22,36 @@ let checker (analysis_data : IntraproceduralAnalysis.t) : unit =
   let initial = ([init_state], AtlasDomain.NonDisjDomain.bottom) in
   match Analyzer.compute_post analysis_data ~initial analysis_data.proc_desc with
   | Some (final_domain, _non_disj) ->
-    let final_states, err_states =
-      List.partition_tf final_domain ~f:(fun s ->
-        match s.AtlasState.status with
-        | AtlasState.Ok -> true
-        | AtlasState.Error _ -> false)
-    in
-    (* Deduplicate states using alpha-equality *)
-    let dedup states =
-      List.fold states ~init:[] ~f:(fun acc s ->
+    (* Deduplicate states using alpha-equality, preserving arrival order. *)
+    let states =
+      List.fold final_domain ~init:[] ~f:(fun acc s ->
         if List.exists acc ~f:(fun s' -> AtlasDomain.state_alpha_equal s s') then acc
         else s :: acc)
       |> List.rev
     in
-    let final_states = dedup final_states in
-    let err_states = dedup err_states in
-    Format.printf
-      "@[<v2>Atlas finished procedure %a@]@."
-      Procname.pp proc_name;
     Format.print_string (
-      "\n================\n" ^
-      "[FINAL STATES] :\n" ^
-      "================\n" ^
-      String.concat (
-        List.map
-          ~f:(fun state -> AtlasState.to_string state)
-          final_states));
-    Format.print_string (
-      "[ERROR STATES] :\n" ^
-      "================\n" ^
-      String.concat (
-        List.map
-          ~f:(fun state -> AtlasState.to_string state)
-          err_states))
+      "\nAtlas finished procedure " ^ Procname.to_string proc_name ^ "\n");
+    List.iter states ~f:(fun state ->
+      Format.print_string (AtlasState.to_string state));
+    Format.print_string "\n================\n[SUMMARY]:\n================\n";
+    if List.is_empty states then Format.print_string "RESULT_UNKNOWN";
+    let errors = List.filter states ~f:(fun s ->
+      match s.AtlasState.status with
+      | AtlasState.Ok -> false
+      | AtlasState.Error _ -> true)
+    in
+    if not (List.is_empty errors) then begin
+      List.iter errors ~f:(fun s ->
+        match s.AtlasState.status with
+        | AtlasState.Error (msg, loc, _instr) ->
+          let open Location in
+          Format.print_string (
+            "RESULT_FALSE=" ^ msg ^
+            " LOCATION=[line " ^ Int.to_string loc.line ^
+            "; column " ^ Int.to_string loc.col ^ "]\n")
+        | AtlasState.Ok -> ())
+    end else if not (List.is_empty states) then
+      Format.print_string "RESULT_TRUE";
   | None ->
-    Format.printf
-      "Atlas: compute_post returned None for %a@."
-      Procname.pp proc_name
+    Format.print_string (
+      "Atlas: compute_post returned None for " ^ Procname.to_string proc_name ^ "\n")

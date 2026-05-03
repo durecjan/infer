@@ -171,17 +171,18 @@ let check_sat (state : AtlasState.t) : [`Sat | `Unsat | `Unknown] =
     returns Unknown, we check whether the conjunction of the state with the
     condition (or its negation) is satisfiable *)
 let check_sat_with_condition (state : AtlasState.t) (condition : Expr.t) : [`Sat | `Unsat | `Unknown] =
+  let dbg fmt = if Config.atlas_debug then Format.printf fmt else Format.ifprintf Format.std_formatter fmt in
   let base = translate_state state in
   match translate_pure_constraint state.types condition with
   | Some cond_atom ->
     let query = LL.mk_star [base; cond_atom] in
-    Format.printf "[ASTRAL] query: %s\n" (LL.show query);
+    dbg "[ASTRAL] query: %s\n" (LL.show query);
     let result = LL.check_sat query in
-    Format.printf "[ASTRAL] result: %s\n"
+    dbg "[ASTRAL] result: %s\n"
       (match result with `Sat -> "SAT" | `Unsat -> "UNSAT" | `Unknown -> "UNKNOWN");
     result
   | None ->
-    Format.printf "[ASTRAL] condition not translatable, returning Unknown\n";
+    dbg "[ASTRAL] condition not translatable, returning Unknown\n";
     `Unknown
 
 (** Evaluates a prune condition using Astral. Checks both the condition and
@@ -190,7 +191,7 @@ let check_sat_with_condition (state : AtlasState.t) (condition : Expr.t) : [`Sat
     - [UNSAT(state ∧ ¬cond)] → condition must hold → [Sat]
     - Otherwise → [Unknown] *)
 let eval_prune (state : AtlasState.t) (condition : Expr.t) : AtlasState.prune_result =
-  Format.printf "[ASTRAL] eval_prune called\n";
+  if Config.atlas_debug then Format.printf "[ASTRAL] eval_prune called\n";
   match check_sat_with_condition state condition with
   | `Unsat -> Unsat
   | `Sat | `Unknown ->

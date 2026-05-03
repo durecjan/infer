@@ -122,6 +122,8 @@ val annotation_reachability_no_allocation : bool
 
 val annotation_reachability_report_source_and_sink : bool
 
+val atlas_debug : bool
+
 val atlas_max_disjuncts : int
 
 val atlas_procname_filter : string option

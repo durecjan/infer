@@ -637,6 +637,13 @@ and annotation_reachability_report_source_and_sink =
     "Reports methods that are marked as both a source and a sink at the same time." ~default:false
 
 
+and atlas_debug =
+  CLOpt.mk_bool ~long:"atlas-debug"
+    "Print per-instruction trace and intermediate state dumps from the Atlas \
+     transfer functions. Off by default; enable for interactive debugging. \
+     Has no effect on the final-state summary printed by $(b,Atlas.checker)."
+
+
 and atlas_max_disjuncts =
   CLOpt.mk_int ~long:"atlas-max-disjuncts" ~default:20
     "Stop exploring new paths after $(i,int) disjunctions in the Atlas domain. \
@@ -3930,6 +3937,8 @@ and annotation_reachability_minimize_sources = !annotation_reachability_minimize
 and annotation_reachability_no_allocation = !annotation_reachability_no_allocation
 
 and annotation_reachability_report_source_and_sink = !annotation_reachability_report_source_and_sink
+
+and atlas_debug = !atlas_debug
 
 and atlas_max_disjuncts = !atlas_max_disjuncts
 

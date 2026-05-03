@@ -636,12 +636,14 @@ module TransferFunctions = struct
           extract_canon_base rhs_canonical
         in
         if Int.equal lhs_canon_base rhs_canon_base then
-          if Int64.equal rhs_offset 0L then
-            (* x = x: identity — no change *)
+          let rhs_canon_offset = extract_canon_offset rhs_canonical in
+          let lhs_canon_offset = extract_canon_offset lhs_canonical in
+          if Int64.equal rhs_canon_offset lhs_canon_offset then
+            (* x = x (after canonicalization): identity — no change *)
             [state]
           else
             (* x = x + offset: self-reassignment within same block *)
-            store_address_self_reassign lhs_direct_id rhs_offset state
+            store_address_self_reassign lhs_direct_id rhs_canon_base rhs_canon_offset state
         else
           store_address_assign_other loc instr lhs_direct_id rhs_canonical rhs_canon_base state
       | None when Formula.is_null_expr rhs_norm ->
@@ -662,21 +664,29 @@ module TransferFunctions = struct
       [{ state with status = Error (err_store_assign_no_lhs, loc, instr) }]
 
   (** Self-reassignment [x = x + offset]: the pointer shifts within its own block.
-      Creates a fresh variable to represent the original allocation base, renames
-      all occurrences of [lhs_id] to [fresh_id] in the state, then records
-      [lhs_id -> Ptr(fresh_id, offset)] in substitutions *)
-  and store_address_self_reassign lhs_id offset state =
-    let fresh_id = Id.fresh () in
-    let state = subst_apply
-      ~from_:(Expr.Var lhs_id) ~to_:(Expr.Var fresh_id) state in
-    let typ = VarIdMap.find_opt lhs_id state.types in
-    let state = match typ with
-      | Some t -> { state with types = VarIdMap.add fresh_id t state.types }
-      | None -> Logging.die InternalError
-        "store_address_self_reassign: VarIdMap.find_opt call failed"
-    in
-    let rhs_canonical = Ptr { base = fresh_id; offset } in
-    [{ state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
+      Two cases by [lhs_id]'s relation to the formula's current base:
+      - [lhs_id = rhs_canon_base]: [lhs_id] IS the current formula base (no
+        prior canonicalization). Mint a fresh id, rename [lhs_id] → fresh in
+        the formula, re-anchor [lhs_id] through subst at [Ptr(fresh, offset)].
+      - [lhs_id <> rhs_canon_base]: [lhs_id] is already aliased through subst
+        to [rhs_canon_base]. The formula has no occurrence of [lhs_id] to
+        rename — just update subst to [Ptr(rhs_canon_base, offset)]. *)
+  and store_address_self_reassign lhs_id rhs_canon_base rhs_canon_offset state =
+    if Id.equal lhs_id rhs_canon_base then
+      let fresh_id = Id.fresh () in
+      let state = subst_apply
+        ~from_:(Expr.Var lhs_id) ~to_:(Expr.Var fresh_id) state in
+      let typ = VarIdMap.find_opt lhs_id state.types in
+      let state = match typ with
+        | Some t -> { state with types = VarIdMap.add fresh_id t state.types }
+        | None -> Logging.die InternalError
+          "store_address_self_reassign: VarIdMap.find_opt call failed"
+      in
+      let rhs_canonical = Ptr { base = fresh_id; offset = rhs_canon_offset } in
+      [{ state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
+    else
+      let rhs_canonical = Ptr { base = rhs_canon_base; offset = rhs_canon_offset } in
+      [{ state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
 
   (** Address assignment where RHS base differs from LHS: temp rename or alias.
       Temps (e.g. malloc retval) get renamed in the formula so that the temp's

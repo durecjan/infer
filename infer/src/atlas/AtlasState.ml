@@ -174,6 +174,12 @@ let subst_expr_to_formula_expr = function
   | Var id -> Expr.Var id
   | Ptr { base; offset } -> Expr.BinOp (Pplus, Var base, Const (Int offset))
 
+(** Extracts the byte offset from a [subst_expr]: [0L] for a bare [Var],
+    or the [offset] field of a [Ptr]. *)
+let extract_canon_offset = function
+  | Var _ -> 0L
+  | Ptr { offset; _ } -> offset
+
 (** Applies substitution [~from_] [~to_] over current and missing parts of [state].
     If [~to_] expression is found within a pure constraint or a heap predicate, a synthetic variable will take it's place *)
 let subst_apply ~from_ ~to_ state =

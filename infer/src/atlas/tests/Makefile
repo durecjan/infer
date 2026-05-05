@@ -7,7 +7,7 @@ run:
 	infer run --atlas-only -j 1 -- clang -c $(TARGET) > out
 
 debug:
-	infer run --atlas-only --debug -j 1 -- clang -c $(TARGET) > out
+	infer run --atlas-only --atlas-debug -j 1 -- clang -c $(TARGET) > out
 
 clean:
 	rm -f out

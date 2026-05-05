@@ -52,12 +52,12 @@ module TransferFunctions = struct
         (exec_store_instr loc instr tenv typ e1 lhs_expr rhs_expr)
         states
     | Sil.Call
-      ( (ident, typ), Exp.Const (Const.Cfun procname), ((actual, actual_typ) :: _), _loc, _ )
+      ( (ident, typ), Exp.Const (Const.Cfun procname), ((actual, actual_typ) :: _), loc, _ )
         when BuiltinDecl.(match_builtin malloc procname (Procname.to_string procname)) ->
           dbg (
             "[SIL_MALLOC]: " ^ sil_instr_to_string instr ^ "\n");
           let actual_expr = sil_exp_to_expr ~typ:actual_typ actual tenv state in
-          exec_malloc_instr ident typ actual_expr state
+          exec_malloc_instr loc instr ident typ actual_expr state
     | Sil.Call
       ( _, Exp.Const (Const.Cfun procname), ((actual, _actual_typ) :: _), loc, _ )
         when BuiltinDecl.(match_builtin free procname (Procname.to_string procname)) ->
@@ -888,7 +888,30 @@ module TransferFunctions = struct
 
   (* ==================== SIL Call - malloc ==================== *)
 
-  and exec_malloc_instr lhs typ actual state =
+  (** Classifies [size_expr] under [state] as provably zero / provably non-zero
+      / indeterminate. Returns [(is_zero, is_non_zero)]; both [false] means
+      we couldn't decide and the caller should split into both branches.
+
+      Concrete-folding via [eval_expr_to_int64_opt] takes precedence; falls
+      back to two Astral SAT queries on [size == 0] and [size != 0]. *)
+  and check_size_zero state size_expr =
+    match eval_expr_to_int64_opt size_expr state with
+    | Some i -> Int64.equal i 0L, not (Int64.equal i 0L)
+    | None ->
+      let is_zero_sat = AtlasAstral.check_sat_with_condition state
+        (Expr.BinOp (Peq, size_expr, Const (Int 0L))) in
+      let is_nonzero_sat = AtlasAstral.check_sat_with_condition state
+        (Expr.BinOp (Pneq, size_expr, Const (Int 0L))) in
+      match is_zero_sat, is_nonzero_sat with
+      | `Unsat, _ -> false, true
+      | _, `Unsat -> true, false
+      | _ -> false, false
+
+  (** SIL malloc dispatch. Classifies the size via [check_size_zero] then
+      routes to the matching sub-handler. Each sub-handler manages its own
+      [--atlas-unsafe-malloc] gating, except [exec_malloc_zero] (no success
+      path to suppress). *)
+  and exec_malloc_instr loc instr lhs typ actual state =
     let lhs_id = Id.fresh () in
     let state = { state with
       vars = VarIdMap.add lhs_id (Var.of_id lhs) state.vars;
@@ -902,7 +925,19 @@ module TransferFunctions = struct
       | Some i -> Expr.Const (Int i)
       | None -> size
     in
-    (* success state: block allocated with Base/End constraints *)
+    match check_size_zero state size with
+    | true, false  -> exec_malloc_zero loc instr state
+    | false, true  -> exec_malloc_nonzero state source size
+    | _            -> exec_malloc_unknown loc instr state source size
+
+  (** malloc(0) — zero-sized allocation is UB per Ch3 design. Single
+      terminal error state, no success/failure split. *)
+  and exec_malloc_zero loc instr state =
+    [{ state with status = Error (err_malloc_zero_size, loc, instr) }]
+
+  (** malloc(n>0) — block allocated with Base/End constraints. Plus a
+      null-failure state when [--atlas-unsafe-malloc] isn't set. *)
+  and exec_malloc_nonzero state source size =
     let ok_state = { state with
       current = {
         spatial = Formula.BlockPointsTo (source, size) :: state.current.spatial;
@@ -910,8 +945,6 @@ module TransferFunctions = struct
           Expr.BinOp (Peq, UnOp (Base, source), source) ::
           Expr.BinOp (Peq, UnOp (End, source), BinOp (Pplus, source, size)) ::
           state.current.pure } } in
-    (* failure state: malloc returned NULL — suppressed under
-       [--atlas-unsafe-malloc] (mirrors Pulse's [--pulse-unsafe-malloc]) *)
     if Config.atlas_unsafe_malloc then [ok_state]
     else
       let null_state = { state with
@@ -922,6 +955,24 @@ module TransferFunctions = struct
             Expr.BinOp (Peq, UnOp (End, source), Expr.zero) ::
             state.current.pure } } in
       [ok_state; null_state]
+
+  (** malloc(n) under indeterminate size. Three disjuncts (two with
+      [--atlas-unsafe-malloc]):
+      - success branch with [size != 0] mirrored into current+missing
+        (assume-as-assert: caller must rule out zero for this branch)
+      - null-failure branch (unless suppressed) with the same assume
+      - error branch with [size == 0] mirrored into current+missing *)
+  and exec_malloc_unknown loc instr state source size =
+    let nonzero_assume = Expr.BinOp (Pneq, size, Const (Int 0L)) in
+    let zero_assume    = Expr.BinOp (Peq,  size, Const (Int 0L)) in
+    let with_assume assume st = { st with
+      current = { st.current with pure = assume :: st.current.pure };
+      missing = { st.missing with pure = assume :: st.missing.pure } } in
+    let nonzero_states = exec_malloc_nonzero state source size
+      |> List.map ~f:(with_assume nonzero_assume) in
+    let zero_state = with_assume zero_assume
+      { state with status = Error (err_malloc_zero_size, loc, instr) } in
+    nonzero_states @ [zero_state]
 
   (* ==================== SIL Call - free ==================== *)
 

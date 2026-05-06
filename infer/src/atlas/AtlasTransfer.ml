@@ -253,7 +253,8 @@ module TransferFunctions = struct
       curr_hps curr_rest miss_hps miss_rest state =
     match match_res with
     | MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
-      [{ state with subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst }]
+      let dest_canonical = canonical_expr state.subst id_of_dest 0L in
+      [{ state with subst = VarIdMap.add lhs_id dest_canonical state.subst }]
     | MatchExpExact { matched = _; dest } ->
       let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
       [{ state with current = { state.current with pure = exp :: state.current.pure } }]
@@ -281,7 +282,8 @@ module TransferFunctions = struct
   and load_match_local lhs_id rhs_typ match_res curr_hps curr_rest state =
     match match_res with
     | MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
-      [{ state with subst = VarIdMap.add lhs_id (Var id_of_dest) state.subst }]
+      let dest_canonical = canonical_expr state.subst id_of_dest 0L in
+      [{ state with subst = VarIdMap.add lhs_id dest_canonical state.subst }]
     | MatchExpExact { matched = _; dest } ->
       let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
       [{ state with current = { state.current with pure = exp :: state.current.pure } }]

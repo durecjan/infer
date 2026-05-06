@@ -246,9 +246,30 @@ module TransferFunctions = struct
     | None, None ->
       load_create_missing_cell loc instr lhs_id rhs_typ rhs_var_id rhs_offset cell_size state
 
+  (** Pre-computes the two states produced by a [BlockSymbolicMatch] split.
+      Returns [(no_remainder_state, remainder_state)] with the appropriate
+      size constraint mirrored into both current and missing pure (per the
+      symmetric-accumulation rule). The caller is responsible for adding
+      [symbolic_split.rem_hp] to the spatial of the remainder state via its
+      own [transform_spatial] call. *)
+  and apply_symbolic_split symbolic_split state =
+    let no_rem =
+      Expr.BinOp (Peq, symbolic_split.sym_size,
+        Const (Int symbolic_split.access_end)) in
+    let with_rem =
+      Expr.BinOp (Plesseq,
+        Const (Int (Stdlib.Int64.add symbolic_split.access_end 1L)),
+        symbolic_split.sym_size) in
+    let with_pure assume st = { st with
+      current = { st.current with pure = assume :: st.current.pure };
+      missing = { st.missing with pure = assume :: st.missing.pure } } in
+    with_pure no_rem state, with_pure with_rem state
+
   (** Handles a heap match for a formal pointer (found in both current and missing).
       Exact match adds subst/pure eq. Block split transforms both current and missing
-      spatial, adds new [ExpPointsTo] to both *)
+      spatial, adds new [ExpPointsTo] to both. [BlockSymbolicMatch] additionally
+      splits into two states with the size-constraint mirroring described in
+      [apply_symbolic_split] *)
   and load_match_formal lhs_id rhs_typ match_res
       curr_hps curr_rest miss_hps miss_rest state =
     match match_res with
@@ -258,26 +279,38 @@ module TransferFunctions = struct
       let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
       [{ state with current = { state.current with pure = exp :: state.current.pure } }]
     | MatchBlockSplit block_split_res ->
-      let { to_remove; to_add; new_exp_points_to; new_dest_id } =
+      let block_split_args, symbolic_split =
         match block_split_res with
-        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
-        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args
+        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args, None
+        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args, None
+        | BlockSymbolicMatch { block_split_args; symbolic_split } ->
+          block_split_args, Some symbolic_split
       in
-      let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
-      let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
-      let state = { state with
-        current = { state.current with
-          spatial = new_exp_points_to :: curr_spatial };
-        missing = { state.missing with
-          spatial = new_exp_points_to :: miss_spatial } }
+      let { to_remove; to_add; new_exp_points_to; new_dest_id } = block_split_args in
+      let continue state to_add =
+        let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
+        let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
+        let state = { state with
+          current = { state.current with
+            spatial = new_exp_points_to :: curr_spatial };
+          missing = { state.missing with
+            spatial = new_exp_points_to :: miss_spatial } }
+        in
+        { state with
+          subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst;
+          types = VarIdMap.add new_dest_id rhs_typ state.types }
       in
-      [{ state with
-        subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst;
-        types = VarIdMap.add new_dest_id rhs_typ state.types }]
+      match symbolic_split with
+      | None -> [continue state to_add]
+      | Some info ->
+        let state_a, state_b = apply_symbolic_split info state in
+        [continue state_a to_add; continue state_b (info.rem_hp :: to_add)]
 
   (** Handles a heap match for a local allocation (found in current only).
       Exact match adds subst/pure eq. Block split transforms current spatial
-      and adds new [ExpPointsTo] to current only *)
+      and adds new [ExpPointsTo] to current only. [BlockSymbolicMatch] additionally
+      splits into two states; the size constraint still mirrors to missing per
+      [apply_symbolic_split], even though the spatial split is current-only. *)
   and load_match_local lhs_id rhs_typ match_res curr_hps curr_rest state =
     match match_res with
     | MatchExpExact { matched = _; dest = Expr.Var id_of_dest } ->
@@ -286,19 +319,29 @@ module TransferFunctions = struct
       let exp = Expr.BinOp (Peq, Expr.Var lhs_id, dest) in
       [{ state with current = { state.current with pure = exp :: state.current.pure } }]
     | MatchBlockSplit block_split_res ->
-      let { to_remove; to_add; new_exp_points_to; new_dest_id } =
+      let block_split_args, symbolic_split =
         match block_split_res with
-        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args
-        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args
+        | ExpExactMatch { block_split_args; old_dest = _ } -> block_split_args, None
+        | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args -> args, None
+        | BlockSymbolicMatch { block_split_args; symbolic_split } ->
+          block_split_args, Some symbolic_split
       in
-      let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
-      let state = { state with
-        current = { state.current with
-          spatial = new_exp_points_to :: curr_spatial } }
+      let { to_remove; to_add; new_exp_points_to; new_dest_id } = block_split_args in
+      let continue state to_add =
+        let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
+        let state = { state with
+          current = { state.current with
+            spatial = new_exp_points_to :: curr_spatial } }
+        in
+        { state with
+          subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst;
+          types = VarIdMap.add new_dest_id rhs_typ state.types }
       in
-      [{ state with
-        subst = VarIdMap.add lhs_id (Var new_dest_id) state.subst;
-        types = VarIdMap.add new_dest_id rhs_typ state.types }]
+      match symbolic_split with
+      | None -> [continue state to_add]
+      | Some info ->
+        let state_a, state_b = apply_symbolic_split info state in
+        [continue state_a to_add; continue state_b (info.rem_hp :: to_add)]
 
   (** Creates missing ExpPointsTo when no heap predicate matches. Should not happen
       in practice (deref_create_missing_base/end create BlockPointsTo that matches),
@@ -763,10 +806,13 @@ module TransferFunctions = struct
     | None, None ->
       store_create_missing_cell loc instr lhs_typ lhs_var_id lhs_offset cell_size rhs_norm state
 
-  (** Extracts block split args and optional old_dest from a [block_split_res],
-      dispatching [ExpExactMatch] stale constraint cleanup.
-      Returns the old destination variable and its value (looked up BEFORE clearing)
-      so callers can resolve self-reassignment in [store_dereference_assign] *)
+  (** Extracts block split args, optional old_dest, and optional
+      symbolic-split info from a [block_split_res], dispatching
+      [ExpExactMatch] stale constraint cleanup. Returns the old destination
+      variable and its value (looked up BEFORE clearing) so callers can
+      resolve self-reassignment in [store_dereference_assign]. The trailing
+      [symbolic_split] is [Some] only for [BlockSymbolicMatch], in which case
+      callers must split into two states via [apply_symbolic_split]. *)
   and store_extract_split_args block_split_res state =
     match block_split_res with
     | ExpExactMatch { block_split_args; old_dest } ->
@@ -778,60 +824,80 @@ module TransferFunctions = struct
         | Expr.Var id -> clear_stale_value_constraints id state
         | _ -> (state, Fun.id)
       in
-      (state, block_split_args, rewrite_spatial, Some old_dest, old_dest_value)
+      (state, block_split_args, rewrite_spatial, Some old_dest, old_dest_value, None)
     | BlockExactMatch args | BlockEdgeMatch args | BlockMiddleMatch args ->
-      (state, args, Fun.id, None, None)
+      (state, args, Fun.id, None, None, None)
+    | BlockSymbolicMatch { block_split_args; symbolic_split } ->
+      (state, block_split_args, Fun.id, None, None, Some symbolic_split)
 
   (** Handles a block split for a local allocation (found in current only).
-      Transforms current spatial, runs assignment, prepends new [ExpPointsTo] to current *)
+      Transforms current spatial, runs assignment, prepends new [ExpPointsTo] to current.
+      For [BlockSymbolicMatch], splits into a no-remainder state and a remainder
+      state via [apply_symbolic_split]. *)
   and store_split_local lhs_typ rhs_norm block_split_res curr_hps curr_rest state =
     let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, rewrite_spatial,
-        old_dest, old_dest_value =
+        old_dest, old_dest_value, symbolic_split =
       store_extract_split_args block_split_res state
     in
-    let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
-    let state = { state with current = { state.current with spatial = curr_spatial } } in
-    let lhs_expr = Expr.Var new_dest_id in
-    let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
-      ~old_dest ~old_dest_value in
-    let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
-    let state = { state with current = { state.current with
-      spatial = rewrite_spatial state.current.spatial } } in
-    [{ state with current = { state.current with
-      spatial = new_exp_points_to :: state.current.spatial } }]
+    let continue state to_add =
+      let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
+      let state = { state with current = { state.current with spatial = curr_spatial } } in
+      let lhs_expr = Expr.Var new_dest_id in
+      let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
+        ~old_dest ~old_dest_value in
+      let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
+      let state = { state with current = { state.current with
+        spatial = rewrite_spatial state.current.spatial } } in
+      { state with current = { state.current with
+        spatial = new_exp_points_to :: state.current.spatial } }
+    in
+    match symbolic_split with
+    | None -> [continue state to_add]
+    | Some info ->
+      let state_a, state_b = apply_symbolic_split info state in
+      [continue state_a to_add; continue state_b (info.rem_hp :: to_add)]
 
   (** Handles a block split for a formal pointer (found in both current and missing).
-      For [Block*Match] (first access): transforms both current and missing spatial,
-      adds new [ExpPointsTo] to both.
+      For [Block*Match] / [BlockSymbolicMatch] (first access): transforms both
+      current and missing spatial, adds new [ExpPointsTo] to both.
       For [ExpExactMatch] (reassignment): only updates current — missing precondition
-      cell is left intact to preserve the pre-postcondition connection *)
+      cell is left intact to preserve the pre-postcondition connection.
+      Symbolic-size matches additionally split into two states via
+      [apply_symbolic_split]. *)
   and store_split_formal lhs_typ rhs_norm block_split_res
       curr_hps curr_rest miss_hps miss_rest state =
     match block_split_res with
     | ExpExactMatch _ ->
       (* Reassignment: treat like local — only update current, leave missing intact *)
       store_split_local lhs_typ rhs_norm block_split_res curr_hps curr_rest state
-    | BlockExactMatch _ | BlockEdgeMatch _ | BlockMiddleMatch _ ->
+    | BlockExactMatch _ | BlockEdgeMatch _ | BlockMiddleMatch _ | BlockSymbolicMatch _ ->
       (* First access: mirror split to both current and missing *)
       let state, { to_remove; to_add; new_exp_points_to; new_dest_id }, _rewrite_spatial,
-          old_dest, old_dest_value =
+          old_dest, old_dest_value, symbolic_split =
         store_extract_split_args block_split_res state
       in
-      let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
-      let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
-      let state = { state with
-        current = { state.current with spatial = curr_spatial };
-        missing = { state.missing with spatial = miss_spatial } }
+      let continue state to_add =
+        let curr_spatial = transform_spatial to_remove curr_hps to_add curr_rest in
+        let miss_spatial = transform_spatial to_remove miss_hps to_add miss_rest in
+        let state = { state with
+          current = { state.current with spatial = curr_spatial };
+          missing = { state.missing with spatial = miss_spatial } }
+        in
+        let lhs_expr = Expr.Var new_dest_id in
+        let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
+          ~old_dest ~old_dest_value in
+        let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
+        { state with
+          current = { state.current with
+            spatial = new_exp_points_to :: state.current.spatial };
+          missing = { state.missing with
+            spatial = new_exp_points_to :: state.missing.spatial } }
       in
-      let lhs_expr = Expr.Var new_dest_id in
-      let assign_res = store_dereference_assign state lhs_typ new_dest_id lhs_expr rhs_norm
-        ~old_dest ~old_dest_value in
-      let state, new_exp_points_to = store_fixup_pto assign_res new_exp_points_to lhs_expr new_dest_id in
-      [{ state with
-        current = { state.current with
-          spatial = new_exp_points_to :: state.current.spatial };
-        missing = { state.missing with
-          spatial = new_exp_points_to :: state.missing.spatial } }]
+      match symbolic_split with
+      | None -> [continue state to_add]
+      | Some info ->
+        let state_a, state_b = apply_symbolic_split info state in
+        [continue state_a to_add; continue state_b (info.rem_hp :: to_add)]
 
   (** Fixes up [new_exp_points_to] after assignment: when an address was stored,
       replaces [canonical_rhs] references in the source/size with the cell variable *)

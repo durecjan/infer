@@ -678,12 +678,8 @@ module TransferFunctions = struct
       let fresh_id = Id.fresh () in
       let state = subst_apply
         ~from_:(Expr.Var lhs_id) ~to_:(Expr.Var fresh_id) state in
-      let typ = VarIdMap.find_opt lhs_id state.types in
-      let state = match typ with
-        | Some t -> { state with types = VarIdMap.add fresh_id t state.types }
-        | None -> Logging.die InternalError
-          "store_address_self_reassign: VarIdMap.find_opt call failed"
-      in
+      let typ = VarIdMap.find lhs_id state.types in
+      let state = { state with types = VarIdMap.add fresh_id typ state.types } in
       let rhs_canonical = Ptr { base = fresh_id; offset = rhs_canon_offset } in
       [{ state with subst = VarIdMap.add lhs_id rhs_canonical state.subst }]
     else

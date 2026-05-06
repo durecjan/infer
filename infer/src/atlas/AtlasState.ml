@@ -181,6 +181,46 @@ let extract_canon_offset = function
   | Var _ -> 0L
   | Ptr { offset; _ } -> offset
 
+(** Rewrites RHS values of the substitution map alongside [subst_apply_to_pure] /
+    [subst_apply_to_spatial]. Without this, subst entries whose RHS referenced the
+    renamed id survive unchanged and silently re-alias to the new owner of that id
+    (e.g. after [head = x], a stale [Var(k) == head] entry collapses [Var(k)] onto
+    the new head value).
+
+    Supports two [from_] shapes (matching all current [subst_apply] call sites):
+    - [Expr.Var from_id]: rewrite [Var from_id] -> [to_], and rewrite the base of
+      [Ptr { base = from_id; offset }] preserving the offset.
+    - [Expr.BinOp (Pplus, Var from_base, Const (Int from_offset))]: exact-position
+      rewrite — [Ptr { base = from_base; offset = from_offset }] -> [to_]. Other
+      offsets at the same base are left alone (different positions in the same
+      block).
+    [to_] must be [Expr.Var to_id]; all current callers pass a single variable id. *)
+let subst_apply_to_subst ~from_ ~to_ subst =
+  let to_id = match to_ with
+    | Expr.Var id -> id
+    | _ -> Logging.die InternalError
+        "subst_apply_to_subst: to_ must be Expr.Var"
+  in
+  match from_ with
+  | Expr.Var from_id ->
+    VarIdMap.map (fun value ->
+      match value with
+      | Var id when Id.equal id from_id -> Var to_id
+      | Ptr { base; offset } when Id.equal base from_id ->
+        Ptr { base = to_id; offset }
+      | _ -> value)
+      subst
+  | Expr.BinOp (Pplus, Var from_base, Const (Int from_offset)) ->
+    VarIdMap.map (fun value ->
+      match value with
+      | Ptr { base; offset }
+        when Id.equal base from_base && Int64.equal offset from_offset ->
+        Var to_id
+      | _ -> value)
+      subst
+  | _ -> Logging.die InternalError
+    "subst_apply_to_subst: from_ must be Var or BinOp(Pplus,Var,Const)"
+
 (** Applies substitution [~from_] [~to_] over current and missing parts of [state].
     If [~to_] expression is found within a pure constraint or a heap predicate, a synthetic variable will take it's place *)
 let subst_apply ~from_ ~to_ state =
@@ -188,9 +228,11 @@ let subst_apply ~from_ ~to_ state =
   let missing_pure = subst_apply_to_pure ~from_:from_ ~to_:to_ state.missing.pure in
   let current_spatial = subst_apply_to_spatial ~from_:from_ ~to_:to_ state.current.spatial in
   let missing_spatial = subst_apply_to_spatial ~from_:from_ ~to_:to_ state.missing.spatial in
-  { state with 
+  let subst = subst_apply_to_subst ~from_:from_ ~to_:to_ state.subst in
+  { state with
     current = { pure = current_pure; spatial = current_spatial };
-    missing = { pure = missing_pure; spatial = missing_spatial} }
+    missing = { pure = missing_pure; spatial = missing_spatial};
+    subst }
 
 (** Prepares [state] for an address substitution targeting [id].
     Must be called before [subst_apply] when [id] is being reassigned to a new address.
@@ -225,6 +267,8 @@ let clear_before_subst id state =
     missing = { state.missing with pure = missing_pure } }
   in
   let placeholder = Id.fresh () in
+  let placeholder_typ = VarIdMap.find id state.types in
+  let state = { state with types = VarIdMap.add placeholder placeholder_typ state.types } in
   subst_apply ~from_:(Expr.Var id) ~to_:(Expr.Var placeholder) state
 
 (** Returns [true] if [constraint_] is a comparison (Peq, Pneq, Pless, Plesseq)

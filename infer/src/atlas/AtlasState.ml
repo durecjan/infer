@@ -900,12 +900,26 @@ and typ_size_of tenv typ =
 
 type block_split_args = { to_remove: heap_pred ; to_add: heap_pred list ; new_exp_points_to: heap_pred ; new_dest_id: Id.t }
 
+(** Carried by [BlockSymbolicMatch] when the matched predicate had a symbolic
+    size: the residual block predicate ([rem_hp]) is kept out of
+    [block_split_args.to_add]; callers split into a no-remainder state with
+    [sym_size == access_end] mirrored to current+missing, and a remainder-exists
+    state with [rem_hp] re-added and [sym_size >= access_end + 1] mirrored. *)
+type symbolic_split_info = {
+  rem_hp: heap_pred;
+  sym_size: Expr.t;
+  access_end: int64;
+}
+
 (** Intermediate result of block splitting *)
 type block_split_res =
   | ExpExactMatch of { block_split_args: block_split_args ; old_dest: Expr.t } (* new cell matched some existing ExpPointsTo with destination expression *)
   | BlockExactMatch of block_split_args (* new cell matched exactly some BlockPointsTo | UniformBlockPointsTo *)
   | BlockEdgeMatch of block_split_args (* new cell matched the edge of some BlockPointsTo | UniformBlockPointsTo *)
   | BlockMiddleMatch of block_split_args (* new cell matched the middle of some BlockPointsTo | UniformBlockPointsTo *)
+  | BlockSymbolicMatch of { block_split_args: block_split_args ; symbolic_split: symbolic_split_info }
+    (* matched predicate had symbolic size; rem_hp held separately so callers can
+       split into a no-remainder state and a remainder-exists state *)
 
 (** Result of heap match (used by load dereference) *)
 type heap_match_res =
@@ -989,12 +1003,17 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
         Expr.Var new_dest_id)
     in
     let rem_size = Expr.BinOp (Pminus, symbolic_size, Const (Int cell_size)) in
-    let to_add = [
-      BlockPointsTo (
-        Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
-        normalize_expr rem_size) ]
+    let rem_hp = BlockPointsTo (
+      Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
+      normalize_expr rem_size)
     in
-    Some (BlockEdgeMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
+    let block_split_args =
+      { to_remove; to_add = []; new_exp_points_to; new_dest_id }
+    in
+    let symbolic_split =
+      { rem_hp; sym_size = symbolic_size; access_end = cell_size }
+    in
+    Some (BlockSymbolicMatch { block_split_args; symbolic_split })
   in
   let try_block_left_edge_match hp src size =
     match src, size with
@@ -1058,12 +1077,17 @@ let heap_try_block_split hps lhs_var_id lhs_offset cell_size =
       Expr.Const (Int left_size))
     in
     let right_size = Expr.BinOp (Pminus, symbolic_size, Const (Int left_and_middle_size)) in
-    let to_add_right_block = BlockPointsTo (
+    let rem_hp = BlockPointsTo (
       Expr.BinOp (Pplus, Var lhs_var_id, Const (Int (Stdlib.Int64.add lhs_offset cell_size))),
       normalize_expr right_size)
     in
-    let to_add = [ to_add_left_block; to_add_right_block ] in
-    Some (BlockMiddleMatch { to_remove; to_add; new_exp_points_to; new_dest_id })
+    let block_split_args =
+      { to_remove; to_add = [ to_add_left_block ]; new_exp_points_to; new_dest_id }
+    in
+    let symbolic_split =
+      { rem_hp; sym_size = symbolic_size; access_end = left_and_middle_size }
+    in
+    Some (BlockSymbolicMatch { block_split_args; symbolic_split })
   in
   let try_block_right_edge_or_middle_match hp src size =
     match src, size with

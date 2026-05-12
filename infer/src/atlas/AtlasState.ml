@@ -684,6 +684,8 @@ let is_var_null id state =
       when Id.equal id id' -> Some false
     | Expr.BinOp (Plesseq, _, UnOp (Base, Var id')) :: _
       when Id.equal id id' -> Some false
+    | Expr.UnOp (Freed, Var id') :: _
+      when Id.equal id id' -> Some false
     | _ :: rest -> scan rest
   in
   match scan state.current.pure with
@@ -695,6 +697,10 @@ let is_var_null id state =
     - Identical expressions after [normalize_expr] → [Sat]
     - Null check: one side is null, other is a pointer variable with
       known null/non-null status via Base constraints → [Sat]/[Unsat]
+    - Null check on offset form: one side is null, other is
+      [Var id + Const]; if [is_var_null id] returns [Some false], the
+      offset preserves non-null-ness ⇒ [Unsat]. [Some true]/[None]
+      remain [Unknown] (null base plus offset is undecidable here).
     - Everything else → [Unknown] (delegated to Astral solver) *)
 let eval_eq e1 e2 state =
   let e1 = normalize_expr e1 in
@@ -709,9 +715,44 @@ let eval_eq e1 e2 state =
       | Some false -> Unsat
       | None -> Unknown
       end
+    | Expr.Const Null, Expr.BinOp (Pplus, Var id, Const (Int _))
+    | Expr.BinOp (Pplus, Var id, Const (Int _)), Expr.Const Null ->
+      begin match is_var_null id state with
+      | Some false -> Unsat
+      | Some true | None -> Unknown
+      end
     | Expr.Var id1, Expr.Var id2
       when Id.equal id1 id2 -> Sat
     | _ -> Unknown
+
+(** Rewrites bare-truthy/falsy Prune conditions into explicit comparison binops so
+    [eval_prune_condition] can resolve them via [eval_eq] (and [is_var_null])
+    instead of escalating to Astral. Four shapes are recognized after
+    [Formula.normalize_expr]:
+    - [Var x]                                          → [x != null] or [x != 0]
+    - [Lnot (Var x)]                                   → [x == null] or [x == 0]
+    - [BinOp (Pplus, Var x, Const (Int _))]            → [x + offset != null/0]
+    - [Lnot (BinOp (Pplus, Var x, Const (Int _)))]     → [x + offset == null/0]
+    The null vs zero choice depends on [x]'s entry in [state.types] — pointer
+    base ⇒ null, otherwise the integer 0. Conditions already in comparison
+    binop form, or any shape not listed above, are returned unchanged —
+    nested boolean combinations are an accepted limitation of this rewrite *)
+let rewrite_prune_condition cond state =
+  let zero_for id =
+    match VarIdMap.find_opt id state.types with
+    | Some t when is_pointer_type t -> Expr.null
+    | _ -> Expr.zero
+  in
+  match cond with
+  | Expr.Var id ->
+    Expr.BinOp (Pneq, Var id, zero_for id)
+  | Expr.UnOp (Lnot, Var id) ->
+    Expr.BinOp (Peq, Var id, zero_for id)
+  | Expr.BinOp (Pplus, Var id, Const (Int _)) ->
+    Expr.BinOp (Pneq, cond, zero_for id)
+  | Expr.UnOp (Lnot, (BinOp (Pplus, Var id, Const (Int _)) as inner)) ->
+    Expr.BinOp (Peq, inner, zero_for id)
+  | _ -> cond
 
 (** Evaluates a prune condition expression against a state.
     Returns [Sat] if the condition is satisfiable (keep state),

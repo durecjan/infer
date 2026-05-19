@@ -128,9 +128,19 @@ module TransferFunctions = struct
             | Unsat -> []
             | Sat -> [state]
             | Unknown ->
+              let to_add = match cond with 
+                | Expr.BinOp (Peq, Var id, Const (Null))
+                | Expr.BinOp (Peq, Const (Null), Var id) ->
+                  [
+                    cond;
+                    Expr.BinOp (Peq, UnOp (Base, Var id), Expr.zero);
+                    Expr.BinOp (Peq, UnOp (End, Var id), Expr.zero)
+                  ]  
+                | _ -> [cond]
+              in
               [{ state with
-                missing = { state.missing with pure = cond :: state.missing.pure };
-                current = { state.current with pure = cond :: state.current.pure } }])
+                missing = { state.missing with pure = to_add @ state.missing.pure };
+                current = { state.current with pure = to_add @ state.current.pure } }])
           states
       end
     | Sil.Call _ ->

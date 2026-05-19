@@ -382,7 +382,7 @@ module DisjDomain = struct
 
   (** State implication — lhs is subsumed by rhs if rhs's spatial/pure
       predicates are a subset of lhs's (lhs is at least as specific) *)
-  let leq ~lhs ~rhs = state_leq lhs rhs
+  let leq ~lhs ~rhs = state_alpha_equal lhs rhs
 
   (** Fast structural equality for deduplication at CFG join points *)
   let equal_fast = state_alpha_equal

@@ -1,0 +1,12 @@
+Atlas
+Copyright 2026 Ján Durec
+
+Files in this directory are licensed under the Apache License, Version 2.0.
+See LICENSE in this directory for full text.
+
+The surrounding host project is Meta's Infer (https://github.com/facebook/infer),
+licensed under the MIT License; see the LICENSE file at the repository root.
+
+Atlas depends at runtime on the Astral separation-logic solver
+(https://github.com/TDacik/Astral), used as an external library under its
+own license. No Astral source code is bundled in this directory.
